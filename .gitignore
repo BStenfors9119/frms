@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target/
+
+# JetBrains IDE
+/.idea/
+
+# macOS
+.DS_Store
