@@ -183,3 +183,20 @@ pub fn embedded_icon(fg: Color)
         }
     }
 }
+
+/// Flat row inside a dropdown/popup menu — transparent until hovered, then a
+/// subtle highlight. Used by the "+ Agent" menu so each choice reads as a list
+/// item rather than a raised button.
+pub fn menu_item(_theme: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => Some(Background::Color(Color::from_rgb8(58, 58, 72))),
+        button::Status::Pressed => Some(Background::Color(Color::from_rgb8(70, 70, 86))),
+        _ => None,
+    };
+    button::Style {
+        background: bg,
+        text_color: Color::from_rgb(0.90, 0.90, 0.93),
+        border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 4.0.into() },
+        shadow: Shadow::default(),
+    }
+}

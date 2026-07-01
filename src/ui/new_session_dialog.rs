@@ -1,8 +1,8 @@
 use iced::{Alignment, Background, Border, Element, Length, Theme};
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Column};
+use iced::widget::{button, column, container, row, scrollable, text, text_input, Column, Space};
 
 use crate::app::Message;
-use crate::file_browser::FileBrowserState;
+use crate::file_browser::{DirEdit, FileBrowserState};
 use crate::session::SessionKind;
 use crate::theme::ThemeColors;
 use crate::ui::buttons;
@@ -20,7 +20,7 @@ pub fn view<'a>(
 ) -> Element<'a, Message> {
     let mut body: Column<'a, Message> = column![
         row![
-            text("New Session").size(22),
+            text("New Project").size(22),
             button(text("Preferences").size(buttons::TEXT_SIZE))
                 .on_press(Message::PrefsOpened)
                 .padding(buttons::PADDING)
@@ -30,11 +30,11 @@ pub fn view<'a>(
         .align_y(Alignment::Center),
 
         column![
-            text("Session name:").size(13),
-            text_input("My session", name_input)
+            text("Project name:").size(13),
+            text_input("My project", name_input)
                 .on_input(Message::NewSessionNameEdited)
                 .width(Length::Fill),
-            text("Shown in the session tab; leave blank for a default.")
+            text("Shown in the project tab; leave blank for a default.")
                 .size(11),
         ]
         .spacing(4),
@@ -50,40 +50,64 @@ pub fn view<'a>(
         ]
         .spacing(4),
 
-        column![
-            text(dir_browser.current_dir.display().to_string()).size(11),
-            scrollable(dir_listing(dir_browser))
-                .height(Length::Fixed(180.0)),
-        ]
-        .spacing(3),
+        {
+            let mut picker = column![
+                row![
+                    text(dir_browser.current_dir.display().to_string()).size(11),
+                    Space::with_width(Length::Fill),
+                    button(text("+ New Folder").size(buttons::TEXT_SIZE))
+                        .on_press(Message::DirEditStart(DirEdit::Create {
+                            draft: String::new(),
+                        }))
+                        .padding(buttons::PADDING)
+                        .style(buttons::secondary),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .spacing(3);
 
-        text("Choose a session type:").size(14),
-        row![
-            session_type_button(
-                "Terminal Session",
-                "File browser + editor + 2 Claude panes + shell",
-                SessionKind::Terminal,
-            ),
-            session_type_button(
-                "Browser Session",
-                "Live browser preview + 2 Claude panes + shell",
-                SessionKind::Browser,
-            ),
-        ]
-        .spacing(16),
+            if let Some(error) = &dir_browser.error {
+                picker = picker.push(
+                    text(error.clone()).size(11).style(|theme: &Theme| {
+                        iced::widget::text::Style {
+                            color: Some(theme.palette().danger),
+                        }
+                    }),
+                );
+            }
+
+            picker.push(
+                scrollable(dir_listing(dir_browser)).height(Length::Fixed(180.0)),
+            )
+        },
     ]
     .spacing(16)
     .align_x(Alignment::Start)
     .padding(28);
 
+    let mut footer = row![]
+        .spacing(12)
+        .width(Length::Fill)
+        .align_y(Alignment::Center);
+
     if can_cancel {
-        body = body.push(
+        footer = footer.push(
             button(text("Cancel").size(buttons::TEXT_SIZE))
                 .on_press(Message::NewSessionCancelled)
                 .padding(buttons::PADDING)
                 .style(buttons::secondary),
         );
     }
+
+    footer = footer.push(iced::widget::horizontal_space());
+    footer = footer.push(
+        button(text("Create Project").size(buttons::TEXT_SIZE))
+            .on_press(Message::NewSessionCreated(SessionKind::Terminal))
+            .padding(buttons::PADDING)
+            .style(buttons::primary),
+    );
+
+    body = body.push(footer);
 
     let surface = colors.surface;
     let border  = colors.tertiary;
@@ -112,6 +136,30 @@ pub fn view<'a>(
 fn dir_listing(state: &FileBrowserState) -> iced::widget::Column<'_, Message> {
     let mut list = column![].spacing(1);
 
+    // Inline "new folder" input at the top of the listing.
+    if let Some(DirEdit::Create { draft }) = &state.edit {
+        let input = text_input("New folder name", draft)
+            .on_input(Message::DirEditDraftChanged)
+            .on_submit(Message::DirEditConfirm)
+            .size(buttons::TEXT_SIZE)
+            .width(Length::Fill);
+
+        let confirm = button(text("✓").size(buttons::TEXT_SIZE))
+            .on_press(Message::DirEditConfirm)
+            .padding(buttons::PADDING)
+            .style(buttons::success);
+        let cancel = button(text("✕").size(buttons::TEXT_SIZE))
+            .on_press(Message::DirEditCancel)
+            .padding(buttons::PADDING)
+            .style(buttons::secondary);
+
+        list = list.push(
+            row![input, confirm, cancel]
+                .spacing(4)
+                .align_y(Alignment::Center),
+        );
+    }
+
     if let Some(parent) = state.current_dir.parent() {
         let parent_path = parent.to_path_buf();
         list = list.push(
@@ -135,23 +183,4 @@ fn dir_listing(state: &FileBrowserState) -> iced::widget::Column<'_, Message> {
     }
 
     list
-}
-
-fn session_type_button(
-    title:    &'static str,
-    subtitle: &'static str,
-    kind:     SessionKind,
-) -> Element<'static, Message> {
-    button(
-        column![
-            text(title).size(15),
-            text(subtitle).size(11),
-        ]
-        .spacing(4),
-    )
-    .on_press(Message::NewSessionCreated(kind))
-    .padding(buttons::PADDING)
-    .style(buttons::primary)
-    .width(Length::Fixed(240.0))
-    .into()
 }

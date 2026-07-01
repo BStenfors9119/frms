@@ -6,7 +6,7 @@
 //! the markers actually style their text instead of being stripped.
 
 use iced::font::{Style, Weight};
-use iced::widget::{column, container, rich_text, scrollable, span, text};
+use iced::widget::{column, container, horizontal_rule, rich_text, scrollable, span, text};
 use iced::{Color, Element, Font, Length};
 
 use crate::app::Message;
@@ -88,7 +88,7 @@ pub fn markdown(source: &str) -> Element<'static, Message> {
 
         // Horizontal rule.
         if t == "---" || t == "***" || t == "___" {
-            col = col.push(text("──────────────────────────────").size(12));
+            col = col.push(horizontal_rule(1));
             continue;
         }
 

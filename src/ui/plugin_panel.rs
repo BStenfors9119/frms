@@ -7,17 +7,34 @@ use iced::widget::{
 };
 
 use crate::app::Message;
-use crate::db_panel::DbPanel;
+use crate::db::TableRef;
 use crate::fonts::{ICON_FONT, UI_FONT};
 use crate::notes::{NoteFormat, NoteViewMode, NotesState};
 use crate::plugin_panel::{DockSide, PluginPanel, PluginSlot, PluginTab};
 use crate::prefs::Prefs;
+use crate::receivers::ReceiversState;
 use crate::terminals::TerminalsState;
 use crate::theme::{FontScale, Mode, Palette, TerminalFontScale};
 use crate::ui::{buttons, with_tip};
-use crate::ui::db_panel as db_ui;
 use crate::ui::preview;
+use crate::ui::receivers_panel;
 use crate::ui::terminal as terminal_ui;
+
+/// Context the Receivers tab needs from the active session: whether a DB is
+/// connected and its tables (for the import picker).
+pub struct ReceiverCtx<'a> {
+    pub state:        &'a ReceiversState,
+    pub db_connected: bool,
+    pub db_tables:    &'a [TableRef],
+    pub font_scale:   TerminalFontScale,
+}
+
+/// What the Profile tab needs from the app beyond `Prefs`: whether the `claude`
+/// CLI is installed (Claude Code status) and whether usage telemetry is on.
+pub struct ProfileCtx {
+    pub claude_installed:  bool,
+    pub telemetry_enabled: bool,
+}
 
 /// Widget id for the Terminals-plugin Name field — used to focus it after
 /// `+ New` so the user can name the terminal, then Tab/Enter into the shell.
@@ -31,15 +48,26 @@ const HANDLE_WIDTH: f32 = 5.0;
 
 pub fn view<'a>(
     panel:     &'a PluginPanel,
-    db:        &'a DbPanel,
     prefs:     &'a Prefs,
     notes:     &'a NotesState,
     project:   Option<&'a str>,
     terminals: &'a TerminalsState,
+    receivers: &'a ReceiversState,
+    db_connected: bool,
+    db_tables: &'a [TableRef],
+    claude_installed: bool,
+    telemetry_enabled: bool,
 ) -> Element<'a, Message> {
+    let rctx = ReceiverCtx {
+        state:        receivers,
+        db_connected,
+        db_tables,
+        font_scale:   prefs.terminal_font_scale,
+    };
+    let pctx = ProfileCtx { claude_installed, telemetry_enabled };
     let content: Element<'_, Message> = if panel.split {
-        let top    = slot_view(panel, PluginSlot::Top,    db, prefs, notes, project, terminals);
-        let bottom = slot_view(panel, PluginSlot::Bottom, db, prefs, notes, project, terminals);
+        let top    = slot_view(panel, PluginSlot::Top,    prefs, notes, project, terminals, &rctx, &pctx);
+        let bottom = slot_view(panel, PluginSlot::Bottom, prefs, notes, project, terminals, &rctx, &pctx);
         let divider = mouse_area(
             container(Space::new(Length::Fill, Length::Fixed(HANDLE_WIDTH)))
                 .width(Length::Fill)
@@ -58,7 +86,7 @@ pub fn view<'a>(
         .height(Length::Fill)
         .into()
     } else {
-        slot_view(panel, PluginSlot::Top, db, prefs, notes, project, terminals)
+        slot_view(panel, PluginSlot::Top, prefs, notes, project, terminals, &rctx, &pctx)
     };
 
     let panel_body = container(content).width(Length::Fill).height(Length::Fill);
@@ -90,18 +118,19 @@ pub fn view<'a>(
 fn slot_view<'a>(
     panel:     &'a PluginPanel,
     slot:      PluginSlot,
-    db:        &'a DbPanel,
     prefs:     &'a Prefs,
     notes:     &'a NotesState,
     project:   Option<&'a str>,
     terminals: &'a TerminalsState,
+    rctx:      &ReceiverCtx<'a>,
+    pctx:      &ProfileCtx,
 ) -> Element<'a, Message> {
     let tab = panel.tab(slot);
     let body: Element<'_, Message> = match tab {
-        PluginTab::Db        => db_ui::body(db),
-        PluginTab::Profile   => profile_body(prefs),
+        PluginTab::Profile   => profile_body(prefs, pctx),
         PluginTab::Notes     => notes_body(notes, project),
         PluginTab::Terminals => terminals_body(terminals, prefs.terminal_font_scale),
+        PluginTab::Receivers => receivers_panel::view(rctx),
     };
 
     column![
@@ -119,15 +148,54 @@ fn slot_view<'a>(
 
 fn tab_bar(panel: &PluginPanel, slot: PluginSlot) -> Element<'static, Message> {
     let active = panel.tab(slot);
+    // Suppress the per-tab ✕ when only one plugin remains so the strip can't be
+    // emptied — the lone tab then has no close affordance.
+    let closable = panel.shown_count() > 1;
+
     let mut r = row![].spacing(4).align_y(Alignment::Center);
-    for &t in PluginTab::ALL {
-        r = r.push(
-            button(text(t.label().to_string()).font(UI_FONT).size(buttons::TEXT_SIZE))
-                .on_press(Message::PluginTabClicked(slot, t))
-                .padding(buttons::PADDING)
-                .style(buttons::toggle(active == t)),
-        );
+    for t in panel.shown_tabs() {
+        let select = button(text(t.label().to_string()).font(UI_FONT).size(buttons::TEXT_SIZE))
+            .on_press(Message::PluginTabClicked(slot, t))
+            .padding(buttons::PADDING)
+            .style(buttons::toggle(active == t));
+        let entry: Element<'static, Message> = if closable {
+            row![
+                select,
+                button(text("\u{2715}").font(ICON_FONT).size(9))
+                    .on_press(Message::PluginTabHidden(t))
+                    .padding([7, 6])
+                    .style(buttons::secondary),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            select.into()
+        };
+        r = r.push(entry);
     }
+
+    // `+` reveals a picker of the hidden plugins; clicking one re-adds it. Only
+    // shown when something is actually hidden.
+    if panel.hidden_tabs().next().is_some() {
+        r = r.push(
+            button(text("+").font(UI_FONT).size(buttons::TEXT_SIZE))
+                .on_press(Message::PluginAddPickerToggled)
+                .padding([7, 10])
+                .style(buttons::toggle(panel.adding)),
+        );
+        if panel.adding {
+            for t in panel.hidden_tabs() {
+                r = r.push(
+                    button(text(t.label().to_string()).font(UI_FONT).size(buttons::TEXT_SIZE))
+                        .on_press(Message::PluginTabShown(t))
+                        .padding(buttons::PADDING)
+                        .style(buttons::secondary),
+                );
+            }
+        }
+    }
+
     r = r.push(iced::widget::Space::with_width(Length::Fill));
 
     // Only the top slot carries the panel-wide controls so they aren't doubled.
@@ -163,7 +231,7 @@ fn icon_ctrl(glyph: &'static str, msg: Message) -> Element<'static, Message> {
 
 // ── Profile plugin ────────────────────────────────────────────────────────────
 
-fn profile_body(prefs: &Prefs) -> Element<'_, Message> {
+fn profile_body<'a>(prefs: &'a Prefs, pctx: &ProfileCtx) -> Element<'a, Message> {
     let palette_picker = labeled_row(
         "Theme:",
         pick_list(Palette::ALL, Some(prefs.palette), Message::PrefsPaletteChanged)
@@ -199,8 +267,63 @@ fn profile_body(prefs: &Prefs) -> Element<'_, Message> {
         mode_picker,
         font_picker,
         term_font_picker,
+        Space::new(Length::Shrink, Length::Fixed(8.0)),
+        claude_status_section(pctx),
+        Space::new(Length::Shrink, Length::Fixed(8.0)),
+        privacy_section(pctx),
     ]
     .spacing(8)
+    .into()
+}
+
+/// Privacy / telemetry controls. Telemetry is on by default; this is the opt-out
+/// and the disclosure of exactly what's collected (anonymous, no PII).
+fn privacy_section(pctx: &ProfileCtx) -> Element<'static, Message> {
+    let toggle = iced::widget::checkbox("Share anonymous usage data", pctx.telemetry_enabled)
+        .on_toggle(Message::PrefsTelemetryToggled)
+        .text_size(13);
+
+    column![
+        text("Privacy").size(15),
+        toggle,
+        text("Helps improve frms. Sends an anonymous id, app version, OS, coarse \
+              feature usage, and crash reports — never file names, project \
+              paths, prompts, keys, or any personal data. Off any time here.")
+            .size(11),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// Claude Code status. Every agent pane — Build (PTY) and the Research / Chat
+/// chats — drives the `claude` CLI, which authenticates through its own login
+/// (a Claude Pro/Max subscription, no API key). This section reflects whether
+/// the CLI is installed and points the user at the one-shot setup helper.
+fn claude_status_section(pctx: &ProfileCtx) -> Element<'static, Message> {
+    let status = if pctx.claude_installed {
+        text("\u{2713} Claude Code is installed.").size(12)
+    } else {
+        text("\u{2717} Claude Code (the 'claude' CLI) was not found.").size(12)
+    };
+
+    // Build the guidance line. When installed we only need the sign-in reminder;
+    // when missing we point at the bundled installer (frms-setup-claude).
+    let guidance = if pctx.claude_installed {
+        "Agent panes sign in through Claude Code. If you haven't yet, run \
+         'claude' once in a terminal to log in (a Claude Pro/Max subscription \
+         — no API key needed)."
+    } else {
+        "Agent panes need it. Install and sign in with one command in a \
+         terminal:  frms-setup-claude  — it installs Node.js/npm + Claude Code, \
+         then logs you in (a Claude Pro/Max subscription, no API key needed)."
+    };
+
+    column![
+        text("Claude Code").size(15),
+        status,
+        text(guidance).size(11),
+    ]
+    .spacing(6)
     .into()
 }
 

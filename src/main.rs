@@ -1,5 +1,8 @@
+mod agent;
 mod app;
 mod cdp;
+mod chat_api;
+mod clipboard;
 mod db;
 mod db_history;
 mod db_panel;
@@ -16,7 +19,10 @@ mod pane;
 mod persisted;
 mod plugin_panel;
 mod prefs;
+mod receivers;
+mod scp;
 mod session;
+mod telemetry;
 mod terminal;
 mod terminals;
 mod theme;
@@ -43,6 +49,12 @@ fn main() -> iced::Result {
     }
 
     eprintln!("[frms] starting up");
+
+    // Best-effort crash reporting, gated on the same opt-out as the rest of
+    // telemetry — and only after the first-run notice has been acknowledged, so
+    // nothing is sent before consent.
+    let prefs = prefs::Prefs::load();
+    telemetry::install_panic_hook(prefs.telemetry_notice_ack && prefs.telemetry);
 
     let mut window_settings = window::Settings {
         size:     Size::new(1400.0, 900.0),

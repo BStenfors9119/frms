@@ -50,6 +50,17 @@ pub fn view<'a>(prompt: Option<&'a PendingPrompt>) -> Element<'a, Message> {
     let before_row = diff_block(&p.before, "(no removal)", BEFORE_BG, BEFORE_FG);
     let after_row  = diff_block(&p.after,  "(no addition)", AFTER_BG,  AFTER_FG);
 
+    // The diff (before + after) takes the remaining vertical space and scrolls
+    // as one unit. Without this a long "after" block grows unbounded and pushes
+    // the Accept/Reject row off the bottom of the pane, out of reach.
+    let diff = scrollable(
+        column![before_row, after_row]
+            .spacing(6)
+            .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill);
+
     let actions = row![
         button(text("Accept").font(UI_FONT).size(buttons::TEXT_SIZE))
             .on_press(Message::PromptAccepted)
@@ -63,10 +74,11 @@ pub fn view<'a>(prompt: Option<&'a PendingPrompt>) -> Element<'a, Message> {
     .spacing(8)
     .padding([8, 10]);
 
+    // `actions` is fixed-height and last, so it stays pinned and reachable at
+    // the bottom while `diff` (height Fill) absorbs any overflow via scrolling.
     column![
         file_row,
-        before_row,
-        after_row,
+        diff,
         actions,
     ]
     .spacing(6)
@@ -88,7 +100,9 @@ fn diff_block<'a>(
         for l in lines {
             col = col.push(text(l.clone()).font(Font::MONOSPACE).size(12).color(fg));
         }
-        scrollable(col).width(Length::Fill).into()
+        // No inner scrollable — the whole diff scrolls as one unit in `view`,
+        // so each block just lays out its lines at natural height.
+        col.width(Length::Fill).into()
     };
 
     container(body)

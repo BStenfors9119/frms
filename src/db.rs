@@ -12,7 +12,7 @@ use std::sync::Arc;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Pool as MyPool, Value as MyValue};
 use tokio_postgres::types::Type;
-use tokio_postgres::{Client as PgClient, NoTls, Row as PgRow};
+use tokio_postgres::{Client as PgClient, NoTls, Row as PgRow, SimpleQueryMessage};
 
 // ── engine ────────────────────────────────────────────────────────────────────
 
@@ -40,6 +40,26 @@ impl DbEngine {
             DbEngine::Postgres                 => format!("\"{ident}\""),
             DbEngine::Mysql | DbEngine::MariaDb => format!("`{ident}`"),
         }
+    }
+
+    /// Quote a value as a single-quoted string literal, escaping per the
+    /// engine's rules. Used by the query builder's WHERE clause, which is
+    /// substituted into the SQL text rather than bound as a parameter.
+    pub fn quote_literal(self, value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        out.push('\'');
+        for c in value.chars() {
+            match c {
+                '\'' => out.push_str("''"),
+                // MySQL/MariaDB treat backslash as an escape character inside
+                // string literals; double it so the value is taken verbatim.
+                // Postgres (standard_conforming_strings) keeps it literal.
+                '\\' if matches!(self, DbEngine::Mysql | DbEngine::MariaDb) => out.push_str("\\\\"),
+                _ => out.push(c),
+            }
+        }
+        out.push('\'');
+        out
     }
 }
 
@@ -156,15 +176,82 @@ impl TableRef {
     }
 }
 
+/// Whether a stored routine is a `PROCEDURE` or a `FUNCTION`. Drives the
+/// keyword used to fetch its source on MySQL/MariaDB (`SHOW CREATE …`) and the
+/// little tag shown beside it in the Objects list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RoutineKind {
+    Procedure,
+    Function,
+}
+
+impl RoutineKind {
+    /// Map an `information_schema` `routine_type` ("PROCEDURE"/"FUNCTION") onto
+    /// the enum, defaulting to `Function` for anything unexpected.
+    fn parse(s: &str) -> RoutineKind {
+        if s.eq_ignore_ascii_case("PROCEDURE") {
+            RoutineKind::Procedure
+        } else {
+            RoutineKind::Function
+        }
+    }
+
+    /// Short tag shown beside the routine name in the Objects list.
+    pub fn tag(self) -> &'static str {
+        match self {
+            RoutineKind::Procedure => "proc",
+            RoutineKind::Function  => "func",
+        }
+    }
+}
+
+/// A stored procedure or function visible to the connected user. The `kind`
+/// distinguishes the two so the source can be fetched with the right keyword.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct RoutineRef {
+    pub schema: String,
+    pub name:   String,
+    pub kind:   RoutineKind,
+}
+
+impl RoutineRef {
+    pub fn key(&self) -> String {
+        format!("{}.{}", self.schema, self.name)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows:    Vec<Vec<String>>,
 }
 
+/// The result of a free-hand statement run from the raw SQL pane. Row-returning
+/// statements (SELECT, or anything with RETURNING) yield a `Rows` result set;
+/// statements that only mutate (INSERT/UPDATE/DELETE/DDL) yield the server's
+/// affected-row count so the UI can report "N rows affected".
+#[derive(Debug, Clone)]
+pub enum StatementOutcome {
+    Rows(QueryResult),
+    Affected(u64),
+}
+
+/// A foreign-key relationship: `from_table.from_column` references
+/// `to_table.to_column`. Used to gate which tables are joinable and to build
+/// the `JOIN … ON …` clauses in the query builder.
+#[derive(Debug, Clone)]
+pub struct ForeignKey {
+    pub from_table:  TableRef,
+    pub from_column: String,
+    pub to_table:    TableRef,
+    pub to_column:   String,
+}
+
 // ── public ops (engine-dispatched) ────────────────────────────────────────────
 
-pub async fn connect_and_list(cfg: DbConfig) -> Result<(DbClient, Vec<TableRef>), String> {
+pub async fn connect_and_list(
+    cfg: DbConfig,
+) -> Result<(DbClient, Vec<TableRef>, Vec<ForeignKey>, Vec<RoutineRef>), String> {
     match cfg.engine {
         DbEngine::Postgres                  => connect_pg(cfg).await,
         DbEngine::Mysql | DbEngine::MariaDb => connect_mysql(cfg).await,
@@ -178,6 +265,17 @@ pub async fn list_columns(client: DbClient, table: TableRef) -> Result<Vec<Strin
     }
 }
 
+/// Fetch the source (DDL) of a stored procedure or function for display.
+pub async fn routine_definition(
+    client: DbClient,
+    routine: RoutineRef,
+) -> Result<String, String> {
+    match client {
+        DbClient::Postgres(c) => routine_definition_pg(c, routine).await,
+        DbClient::Mysql(p)    => routine_definition_mysql(p, routine).await,
+    }
+}
+
 pub async fn run_query(client: DbClient, sql: String) -> Result<QueryResult, String> {
     match client {
         DbClient::Postgres(c) => run_query_pg(c, sql).await,
@@ -185,9 +283,22 @@ pub async fn run_query(client: DbClient, sql: String) -> Result<QueryResult, Str
     }
 }
 
+/// Run an arbitrary, user-authored statement (SELECT, UPDATE, DELETE, DDL, …)
+/// verbatim. Unlike `run_query` — which only ever runs the builder's SELECT —
+/// this reports either a result set or an affected-row count, so the raw SQL
+/// pane can execute commands that return no rows.
+pub async fn run_statement(client: DbClient, sql: String) -> Result<StatementOutcome, String> {
+    match client {
+        DbClient::Postgres(c) => run_statement_pg(c, sql).await,
+        DbClient::Mysql(p)    => run_statement_mysql(p, sql).await,
+    }
+}
+
 // ── postgres backend ──────────────────────────────────────────────────────────
 
-async fn connect_pg(cfg: DbConfig) -> Result<(DbClient, Vec<TableRef>), String> {
+async fn connect_pg(
+    cfg: DbConfig,
+) -> Result<(DbClient, Vec<TableRef>, Vec<ForeignKey>, Vec<RoutineRef>), String> {
     let mut config = tokio_postgres::Config::new();
     config.host(&cfg.host);
     config.port(cfg.port);
@@ -206,8 +317,88 @@ async fn connect_pg(cfg: DbConfig) -> Result<(DbClient, Vec<TableRef>), String> 
         }
     });
 
-    let tables = list_tables_pg(&client).await?;
-    Ok((DbClient::Postgres(Arc::new(client)), tables))
+    let tables   = list_tables_pg(&client).await?;
+    let fks      = list_foreign_keys_pg(&client).await?;
+    let routines = list_routines_pg(&client).await?;
+    Ok((DbClient::Postgres(Arc::new(client)), tables, fks, routines))
+}
+
+async fn list_routines_pg(client: &PgClient) -> Result<Vec<RoutineRef>, String> {
+    let rows = client
+        .query(
+            "SELECT routine_schema, routine_name, routine_type \
+             FROM information_schema.routines \
+             WHERE routine_schema NOT IN ('pg_catalog', 'information_schema') \
+               AND routine_type IN ('PROCEDURE', 'FUNCTION') \
+             ORDER BY routine_schema, routine_name",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("list routines: {e}"))?;
+
+    Ok(rows.into_iter()
+        .map(|r| RoutineRef {
+            schema: r.get(0),
+            name:   r.get(1),
+            kind:   RoutineKind::parse(&r.get::<_, String>(2)),
+        })
+        .collect())
+}
+
+async fn routine_definition_pg(
+    client: Arc<PgClient>,
+    routine: RoutineRef,
+) -> Result<String, String> {
+    // `pg_get_functiondef` reconstructs the full `CREATE …` for both functions
+    // and procedures. A name may be overloaded, so several rows can come back;
+    // show each definition separated by a blank line.
+    let rows = client
+        .query(
+            "SELECT pg_get_functiondef(p.oid) \
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = $1 AND p.proname = $2 \
+             ORDER BY p.oid",
+            &[&routine.schema, &routine.name],
+        )
+        .await
+        .map_err(|e| format!("routine definition: {e}"))?;
+
+    if rows.is_empty() {
+        return Err("routine definition not found".to_string());
+    }
+    Ok(rows.iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+async fn list_foreign_keys_pg(client: &PgClient) -> Result<Vec<ForeignKey>, String> {
+    let rows = client
+        .query(
+            "SELECT tc.table_schema, tc.table_name, kcu.column_name, \
+                    ccu.table_schema, ccu.table_name, ccu.column_name \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON tc.constraint_name = kcu.constraint_name \
+              AND tc.table_schema = kcu.table_schema \
+             JOIN information_schema.constraint_column_usage ccu \
+               ON ccu.constraint_name = tc.constraint_name \
+              AND ccu.table_schema = tc.table_schema \
+             WHERE tc.constraint_type = 'FOREIGN KEY' \
+               AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("list foreign keys: {e}"))?;
+
+    Ok(rows.into_iter()
+        .map(|r| ForeignKey {
+            from_table:  TableRef { schema: r.get(0), name: r.get(1) },
+            from_column: r.get(2),
+            to_table:    TableRef { schema: r.get(3), name: r.get(4) },
+            to_column:   r.get(5),
+        })
+        .collect())
 }
 
 async fn list_tables_pg(client: &PgClient) -> Result<Vec<TableRef>, String> {
@@ -261,6 +452,50 @@ async fn run_query_pg(client: Arc<PgClient>, sql: String) -> Result<QueryResult,
     Ok(QueryResult { columns, rows: rendered })
 }
 
+/// Run a free-hand statement on Postgres via `simple_query`, which executes the
+/// text as-is (no parameter binding) and streams back per-statement messages.
+/// Row-returning statements produce a `Rows` outcome with all values rendered as
+/// text; everything else reports the affected-row count of the final command.
+async fn run_statement_pg(client: Arc<PgClient>, sql: String) -> Result<StatementOutcome, String> {
+    let messages = client
+        .simple_query(&sql)
+        .await
+        .map_err(|e| format!("query: {e}"))?;
+
+    let mut columns:  Vec<String>      = Vec::new();
+    let mut rows:     Vec<Vec<String>> = Vec::new();
+    let mut got_rows = false;
+    let mut affected: u64 = 0;
+
+    for msg in messages {
+        match msg {
+            SimpleQueryMessage::RowDescription(cols) => {
+                columns  = cols.iter().map(|c| c.name().to_string()).collect();
+                got_rows = true;
+            }
+            SimpleQueryMessage::Row(row) => {
+                got_rows = true;
+                if columns.is_empty() {
+                    columns = row.columns().iter().map(|c| c.name().to_string()).collect();
+                }
+                rows.push(
+                    (0..row.len())
+                        .map(|i| row.get(i).map(str::to_string).unwrap_or_else(|| "NULL".to_string()))
+                        .collect(),
+                );
+            }
+            SimpleQueryMessage::CommandComplete(n) => affected = n,
+            _ => {}
+        }
+    }
+
+    if got_rows {
+        Ok(StatementOutcome::Rows(QueryResult { columns, rows }))
+    } else {
+        Ok(StatementOutcome::Affected(affected))
+    }
+}
+
 fn pg_cell_to_string(row: &PgRow, idx: usize) -> String {
     let col_type = row.columns()[idx].type_().clone();
 
@@ -293,7 +528,9 @@ fn pg_cell_to_string(row: &PgRow, idx: usize) -> String {
 
 // ── mysql / mariadb backend ───────────────────────────────────────────────────
 
-async fn connect_mysql(cfg: DbConfig) -> Result<(DbClient, Vec<TableRef>), String> {
+async fn connect_mysql(
+    cfg: DbConfig,
+) -> Result<(DbClient, Vec<TableRef>, Vec<ForeignKey>, Vec<RoutineRef>), String> {
     let mut builder = mysql_async::OptsBuilder::default()
         .ip_or_hostname(cfg.host.clone())
         .tcp_port(cfg.port)
@@ -306,10 +543,80 @@ async fn connect_mysql(cfg: DbConfig) -> Result<(DbClient, Vec<TableRef>), Strin
 
     // Validate the connection before returning the pool.
     let mut conn = pool.get_conn().await.map_err(|e| format!("connect: {e}"))?;
-    let tables = list_tables_mysql_with(&mut conn).await?;
+    let tables   = list_tables_mysql_with(&mut conn).await?;
+    let fks      = list_foreign_keys_mysql_with(&mut conn).await?;
+    let routines = list_routines_mysql_with(&mut conn).await?;
     drop(conn);
 
-    Ok((DbClient::Mysql(pool), tables))
+    Ok((DbClient::Mysql(pool), tables, fks, routines))
+}
+
+async fn list_routines_mysql_with(
+    conn: &mut mysql_async::Conn,
+) -> Result<Vec<RoutineRef>, String> {
+    let rows: Vec<(String, String, String)> = conn
+        .query(
+            "SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE FROM information_schema.ROUTINES \
+             WHERE ROUTINE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys') \
+             ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME",
+        )
+        .await
+        .map_err(|e| format!("list routines: {e}"))?;
+
+    Ok(rows.into_iter()
+        .map(|(schema, name, kind)| RoutineRef { schema, name, kind: RoutineKind::parse(&kind) })
+        .collect())
+}
+
+async fn routine_definition_mysql(
+    pool: MyPool,
+    routine: RoutineRef,
+) -> Result<String, String> {
+    let mut conn = pool.get_conn().await.map_err(|e| format!("conn: {e}"))?;
+    let keyword = match routine.kind {
+        RoutineKind::Procedure => "PROCEDURE",
+        RoutineKind::Function  => "FUNCTION",
+    };
+    let sql = format!(
+        "SHOW CREATE {keyword} `{}`.`{}`",
+        escape_mysql_ident(&routine.schema),
+        escape_mysql_ident(&routine.name),
+    );
+    let row: mysql_async::Row = conn
+        .query_first(&sql)
+        .await
+        .map_err(|e| format!("routine definition: {e}"))?
+        .ok_or_else(|| "routine definition not found".to_string())?;
+
+    // SHOW CREATE PROCEDURE/FUNCTION returns the DDL in its third column
+    // ("Create Procedure" / "Create Function"); it is NULL without privileges.
+    row.get::<Option<String>, _>(2)
+        .flatten()
+        .ok_or_else(|| "routine definition unavailable (insufficient privileges?)".to_string())
+}
+
+async fn list_foreign_keys_mysql_with(
+    conn: &mut mysql_async::Conn,
+) -> Result<Vec<ForeignKey>, String> {
+    let rows: Vec<(String, String, String, String, String, String)> = conn
+        .query(
+            "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, \
+                    REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE REFERENCED_TABLE_NAME IS NOT NULL \
+               AND TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')",
+        )
+        .await
+        .map_err(|e| format!("list foreign keys: {e}"))?;
+
+    Ok(rows.into_iter()
+        .map(|(fs, ft, fc, ts, tn, tc)| ForeignKey {
+            from_table:  TableRef { schema: fs, name: ft },
+            from_column: fc,
+            to_table:    TableRef { schema: ts, name: tn },
+            to_column:   tc,
+        })
+        .collect())
 }
 
 async fn list_tables_mysql_with(conn: &mut mysql_async::Conn) -> Result<Vec<TableRef>, String> {
@@ -366,6 +673,41 @@ async fn run_query_mysql(pool: MyPool, sql: String) -> Result<QueryResult, Strin
     Ok(QueryResult { columns, rows: rendered })
 }
 
+/// Run a free-hand statement on MySQL/MariaDB. A statement that exposes columns
+/// is collected into a `Rows` outcome; one that does not (INSERT/UPDATE/DELETE/
+/// DDL) reports the server's affected-row count.
+async fn run_statement_mysql(pool: MyPool, sql: String) -> Result<StatementOutcome, String> {
+    let mut conn = pool.get_conn().await.map_err(|e| format!("conn: {e}"))?;
+    let mut result = conn.query_iter(&sql).await.map_err(|e| format!("query: {e}"))?;
+
+    let columns: Vec<String> = result
+        .columns()
+        .as_ref()
+        .map(|cols| cols.iter().map(|c| c.name_str().to_string()).collect())
+        .unwrap_or_default();
+
+    // No columns ⇒ a non-row-returning statement; report what it changed.
+    if columns.is_empty() {
+        let affected = result.affected_rows();
+        drop(result);
+        return Ok(StatementOutcome::Affected(affected));
+    }
+
+    let mut rendered: Vec<Vec<String>> = Vec::new();
+    while let Some(set) = result.next().await.map_err(|e| format!("rows: {e}"))? {
+        let row: mysql_async::Row = set;
+        let len = row.len();
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let v: MyValue = row.as_ref(i).cloned().unwrap_or(MyValue::NULL);
+            out.push(mysql_value_to_string(&v));
+        }
+        rendered.push(out);
+    }
+
+    Ok(StatementOutcome::Rows(QueryResult { columns, rows: rendered }))
+}
+
 fn mysql_value_to_string(v: &MyValue) -> String {
     match v {
         MyValue::NULL          => "NULL".into(),
@@ -396,4 +738,11 @@ fn escape_mysql_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// Escape an identifier for use inside backticks — a literal backtick is
+/// doubled. Used by the `SHOW CREATE …` routine lookup, which interpolates the
+/// schema/name rather than binding them.
+fn escape_mysql_ident(s: &str) -> String {
+    s.replace('`', "``")
 }

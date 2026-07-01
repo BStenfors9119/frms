@@ -5,7 +5,8 @@
 //! fall back to defaults.
 //!
 //! What we persist (per session): kind, name, working_dir, the browser
-//! url state, the last-open editor file, and the center-tab choice.
+//! url state, the last-open editor file, the center-tab choice, and the
+//! plugin panel layout (dock side, split, tabs, sizes, visibility).
 //! What we deliberately don't: live PTY contents, DB connection state,
 //! screenshots, diff lists — anything that has to be rebuilt fresh on
 //! launch anyway.
@@ -14,6 +15,8 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
+use crate::agent::AgentKind;
+use crate::plugin_panel::{DockSide, PluginPanel, PluginTab};
 use crate::session::SessionKind;
 
 /// Persisted form of the session's center-pane tab. We deliberately don't
@@ -41,6 +44,10 @@ pub struct PersistedSession {
     /// Per-tab user-assigned names, indexed positionally. Shorter than
     /// `claude_count` if only some tabs were renamed.
     pub claude_names: Vec<Option<String>>,
+    /// Per-tab agent kind (build/research/chat), indexed positionally. Empty
+    /// when the file predates this field — restore then treats every tab as a
+    /// `Build` pane, matching the old behaviour.
+    pub claude_kinds: Vec<AgentKind>,
     /// Names of the session's *pinned* Terminals-plugin shell terminals.
     /// Each is respawned as a fresh shell (rooted in `working_dir`) on the
     /// next launch. Unpinned plugin terminals are ephemeral and omitted.
@@ -49,6 +56,9 @@ pub struct PersistedSession {
     /// sessions are written, so this is always true on load — kept explicit
     /// so the restored session stays pinned without re-pinning.
     pub pinned:       bool,
+    /// Plugin panel layout — dock side, split, tabs, sizes, visibility.
+    /// `None` when the file predates this field; restore keeps defaults.
+    pub plugin_panel: Option<PluginPanel>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +92,69 @@ fn kind_from_str(s: &str) -> Option<SessionKind> {
         "browser"  => Some(SessionKind::Browser),
         _          => None,
     }
+}
+
+fn plugin_tab_as_str(t: PluginTab) -> &'static str {
+    match t {
+        PluginTab::Profile   => "profile",
+        PluginTab::Notes     => "notes",
+        PluginTab::Terminals => "terminals",
+        PluginTab::Receivers => "receivers",
+    }
+}
+
+fn plugin_tab_from_str(s: &str) -> Option<PluginTab> {
+    match s {
+        // "db" is a legacy value — the database tooling is no longer a plugin
+        // tab, so an old persisted "db" falls back to the default tab.
+        "profile"   => Some(PluginTab::Profile),
+        "notes"     => Some(PluginTab::Notes),
+        "terminals" => Some(PluginTab::Terminals),
+        "receivers" => Some(PluginTab::Receivers),
+        _           => None,
+    }
+}
+
+fn plugin_panel_to_value(p: &PluginPanel) -> Value {
+    json!({
+        "visible":    p.visible,
+        "dock":       match p.dock { DockSide::Left => "left", DockSide::Right => "right" },
+        "active_tab": plugin_tab_as_str(p.active_tab),
+        "bottom_tab": plugin_tab_as_str(p.bottom_tab),
+        "split":      p.split,
+        "top_height": p.top_height,
+        "width":      p.width,
+        "hidden":     p.hidden.iter().map(|t| plugin_tab_as_str(*t)).collect::<Vec<_>>(),
+    })
+}
+
+fn plugin_panel_from_value(v: &Value) -> Option<PluginPanel> {
+    let obj = v.as_object()?;
+    let mut p = PluginPanel::default();
+    if let Some(b) = obj.get("visible").and_then(Value::as_bool) { p.visible = b; }
+    if let Some(d) = obj.get("dock").and_then(Value::as_str) {
+        p.dock = match d {
+            "left" => DockSide::Left,
+            _      => DockSide::Right,
+        };
+    }
+    if let Some(t) = obj.get("active_tab").and_then(Value::as_str).and_then(plugin_tab_from_str) {
+        p.active_tab = t;
+    }
+    if let Some(t) = obj.get("bottom_tab").and_then(Value::as_str).and_then(plugin_tab_from_str) {
+        p.bottom_tab = t;
+    }
+    if let Some(b) = obj.get("split").and_then(Value::as_bool) { p.split = b; }
+    // Route sizes through the setters so hand-edited or stale values are
+    // clamped to the same bounds the drag handles enforce.
+    if let Some(h) = obj.get("top_height").and_then(Value::as_f64) { p.set_top_height(h as f32); }
+    if let Some(w) = obj.get("width").and_then(Value::as_f64)      { p.set_width(w as f32); }
+    if let Some(arr) = obj.get("hidden").and_then(Value::as_array) {
+        p.hidden = arr.iter()
+            .filter_map(|v| v.as_str().and_then(plugin_tab_from_str))
+            .collect();
+    }
+    Some(p)
 }
 
 fn center_tab_to_value(t: PersistedCenterTab) -> Value {
@@ -154,8 +227,12 @@ impl PersistedState {
             "claude_names": s.claude_names.iter()
                 .map(|n| n.clone().map(Value::String).unwrap_or(Value::Null))
                 .collect::<Vec<_>>(),
+            "claude_kinds": s.claude_kinds.iter()
+                .map(|k| Value::String(k.as_str().to_string()))
+                .collect::<Vec<_>>(),
             "plugin_terminals": s.plugin_terminals,
             "pinned":       s.pinned,
+            "plugin_panel": s.plugin_panel.as_ref().map(plugin_panel_to_value),
         })).collect();
 
         let split_view = self.split_view.as_ref().map(|sv| json!({
@@ -206,6 +283,12 @@ fn parse_session(v: &Value) -> Option<PersistedSession> {
         .and_then(Value::as_array)
         .map(|arr| arr.iter().map(|n| n.as_str().map(str::to_owned)).collect())
         .unwrap_or_default();
+    let claude_kinds = v.get("claude_kinds")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter()
+            .filter_map(|k| k.as_str().and_then(AgentKind::from_str))
+            .collect())
+        .unwrap_or_default();
     let plugin_terminals = v.get("plugin_terminals")
         .and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(|n| n.as_str().map(str::to_owned)).collect())
@@ -215,10 +298,14 @@ fn parse_session(v: &Value) -> Option<PersistedSession> {
     // this version of the format.
     let pinned = v.get("pinned").and_then(Value::as_bool).unwrap_or(true);
 
+    let plugin_panel = v.get("plugin_panel").and_then(plugin_panel_from_value);
+
     Some(PersistedSession {
         id, kind, name, working_dir,
         url_input, browser_url, open_file, center_tab, claude_count, claude_names,
+        claude_kinds,
         plugin_terminals,
         pinned,
+        plugin_panel,
     })
 }

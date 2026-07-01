@@ -10,14 +10,18 @@ pub mod db_panel;
 pub mod editor;
 pub mod prompt_response;
 pub mod file_browser;
+pub mod file_picker;
 pub mod header;
 pub mod new_session_dialog;
 pub mod pane;
 pub mod plugin_panel;
 pub mod prefs_dialog;
 pub mod preview;
+pub mod receivers_panel;
 pub mod session_bar;
+pub mod nda_dialog;
 pub mod splash;
+pub mod telemetry_notice;
 pub mod terminal;
 
 /// Wrap a small icon button in a hover tooltip — the single-glyph buttons

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::agent::{AgentKind, AgentPane};
 use crate::claude_prompt::PendingPrompt;
 use crate::db_panel::DbPanel;
 use crate::editor::EditorState;
@@ -13,6 +14,60 @@ use crate::terminals::TerminalsState;
 pub enum SessionKind {
     Terminal,
     Browser,
+}
+
+/// True if `cmd` is an executable file reachable on `PATH`. Used to decide
+/// whether the `claude` CLI is installed before we try to spawn it.
+fn on_path(cmd: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths)
+            .any(|dir| std::fs::metadata(dir.join(cmd)).map(|m| m.is_file()).unwrap_or(false))
+    })
+}
+
+/// Whether the `claude` CLI is installed (on `PATH`). Both Build panes and the
+/// native chat panes drive it, so the Profile tab surfaces this to the user.
+pub fn claude_on_path() -> bool {
+    on_path("claude")
+}
+
+/// Spawn a Build (Claude Code) agent pane in a PTY.
+///
+/// When the `claude` CLI is on `PATH`, run it directly. When it isn't —
+/// common right after an `.rpm`/`.deb` install, since Claude Code ships via
+/// npm, not as a distro package — fall back to an interactive shell that first
+/// prints install guidance. That keeps a fresh machine from crashing at launch
+/// (the previous code `panic!`ed on the failed spawn) and tells the user
+/// exactly how to get Claude Code, while leaving them a usable shell in the
+/// pane. Re-running an agent pane after installing picks up `claude` normally.
+fn spawn_agent_pane(id: TerminalId, dir: Option<&std::path::Path>) -> TerminalPane {
+    if on_path("claude") {
+        if let Ok(pane) = TerminalPane::spawn(id, "claude", dir) {
+            return pane;
+        }
+    }
+
+    // Single-quote a string for safe inclusion in a `sh -c` script: wrap in
+    // quotes and replace each embedded quote with the '\'' idiom.
+    fn sq(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let lines = [
+        "Claude Code CLI ('claude') was not found on your PATH.",
+        "Agent panes use it to run Claude. To install it:",
+        "    npm install -g @anthropic-ai/claude-code",
+        "(requires Node.js / npm). Then restart frms or open a new agent pane.",
+        "",
+    ];
+    let script = format!(
+        "printf '%s\\n' {}; exec {}",
+        lines.iter().map(|l| sq(l)).collect::<Vec<_>>().join(" "),
+        sq(&shell),
+    );
+    let args = vec!["-c".to_string(), script];
+    TerminalPane::spawn_args(id, "/bin/sh", &args, &[], dir)
+        .unwrap_or_else(|e| panic!("Failed to spawn fallback shell for agent pane {id}: {e}"))
 }
 
 /// Which tab is currently active in the center pane: the editor, the
@@ -42,9 +97,10 @@ pub struct Session {
     pub pinned:           bool,
     pub file_browser:     FileBrowserState,
     pub editor:           EditorState,
-    /// Claude terminals owned by this session, in tab order. Always at
-    /// least one. Each appears as a "Claude N" tab in the center pane.
-    pub terminals:        Vec<TerminalPane>,
+    /// Agent panes owned by this session, in tab order. Always at least one.
+    /// Each appears as a tab in the center pane. Currently every pane is a
+    /// `Build` pane (Claude Code in a PTY); native chat panes arrive later.
+    pub panes:            Vec<AgentPane>,
     pub active_terminal:  TerminalId,
     pub url_input:        String,
     pub browser_url:      String,
@@ -100,9 +156,8 @@ impl Session {
             SessionKind::Browser  => Layout::new_browser(),
         };
         let dir = Some(working_dir.as_path());
-        let terminals = vec![
-            TerminalPane::spawn(first_term, "claude", dir)
-                .unwrap_or_else(|e| panic!("Failed to spawn claude {first_term}: {e}")),
+        let panes = vec![
+            AgentPane::Terminal(spawn_agent_pane(first_term, dir)),
         ];
         let mut file_browser = FileBrowserState::new();
         file_browser.navigate(working_dir.clone());
@@ -121,7 +176,7 @@ impl Session {
             file_browser,
             editor:           EditorState::new(),
             active_terminal:  first_term,
-            terminals,
+            panes,
             url_input:        String::from("http://localhost:3000"),
             browser_url:      String::new(),
             screenshot_bytes: None,
@@ -141,16 +196,26 @@ impl Session {
         }
     }
 
+    /// The underlying PTY terminal for `id`, when that pane is a Build pane.
     pub fn terminal_mut(&mut self, id: TerminalId) -> Option<&mut TerminalPane> {
-        self.terminals.iter_mut().find(|t| t.id == id)
+        self.panes.iter_mut().find(|p| p.id() == id).and_then(|p| p.as_terminal_mut())
     }
 
-    /// Spawn another Claude terminal in this session and return its id.
-    pub fn add_claude_terminal(&mut self, id: TerminalId) -> TerminalId {
-        let dir = Some(self.working_dir.as_path());
-        let pane = TerminalPane::spawn(id, "claude", dir)
-            .unwrap_or_else(|e| panic!("Failed to spawn claude {id}: {e}"));
-        self.terminals.push(pane);
+    /// The chat state for `id`, when that pane is a Research/Chat pane.
+    pub fn chat_mut(&mut self, id: TerminalId) -> Option<&mut crate::agent::ChatPane> {
+        self.panes.iter_mut().find(|p| p.id() == id).and_then(|p| p.as_chat_mut())
+    }
+
+    /// Add an agent pane of the given `kind` and return its id. `Build` spawns
+    /// a `claude` PTY; `Research`/`Chat` create a native chat pane that talks
+    /// to the Messages API (no process spawned).
+    pub fn add_agent(&mut self, id: TerminalId, kind: AgentKind) -> TerminalId {
+        if kind.is_agentic() {
+            let dir = Some(self.working_dir.as_path());
+            self.panes.push(AgentPane::Terminal(spawn_agent_pane(id, dir)));
+        } else {
+            self.panes.push(AgentPane::Chat(crate::agent::ChatPane::new(id, kind)));
+        }
         id
     }
 
@@ -159,21 +224,21 @@ impl Session {
     /// `active_terminal` / `center_tab` and clears any pending prompt sourced
     /// from the closed terminal. Returns true if the terminal was removed.
     pub fn close_claude_terminal(&mut self, id: TerminalId) -> bool {
-        if self.terminals.len() <= 1 {
+        if self.panes.len() <= 1 {
             return false;
         }
-        let Some(pos) = self.terminals.iter().position(|t| t.id == id) else {
+        let Some(pos) = self.panes.iter().position(|p| p.id() == id) else {
             return false;
         };
-        self.terminals.remove(pos);
+        self.panes.remove(pos);
 
         // Pick the neighbour that visually replaces the closed tab — prefer
         // the one to the right (now at the same index), falling back to the
         // last remaining tab when we removed the rightmost one.
-        let neighbour = self.terminals.get(pos)
-            .or_else(|| self.terminals.last())
-            .map(|t| t.id)
-            .expect("terminals is non-empty after the early return above");
+        let neighbour = self.panes.get(pos)
+            .or_else(|| self.panes.last())
+            .map(|p| p.id())
+            .expect("panes is non-empty after the early return above");
 
         if self.active_terminal == id {
             self.active_terminal = neighbour;
@@ -192,6 +257,6 @@ impl Session {
 
     #[allow(dead_code)]
     pub fn terminal(&self, id: TerminalId) -> Option<&TerminalPane> {
-        self.terminals.iter().find(|t| t.id == id)
+        self.panes.iter().find(|p| p.id() == id).and_then(|p| p.as_terminal())
     }
 }

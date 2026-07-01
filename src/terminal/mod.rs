@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use iced::futures::SinkExt;
 use std::sync::{Arc, Mutex};
 
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use vte::Parser;
 
 pub use grid::{Grid, COLS, ROWS};
@@ -101,8 +101,10 @@ pub struct TerminalPane {
     /// (`TIOCSWINSZ`) to match the visible pane — letting the child reflow its
     /// output to the real width instead of the fixed 80-column default.
     master:     Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    /// Kept alive so the slave PTY end stays open for the child process.
-    _slave:     Box<dyn portable_pty::SlavePty + Send>,
+    /// The spawned child process. The subscription polls this to learn when
+    /// the shell has exited (e.g. the user typed `exit`) so the terminal can
+    /// be torn down. Shared so the subscription's poll thread can reach it.
+    pub child:  Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     /// Shared with the subscription; wrapped so it outlives the PTY setup.
     pub reader: Arc<Mutex<Box<dyn Read + Send>>>,
 }
@@ -112,6 +114,20 @@ impl TerminalPane {
     pub fn spawn(
         id:          TerminalId,
         command:     &str,
+        working_dir: Option<&std::path::Path>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::spawn_args(id, command, &[], &[], working_dir)
+    }
+
+    /// Spawn `command args…` in a new PTY with extra environment variables,
+    /// optionally rooted at `working_dir`. Used to launch `sshpass ssh …` for
+    /// receiver sessions, where the password rides in `SSHPASS` rather than the
+    /// argument list.
+    pub fn spawn_args(
+        id:          TerminalId,
+        command:     &str,
+        args:        &[String],
+        envs:        &[(String, String)],
         working_dir: Option<&std::path::Path>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let pty_system = native_pty_system();
@@ -124,6 +140,9 @@ impl TerminalPane {
         })?;
 
         let mut cmd = CommandBuilder::new(command);
+        for arg in args {
+            cmd.arg(arg);
+        }
         // CommandBuilder inherits the parent env verbatim and sets no TERM of
         // its own. When the IDE is launched from a desktop entry (rather than
         // a shell), TERM is unset — children then assume a dumb terminal: no
@@ -132,10 +151,18 @@ impl TerminalPane {
         // from a terminal during development.
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
         if let Some(dir) = working_dir {
             cmd.cwd(dir);
         }
-        let _child = pair.slave.spawn_command(cmd)?;
+        let child = pair.slave.spawn_command(cmd)?;
+        // Drop our copy of the slave now that the child owns its own pty fds.
+        // Holding it open would keep the master from ever returning EOF/EIO
+        // when the child exits, so the subscription could never tell that the
+        // shell had closed.
+        drop(pair.slave);
 
         let writer = pair.master.take_writer()?;
         let reader = pair.master.try_clone_reader()?;
@@ -149,7 +176,7 @@ impl TerminalPane {
             parser:    Parser::new(),
             writer:    Arc::new(Mutex::new(writer)),
             master:    Arc::new(Mutex::new(pair.master)),
-            _slave:    pair.slave,
+            child:     Arc::new(Mutex::new(child)),
             reader:    Arc::new(Mutex::new(reader)),
         })
     }
@@ -194,11 +221,14 @@ pub fn resize_pty(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>, cols: usize, r
 // ── subscription ──────────────────────────────────────────────────────────────
 
 /// Returns an iced Subscription that continuously reads bytes from the PTY
-/// master and emits `on_data(id, bytes)` messages.
+/// master and emits `on_data(id, bytes)` messages. When the child process
+/// exits (e.g. the user typed `exit`), it emits `on_exit(id)` once and ends.
 pub fn pty_subscription<Message>(
     id: TerminalId,
     reader: Arc<Mutex<Box<dyn Read + Send + 'static>>>,
+    child: Arc<Mutex<Box<dyn Child + Send + Sync + 'static>>>,
     on_data: impl Fn(TerminalId, Vec<u8>) -> Message + Send + Sync + 'static,
+    on_exit: impl Fn(TerminalId) -> Message + Send + Sync + 'static,
 ) -> iced::Subscription<Message>
 where
     Message: Send + 'static,
@@ -207,6 +237,7 @@ where
 
     iced::Subscription::run_with_id(id, iced::stream::channel(256, move |mut tx| {
         let reader = reader.clone();
+        let child  = child.clone();
         async move {
             loop {
                 // Drive blocking reads off the async executor thread.
@@ -225,6 +256,20 @@ where
                         let _ = tx.send(on_data(id, bytes)).await;
                     }
                     _ => {
+                        // No data — either a transient read hiccup or the child
+                        // has gone. Confirm via the child handle: once it has
+                        // exited, tell the app to tear this terminal down and
+                        // stop the read loop.
+                        let child = child.clone();
+                        let exited = tokio::task::spawn_blocking(move || {
+                            child.lock().ok()
+                                .and_then(|mut c| c.try_wait().ok().flatten())
+                                .is_some()
+                        }).await.unwrap_or(false);
+                        if exited {
+                            let _ = tx.send(on_exit(id)).await;
+                            break;
+                        }
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 }

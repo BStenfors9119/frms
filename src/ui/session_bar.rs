@@ -1,5 +1,5 @@
 use iced::{Alignment, Background, Border, Color, Element, Length, Renderer, Theme};
-use iced::widget::{button, container, row, text, text_input, tooltip};
+use iced::widget::{button, container, row, scrollable, text, text_input, tooltip};
 
 use crate::app::{Message, SplitSlot};
 use crate::fonts::{ICON_FONT, UI_FONT};
@@ -56,9 +56,19 @@ pub fn view<'a>(
             .style(buttons::primary),
     );
 
+    // Let the row keep its natural width and scroll horizontally once the
+    // session tabs overflow the pane — otherwise they bunch up / get clipped.
+    // The scrollbar only materialises when the content is wider than the bar,
+    // so the common (few-sessions) case looks exactly as before.
+    let bar = scrollable(tabs)
+        .width(Length::Fill)
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new().width(4).scroller_width(4),
+        ));
+
     let surface = colors.surface;
     let accent  = colors.tertiary;
-    container(tabs)
+    container(bar)
         .width(Length::Fill)
         .align_y(Alignment::Center)
         .style(move |_theme: &Theme| container::Style {
@@ -83,7 +93,7 @@ fn session_tab<'a>(
     // Any Claude terminal in this session stopped on a question? Turn the
     // whole session tab amber so the user notices even while working in a
     // different session.
-    let waiting = session.terminals.iter().any(|t| t.waiting_on_user);
+    let waiting = session.panes.iter().any(|p| p.waiting_on_user());
 
     let fg = if waiting {
         buttons::tab_text_color(buttons::ATTENTION, buttons::ATTENTION, is_active)

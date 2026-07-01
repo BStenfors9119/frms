@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::theme::{FontScale, Mode, Palette, TerminalFontScale, ThemeColors};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Prefs {
     /// Default working directory for new sessions. When set, the new-session
     /// dialog opens with the picker rooted here instead of `$HOME`.
@@ -17,6 +17,34 @@ pub struct Prefs {
     pub mode:                Mode,
     pub font_scale:          FontScale,
     pub terminal_font_scale: TerminalFontScale,
+    /// Share anonymous usage telemetry ([`crate::telemetry`]). On by default;
+    /// the user can turn it off in the Profile tab. Hand-written `Default`
+    /// below keeps this `true` (a derived `Default` would make it `false`, so a
+    /// missing/corrupt prefs file would silently opt out).
+    pub telemetry:           bool,
+    /// Whether the user has seen the first-run telemetry notice. Until this is
+    /// `true`, the notice modal is shown and **no telemetry is sent** — consent
+    /// before collection.
+    pub telemetry_notice_ack: bool,
+    /// Whether the user has accepted the Non-Disclosure Agreement. Until `true`,
+    /// the first-run NDA modal blocks the app (declining exits). This is the
+    /// cross-format acceptance that replaced the deb-only debconf gate.
+    pub nda_accepted:        bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self {
+            dev_dir:             None,
+            palette:             Palette::default(),
+            mode:                Mode::default(),
+            font_scale:          FontScale::default(),
+            terminal_font_scale: TerminalFontScale::default(),
+            telemetry:           true,
+            telemetry_notice_ack: false,
+            nda_accepted:        false,
+        }
+    }
 }
 
 fn prefs_path() -> Option<PathBuf> {
@@ -51,6 +79,12 @@ impl Prefs {
                 .and_then(Value::as_str)
                 .and_then(TerminalFontScale::from_str)
                 .unwrap_or_default(),
+            // Absent key → on (opt-out, not opt-in).
+            telemetry: v.get("telemetry").and_then(Value::as_bool).unwrap_or(true),
+            // Absent key → not yet acknowledged (show the first-run notice).
+            telemetry_notice_ack: v.get("telemetry_notice_ack").and_then(Value::as_bool).unwrap_or(false),
+            // Absent key → not yet accepted (show the NDA gate).
+            nda_accepted: v.get("nda_accepted").and_then(Value::as_bool).unwrap_or(false),
         }
     }
 
@@ -65,6 +99,9 @@ impl Prefs {
             "mode":                self.mode.as_str(),
             "font_scale":          self.font_scale.as_str(),
             "terminal_font_scale": self.terminal_font_scale.as_str(),
+            "telemetry":           self.telemetry,
+            "telemetry_notice_ack": self.telemetry_notice_ack,
+            "nda_accepted":        self.nda_accepted,
         });
         if let Ok(bytes) = serde_json::to_vec_pretty(&v) {
             let _ = std::fs::write(&path, bytes);

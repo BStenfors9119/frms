@@ -4,13 +4,14 @@ use iced::widget::text::LineHeight;
 
 use crate::app::Message;
 use crate::fonts::{ICON_FONT, RESET_FONT, UI_FONT};
-use crate::stats::{ClaudeStats, RefreshInterval};
+use crate::stats::{ClaudeStats, ProcStats, RefreshInterval};
 use crate::theme::ThemeColors;
 use crate::ui::buttons;
 
 pub fn view(
     plugin_visible:   bool,
     stats:            &ClaudeStats,
+    procs:            &ProcStats,
     refresh_interval: RefreshInterval,
     collapsed:        bool,
     colors:           ThemeColors,
@@ -77,6 +78,7 @@ pub fn view(
 
     let left_col = column![
         row![session_bar, week_bar].spacing(16),
+        proc_tracker(procs),
         row![refresh_btn, interval_picker]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -157,6 +159,45 @@ fn usage_bar(
     .width(Length::Fill)
     .spacing(3)
     .into()
+}
+
+/// Compact summary of every `claude` process on the machine — count, total
+/// resident memory (with its share of system RAM), and aggregate CPU — plus a
+/// bar showing the memory share, matching the usage bars above it.
+fn proc_tracker(procs: &ProcStats) -> Element<'static, Message> {
+    let frac  = procs.mem_fraction();
+    let label = format!(
+        "Claude procs  {}   ·   Mem {} ({:.0}%)   ·   CPU {:.0}%",
+        procs.count(),
+        fmt_mem(procs.total_rss_kb()),
+        frac * 100.0,
+        procs.total_cpu_pct(),
+    );
+
+    column![
+        text(label).font(UI_FONT).size(13),
+        progress_bar(0.0..=1.0, frac)
+            .width(Length::Fill)
+            .height(Length::Fixed(14.0))
+            .style(move |_theme: &Theme| progress_bar::Style {
+                background: Background::Color(Color::from_rgb8(45, 45, 55)),
+                bar:        Background::Color(bar_color(frac)),
+                border:     Border { color: Color::TRANSPARENT, width: 0.0, radius: 4.0.into() },
+            }),
+    ]
+    .width(Length::Fill)
+    .spacing(3)
+    .into()
+}
+
+/// Render a KiB count as a friendly "512 MB" / "1.2 GB" string.
+fn fmt_mem(kb: u64) -> String {
+    let mb = kb as f64 / 1024.0;
+    if mb >= 1024.0 {
+        format!("{:.1} GB", mb / 1024.0)
+    } else {
+        format!("{mb:.0} MB")
+    }
 }
 
 fn bar_color(fraction: f32) -> Color {

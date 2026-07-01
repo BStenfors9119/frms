@@ -6,3 +6,10 @@
 
 # macOS
 .DS_Store
+
+# Packaging output
+/dist/
+
+# Packaging working dir — build cache (_package/target), staged deb tree,
+# keyring, and the deploy.sh apt-repo sftp credential. Nothing here is source.
+/_package/

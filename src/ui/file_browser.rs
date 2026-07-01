@@ -141,7 +141,18 @@ fn entry_row(entry: &Entry) -> Element<'static, Message> {
         .width(Length::Fill);
 
     if !entry.is_dir {
-        return main.into();
+        // 📤 copies this file to the currently-selected TSR receiver (scp).
+        let to_receiver = crate::ui::with_tip(
+            button(text("\u{1F4E4}").font(ICON_FONT).size(11))
+                .on_press(Message::ReceiverCopyFile(entry.path.clone()))
+                .padding([4, 6])
+                .style(buttons::secondary),
+            "Copy to selected receiver",
+        );
+        return row![main, to_receiver]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into();
     }
 
     let rename = button(text("✎").font(ICON_FONT).size(11))

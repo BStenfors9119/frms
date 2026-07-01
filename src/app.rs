@@ -3,18 +3,20 @@ use std::time::{Duration, Instant};
 
 use iced::widget::{column, container, pane_grid, text_editor, text_input};
 use iced::widget::pane_grid::Configuration;
-use iced::{Element, Length, Subscription, Task, Theme};
+use iced::{Element, Length, Subscription, Task, Theme, window};
 use iced::keyboard::{self, key};
 
+use crate::agent::{AgentKind, AgentPane, ChatMessage, ChatPane, ChatRole};
 use crate::cdp;
+use crate::chat_api;
 use crate::claude_prompt;
-use crate::db::{self, DbClient, DbEngine, DbProvider, QueryResult, TableRef};
-use crate::db_panel::ConnState;
+use crate::db::{self, DbClient, DbEngine, DbProvider, ForeignKey, QueryResult, RoutineRef, StatementOutcome, TableRef};
+use crate::db_panel::{ColRef, Conj, ConnState, Filter, FilterOp};
 use crate::file_browser::{DirEdit, FileBrowserState};
 use crate::notes::{NoteFormat, NoteViewMode, NotesState};
 use crate::plugin_panel::{PluginSlot, PluginTab};
 use crate::prefs::Prefs;
-use crate::stats::{self, ClaudeStats, RefreshInterval};
+use crate::stats::{self, ClaudeStats, ProcStats, RefreshInterval};
 use crate::theme::{self as theme_mod, FontScale, Mode, Palette, TerminalFontScale, ThemeColors};
 use crate::pane::PaneKind;
 use crate::session::{Session, SessionKind};
@@ -26,6 +28,12 @@ use crate::ui;
 /// that the pane's own resize provokes (which would otherwise flicker), short
 /// enough that the pane disappears promptly once the prompt is truly answered.
 const PROMPT_CLEAR_DELAY: Duration = Duration::from_millis(400);
+
+/// Text-input widget id for a chat pane's message box, so the app can move
+/// keyboard focus into it when the pane is created or selected.
+pub fn chat_input_id(id: TerminalId) -> text_input::Id {
+    text_input::Id::new(format!("chat-input-{id}"))
+}
 
 // ── splash animation state ────────────────────────────────────────────────────
 
@@ -77,10 +85,20 @@ pub enum PendingClose {
     Claude(TerminalId),
 }
 
+/// Full-screen file picker for choosing a local file to copy to a receiver.
+/// Carries its own directory browser plus the receiver the chosen file is
+/// destined for (captured at open time so it can't drift).
+pub struct FilePicker {
+    pub browser:  FileBrowserState,
+    pub receiver: u64,
+}
+
 pub struct Frms {
     pub sessions:                Vec<Session>,
     pub active_session:          usize,
     pub split_view:              Option<SplitView>,
+    /// `Some` while the receiver file-copy picker overlay is on screen.
+    pub file_picker:             Option<FilePicker>,
     /// `Some` while the close-confirmation dialog is on screen.
     pub pending_close:           Option<PendingClose>,
     pub creating_session:        bool,
@@ -90,16 +108,30 @@ pub struct Frms {
     pub renaming_session:        Option<(usize, String)>,
     /// Inline rename for a Claude terminal tab — `(terminal_id, draft)`.
     pub renaming_claude:         Option<(TerminalId, String)>,
+    /// `true` while the "+ Agent" button's dropdown menu is open.
+    pub agent_menu_open:         bool,
     next_terminal_id:            u64,
     next_session_id:             usize,
     pub claude_stats:            ClaudeStats,
+    pub claude_procs:            ProcStats,
     pub stats_refresh_interval:  RefreshInterval,
     // Preferences
     pub prefs:                   Prefs,
     pub showing_prefs:           bool,
     pub prefs_dev_dir_input:     String,
     pub prefs_file_browser:      FileBrowserState,
+    /// Whether the `claude` CLI is on `PATH`, shown in the Profile tab's Claude
+    /// Code status. Probed once at startup (an external install/sign-in via
+    /// `frms-setup-claude` is picked up on the next launch).
+    pub claude_installed:        bool,
+    /// Anonymous usage telemetry sender (no-op when the user has opted out).
+    pub telemetry:               crate::telemetry::Telemetry,
     pub notes:                   NotesState,
+    /// Global TSR receiver inventory shown in the Receivers plugin tab.
+    pub receivers:               crate::receivers::ReceiversState,
+    /// Rows parsed from a CSV import, held between loading the file and the
+    /// user confirming the column mapping. Empty when no CSV import is pending.
+    pub csv_import_rows:         Vec<Vec<String>>,
     /// Active theme-color crossfade. `None` when the theme is settled.
     pub theme_anim:              Option<ThemeAnim>,
     /// When true the top header collapses to a slim bar with just an expand toggle.
@@ -213,6 +245,9 @@ pub enum Message {
     EditorPreviewReady(usize, PathBuf, Result<Vec<u8>, String>),
     // Terminals
     TerminalData(TerminalId, Vec<u8>),
+    /// The child process behind a terminal exited (e.g. the user typed
+    /// `exit`). Plugin shell terminals are removed in response.
+    TerminalExited(TerminalId),
     TerminalInput(String),
     TerminalScroll(TerminalId, f32),
     /// Left mouse pressed on a terminal canvas at the given viewport cell —
@@ -242,9 +277,24 @@ pub enum Message {
     /// Clipboard read completed — write its contents to the active terminal,
     /// wrapping with bracketed-paste markers when the program has opted in.
     TerminalPasteReady(Option<String>),
+    /// A background clipboard *write* finished. No-op; exists only so the
+    /// shell-out `Task` has a message to resolve to.
+    ClipboardWritten,
     TabPressed { shift: bool },
-    /// Add a new Claude terminal to the active session and select its tab.
-    ClaudeSessionAdded,
+    /// Add a new agent pane of the given kind to the active session and select
+    /// its tab (Build = Claude Code PTY, Research/Chat = native chat).
+    AgentAdded(AgentKind),
+    /// Toggle the "+ Agent" dropdown menu open/closed.
+    AgentMenuToggled,
+    /// Edited the draft input of a chat (Research/Chat) pane.
+    ChatInputEdited(TerminalId, String),
+    /// Submitted the draft of a chat pane — sends the transcript to the API.
+    ChatSubmitted(TerminalId),
+    /// A streamed text fragment arrived for a chat pane's in-flight reply.
+    ChatDelta(TerminalId, String),
+    /// A chat pane's reply stream finished — `Ok(session_id)` (to resume on the
+    /// next turn) or `Err(message)` on failure.
+    ChatEnded(TerminalId, Result<String, String>),
     /// Close a Claude terminal tab from a session (only when more than one exists).
     ClaudeSessionClosed(TerminalId),
     /// Begin inline rename of the named Claude terminal tab.
@@ -278,10 +328,17 @@ pub enum Message {
     // Stats
     StatsRefresh,
     StatsLoaded(ClaudeStats),
+    ProcsLoaded(ProcStats),
     StatsRefreshIntervalChanged(RefreshInterval),
     // Plugin panel (DB / Profile / Notes / Terminals)
     /// A tab was clicked in the given slot — switch that slot to the tab.
     PluginTabClicked(PluginSlot, PluginTab),
+    /// Hide a plugin from the tab bar via its per-tab `✕`.
+    PluginTabHidden(PluginTab),
+    /// Re-show a hidden plugin (and make it active) from the `+` picker.
+    PluginTabShown(PluginTab),
+    /// Toggle the `+` add-plugin picker that lists hidden plugins.
+    PluginAddPickerToggled,
     PluginPanelHide,
     /// Toggle plugin panel visibility without changing the active tab.
     /// Bound to the consolidated header button.
@@ -333,9 +390,69 @@ pub enum Message {
     /// Move keyboard focus out of the Terminals-plugin Name field and into the
     /// selected terminal — emitted by Tab or Enter while naming.
     TerminalPluginFocusTerminal,
+    // Receivers plugin (global TSR receiver inventory)
+    /// Add a container under `Some(parent)` or as a new root (`None`).
+    ReceiverContainerAdd(Option<u64>),
+    ReceiverContainerSelect(u64),
+    ReceiverContainerRenamed(u64, String),
+    ReceiverContainerDelete(u64),
+    /// Expand/collapse a container row in the tree.
+    ReceiverContainerToggle(u64),
+    /// Add a receiver under the given container.
+    ReceiverAdd(u64),
+    ReceiverSelect(u64),
+    ReceiverDelete(u64),
+    // Edit form for the selected receiver.
+    ReceiverNameEdited(String),
+    ReceiverHostEdited(String),
+    ReceiverUserEdited(String),
+    ReceiverPasswordEdited(String),
+    ReceiverPortEdited(String),
+    /// Open an interactive SSH session to the given receiver.
+    ReceiverConnect(u64),
+    /// Tear down the live SSH session for the given receiver.
+    ReceiverSshDisconnect(u64),
+    /// Open the file picker to choose a local file to copy to the selected receiver.
+    ReceiverCopyPick,
+    /// Navigate the file picker to a directory.
+    ReceiverPickerBrowse(std::path::PathBuf),
+    /// A file was chosen in the picker — copy it to the picker's receiver.
+    ReceiverPickerChoose(std::path::PathBuf),
+    /// Dismiss the file picker without copying.
+    ReceiverPickerCancel,
+    /// Copy a specific file (e.g. a file-browser row action) to the selected receiver.
+    ReceiverCopyFile(std::path::PathBuf),
+    /// Result of an scp copy.
+    ReceiverCopyDone(Result<String, String>),
+    // Import flow (DB / CSV).
+    /// Begin a database import for the selected container (shows the table picker).
+    ReceiverImportDbStart,
+    /// A table was chosen — fetch its columns.
+    ReceiverImportTablePicked(String),
+    /// Columns fetched for the chosen DB table (or an error).
+    ReceiverImportColumnsLoaded(Result<Vec<String>, String>),
+    /// Begin a CSV import for the selected container.
+    ReceiverImportCsvStart,
+    ReceiverImportCsvPathEdited(String),
+    /// Parse the CSV at the entered path and populate the column mapping.
+    ReceiverImportCsvLoad,
+    /// Map one receiver field onto a source column (or clear it).
+    ReceiverImportFieldMapped(crate::receivers::MapField, Option<String>),
+    /// Set a literal username/password/port to apply when that column is unmapped.
+    ReceiverImportLiteralEdited(crate::receivers::MapField, String),
+    /// Set the optional import row-filter column (or clear it).
+    ReceiverImportFilterColumn(Option<String>),
+    ReceiverImportFilterOp(crate::receivers::ImportFilterOp),
+    ReceiverImportFilterValue(String),
+    /// Confirm the import — fetch rows (DB) or reuse parsed rows (CSV) and create receivers.
+    ReceiverImportConfirm,
+    /// Rows fetched for a DB import (or an error).
+    ReceiverImportRowsLoaded(Result<Vec<Vec<String>>, String>),
+    ReceiverImportCancel,
     // Database panel (active session)
     DbEngineChanged(DbEngine),
     DbProviderChanged(DbProvider),
+    DbFormToggleCollapsed,
     DbHostEdited(String),
     DbPortEdited(String),
     DbUserEdited(String),
@@ -343,17 +460,65 @@ pub enum Message {
     DbDatabaseEdited(String),
     DbFieldSubmitted(&'static str),
     DbConnect,
-    DbConnected(usize, Result<(DbClient, Vec<TableRef>), String>),
+    DbConnected(usize, Result<(DbClient, Vec<TableRef>, Vec<ForeignKey>, Vec<RoutineRef>), String>),
     DbDisconnect,
     DbTableToggled(String),
+    /// Open a stored procedure/function's source for viewing (Objects list).
+    DbRoutineSelected(RoutineRef),
+    /// The fetched source of the selected routine (or an error).
+    DbRoutineLoaded(usize, Result<String, String>),
+    /// Dismiss the routine source view and return to query results.
+    DbRoutineClosed,
     DbColumnsLoaded(usize, String, Result<Vec<String>, String>),
     DbColumnToggled(String, String),
-    DbBuildQuery,
-    DbQueryEdited(String),
+    /// Check/uncheck "All fields" — select or clear every available column.
+    DbFieldsSelectAll(bool),
+    /// Mouse-drag reordering of the picked result columns (Col 3): begin a drag
+    /// on a field, drag over another to move it there, release to finish.
+    DbFieldDragStart(usize),
+    DbFieldDragOver(usize),
+    DbFieldDragEnd,
+    /// Remove a picked result column from the query by its position.
+    DbFieldRemoved(usize),
+    /// WHERE-clause editing in the Filters column: add a new condition,
+    /// change a condition's column / operator / value, flip its AND/OR
+    /// connector, or remove it by position.
+    DbFilterAdd,
+    DbFilterColumnChanged(usize, ColRef),
+    DbFilterOpChanged(usize, FilterOp),
+    DbFilterValueChanged(usize, String),
+    DbFilterConjToggled(usize),
+    DbFilterRemoved(usize),
+    /// Toggle a (table, column) into/out of the GROUP BY clause.
+    DbGroupToggled(String, String),
+    /// Manual JOIN-condition edits, keyed by the joined table. The first arg is
+    /// the joined table key; the second the chosen left table / column / column.
+    DbJoinLeftTableChanged(String, String),
+    DbJoinLeftColChanged(String, String),
+    DbJoinRightColChanged(String, String),
     DbRunQuery,
+    /// Re-run the last query so the results list reflects current data.
+    DbRefreshResults,
     DbQueryResult(usize, Result<QueryResult, String>),
-    DbResetQuery,
     DbResetTables,
+    /// Switch the builder row between the visual builder and the free-hand SQL
+    /// editor (false = builder, true = raw SQL).
+    DbSetSqlMode(bool),
+    /// Edit the free-hand SQL buffer.
+    DbSqlAction(text_editor::Action),
+    /// Execute the free-hand SQL verbatim against the connection.
+    DbRunSql,
+    /// Outcome of a free-hand statement — a result set or an affected-row count.
+    DbStatementResult(usize, Result<StatementOutcome, String>),
+    /// Filter the Tables/Objects list in Col 1 by name.
+    DbObjectFilterChanged(String),
+    /// Collapse/expand the Tables and Objects groups in Col 1.
+    DbTablesToggleCollapsed,
+    DbObjectsToggleCollapsed,
+    /// Collapse/expand the builder row to give the results table more room.
+    DbRow1ToggleCollapsed,
+    /// Copy a single results-table cell value (e.g. an ID) to the clipboard.
+    DbCopyValue(String),
     // Center-pane tab switcher
     CenterTabSelected(crate::session::CenterTab),
     // Preferences
@@ -366,6 +531,14 @@ pub enum Message {
     PrefsModeChanged(Mode),
     PrefsFontScaleChanged(FontScale),
     PrefsTerminalFontScaleChanged(TerminalFontScale),
+    /// Profile-tab toggle for anonymous usage telemetry.
+    PrefsTelemetryToggled(bool),
+    /// First-run telemetry notice dismissed — `true` keeps telemetry on, `false`
+    /// turns it off. Either way the notice is acknowledged and won't reappear.
+    TelemetryNoticeChoice(bool),
+    /// First-run NDA gate — `true` accepts (and proceeds), `false` declines and
+    /// exits the app.
+    NdaChoice(bool),
     /// Tick from the per-frame theme-crossfade subscription.
     ThemeAnimTick,
     /// Collapse / expand the top header panel.
@@ -431,15 +604,22 @@ impl Frms {
             new_session_file_browser: new_session_browser,
             renaming_session:         None,
             renaming_claude:          None,
+            agent_menu_open:          false,
             next_terminal_id:         0,
             next_session_id:          1,
             claude_stats:             ClaudeStats::default(),
+            claude_procs:             ProcStats::default(),
             stats_refresh_interval:   RefreshInterval::default(),
             prefs,
             showing_prefs:            false,
             prefs_dev_dir_input,
             prefs_file_browser:       prefs_browser,
+            claude_installed:         crate::session::claude_on_path(),
+            telemetry:                crate::telemetry::Telemetry::disabled(),
             notes:                    NotesState::load(),
+            receivers:                crate::receivers::ReceiversState::load(),
+            csv_import_rows:          Vec::new(),
+            file_picker:              None,
             theme_anim:               None,
             header_collapsed:         false,
             plugin_panel_drag:        None,
@@ -455,11 +635,23 @@ impl Frms {
             splash_audio_children:    Vec::new(),
         };
         app.restore_persisted();
+        // Telemetry only starts after the user has seen the first-run notice —
+        // no events (not even launch) are sent before consent. Once acked, it
+        // honors the on/off pref. The first post-consent launch is recorded by
+        // the notice handler.
+        if app.prefs.telemetry_notice_ack {
+            app.telemetry = crate::telemetry::Telemetry::start(app.prefs.telemetry);
+            app.telemetry.record(crate::telemetry::Event::Launch);
+        }
         let init_stats = Task::perform(
             stats::load(),
             |s| Message::StatsLoaded(s.unwrap_or_default()),
         );
-        (app, init_stats)
+        let init_procs = Task::perform(stats::load_procs(), Message::ProcsLoaded);
+        // Start maximized: grab the freshly-opened window and maximize it.
+        let maximize = window::get_latest()
+            .and_then(|id| window::maximize(id, true));
+        (app, Task::batch([init_stats, init_procs, maximize]))
     }
 
     /// Re-create sessions from `~/.frms/sessions.json` (written on every
@@ -485,17 +677,30 @@ impl Frms {
             // Restored sessions were only written because they were pinned,
             // so keep them pinned (otherwise they'd vanish on next save).
             session.pinned = ps.pinned;
-            // Spawn any additional Claude terminals the session had open.
-            for _ in 1..ps.claude_count.max(1) {
+            // `Session::new` always makes pane[0] a Build/Claude PTY. If this
+            // session's first tab was actually a chat pane, swap it (killing the
+            // just-spawned `claude` child so it doesn't linger orphaned).
+            if let Some(k0) = ps.claude_kinds.first().copied() {
+                if !k0.is_agentic() {
+                    if let Some(t) = session.panes[0].as_terminal() {
+                        let _ = t.child.lock().map(|mut c| c.kill());
+                    }
+                    session.panes[0] = AgentPane::Chat(ChatPane::new(first_term, k0));
+                }
+            }
+            // Recreate any additional tabs the session had open, each with its
+            // persisted kind (defaulting to Build for pre-kinds save files).
+            for i in 1..ps.claude_count.max(1) {
                 let tid = self.next_terminal_id;
                 self.next_terminal_id += 1;
-                session.add_claude_terminal(tid);
+                let kind = ps.claude_kinds.get(i).copied().unwrap_or_default();
+                session.add_agent(tid, kind);
             }
             // Restore per-tab user-assigned names.
-            for (i, t) in session.terminals.iter_mut().enumerate() {
+            for (i, p) in session.panes.iter_mut().enumerate() {
                 if let Some(name) = ps.claude_names.get(i).and_then(|n| n.clone()) {
                     if !name.trim().is_empty() {
-                        t.name = Some(name);
+                        p.set_name(Some(name));
                     }
                 }
             }
@@ -503,14 +708,19 @@ impl Frms {
                 crate::persisted::PersistedCenterTab::Editor   => crate::session::CenterTab::Editor,
                 crate::persisted::PersistedCenterTab::Database => crate::session::CenterTab::Database,
                 crate::persisted::PersistedCenterTab::Claude(i) => {
-                    session.terminals.get(i)
-                        .map(|t| crate::session::CenterTab::Claude(t.id))
+                    session.panes.get(i)
+                        .map(|p| crate::session::CenterTab::Claude(p.id()))
                         .unwrap_or(crate::session::CenterTab::Editor)
                 }
             };
             if let Some(u) = &ps.url_input   { session.url_input   = u.clone(); }
             if let Some(u) = &ps.browser_url { session.browser_url = u.clone(); }
             if let Some(p) = &ps.open_file   { session.editor.open(p.clone()); }
+            // Restore the plugin panel layout — dock side, split, tabs,
+            // sizes, visibility — exactly as the user last arranged it.
+            if let Some(panel) = &ps.plugin_panel {
+                session.plugin_panel = panel.clone();
+            }
             // Respawn the session's pinned plugin shell terminals as fresh
             // shells, preserving the names the user gave them.
             for name in &ps.plugin_terminals {
@@ -561,6 +771,17 @@ impl Frms {
 
     /// Snapshot the current session list and split state to disk. Called
     /// after every mutation that affects persisted fields.
+    /// The file browser that inline directory edits (create/rename/delete)
+    /// should act on: the new-project dialog's picker while that dialog is
+    /// open, otherwise the active session's file browser.
+    fn dir_edit_browser(&mut self) -> &mut FileBrowserState {
+        if self.creating_session {
+            &mut self.new_session_file_browser
+        } else {
+            &mut self.sessions[self.active_session].file_browser
+        }
+    }
+
     fn save_persisted(&self) {
         // A session is written if the user pinned it, or if it owns at least
         // one pinned plugin terminal (so a pinned shell survives even inside
@@ -572,7 +793,7 @@ impl Frms {
                 crate::session::CenterTab::Editor   => crate::persisted::PersistedCenterTab::Editor,
                 crate::session::CenterTab::Database => crate::persisted::PersistedCenterTab::Database,
                 crate::session::CenterTab::Claude(tid) => {
-                    let idx = s.terminals.iter().position(|t| t.id == tid).unwrap_or(0);
+                    let idx = s.panes.iter().position(|p| p.id() == tid).unwrap_or(0);
                     crate::persisted::PersistedCenterTab::Claude(idx)
                 }
             };
@@ -585,13 +806,15 @@ impl Frms {
                 browser_url:  Some(s.browser_url.clone()),
                 open_file:    s.editor.path.clone(),
                 center_tab,
-                claude_count: s.terminals.len(),
-                claude_names: s.terminals.iter().map(|t| t.name.clone()).collect(),
+                claude_count: s.panes.len(),
+                claude_names: s.panes.iter().map(|p| p.name().map(str::to_owned)).collect(),
+                claude_kinds: s.panes.iter().map(|p| p.kind()).collect(),
                 plugin_terminals: s.terminals_plugin.terminals.iter()
                     .filter(|t| t.pinned)
                     .map(|t| t.name.clone())
                     .collect(),
                 pinned:       s.pinned,
+                plugin_panel: Some(s.plugin_panel.clone()),
             }
         }).collect();
 
@@ -851,25 +1074,25 @@ impl Frms {
                 s.file_browser_collapsed = !s.file_browser_collapsed;
             }
             Message::CopyPath(path) => {
-                return iced::clipboard::write(path);
+                return Task::perform(crate::clipboard::write(path), |_| Message::ClipboardWritten);
             }
             Message::DirEditStart(edit) => {
-                let fb = &mut self.sessions[self.active_session].file_browser;
+                let fb = self.dir_edit_browser();
                 fb.edit = Some(edit);
                 fb.error = None;
             }
             Message::DirEditDraftChanged(s) => {
                 if let Some(DirEdit::Create { draft } | DirEdit::Rename { draft, .. }) =
-                    &mut self.sessions[self.active_session].file_browser.edit
+                    &mut self.dir_edit_browser().edit
                 {
                     *draft = s;
                 }
             }
             Message::DirEditConfirm => {
-                self.sessions[self.active_session].file_browser.confirm_edit();
+                self.dir_edit_browser().confirm_edit();
             }
             Message::DirEditCancel => {
-                let fb = &mut self.sessions[self.active_session].file_browser;
+                let fb = self.dir_edit_browser();
                 fb.edit = None;
                 fb.error = None;
             }
@@ -952,16 +1175,122 @@ impl Frms {
                     if let Some(t) = s.terminals_plugin.terminal_mut(id) {
                         t.pane.process(&bytes);
                     }
+                } else if let Some(t) = self.receivers.ssh_mut(id) {
+                    t.pane.process(&bytes);
                 }
             }
-            Message::ClaudeSessionAdded => {
+            Message::TerminalExited(id) => {
+                // The shell in this terminal exited (e.g. the user typed
+                // `exit`). Remove plugin shell terminals so a dead session
+                // doesn't linger. Claude panes are managed through their own
+                // session/tab lifecycle, so they're left untouched here.
+                // A receiver SSH session that exited (auth failure, dropped
+                // connection, or the user typed `exit`) keeps its pane so the
+                // final output stays readable — mark it exited and drop focus.
+                if let Some(t) = self.receivers.ssh_mut(id) {
+                    t.exited  = true;
+                    t.focused = false;
+                }
+                let removed = if let Some(s) = self.session_for_plugin_terminal_mut(id) {
+                    s.terminals_plugin.delete(id);
+                    true
+                } else {
+                    false
+                };
+                if removed {
+                    // A pinned terminal that exited shouldn't be respawned on
+                    // the next launch — re-snapshot the persisted session.
+                    self.save_persisted();
+                }
+            }
+            Message::AgentMenuToggled => {
+                self.agent_menu_open = !self.agent_menu_open;
+            }
+            Message::AgentAdded(kind) => {
+                self.agent_menu_open = false;
                 let new_id = self.next_terminal_id;
                 self.next_terminal_id += 1;
                 let s = &mut self.sessions[self.active_session];
-                s.add_claude_terminal(new_id);
+                s.add_agent(new_id, kind);
                 s.active_terminal = new_id;
                 s.center_tab      = crate::session::CenterTab::Claude(new_id);
+                self.telemetry.record(crate::telemetry::Event::AgentCreated { kind: kind.as_str() });
                 self.save_persisted();
+                if !kind.is_agentic() {
+                    // Drop the keyboard cursor into the new chat's input box so
+                    // the user can start typing immediately.
+                    return text_input::focus(chat_input_id(new_id));
+                }
+            }
+            Message::ChatInputEdited(id, value) => {
+                if let Some(s) = self.session_for_terminal_mut(id) {
+                    if let Some(c) = s.chat_mut(id) {
+                        c.input = value;
+                    }
+                }
+            }
+            Message::ChatSubmitted(id) => {
+                let Some(s) = self.session_for_terminal_mut(id) else { return Task::none(); };
+                let Some(c) = s.chat_mut(id) else { return Task::none(); };
+                let text = c.input.trim().to_string();
+                if text.is_empty() || c.streaming {
+                    return Task::none();
+                }
+                c.input.clear();
+                c.error = None;
+                c.pending.clear();
+                c.messages.push(ChatMessage { role: ChatRole::User, text: text.clone() });
+                c.streaming = true;
+                let model  = c.model();
+                let resume = c.session_id.clone();
+                return Task::run(
+                    chat_api::stream_completion(
+                        id, model, text, resume,
+                        Message::ChatDelta,
+                        Message::ChatEnded,
+                    ),
+                    |m| m,
+                );
+            }
+            Message::ChatDelta(id, chunk) => {
+                if let Some(s) = self.session_for_terminal_mut(id) {
+                    if let Some(c) = s.chat_mut(id) {
+                        c.pending.push_str(&chunk);
+                    }
+                }
+            }
+            Message::ChatEnded(id, result) => {
+                // Outcome captured here, recorded after the session borrow ends.
+                let mut tel: Option<crate::telemetry::Event> = None;
+                if let Some(s) = self.session_for_terminal_mut(id) {
+                    if let Some(c) = s.chat_mut(id) {
+                        c.streaming = false;
+                        // Commit whatever text streamed in (a failed request may
+                        // still have produced a partial reply worth keeping).
+                        if !c.pending.is_empty() {
+                            let text = std::mem::take(&mut c.pending);
+                            c.messages.push(ChatMessage { role: ChatRole::Assistant, text });
+                        }
+                        match result {
+                            // Remember the session so the next turn resumes it.
+                            Ok(session) => {
+                                if !session.is_empty() {
+                                    c.session_id = Some(session);
+                                }
+                                tel = Some(crate::telemetry::Event::ChatCompleted { model: c.model() });
+                            }
+                            Err(e) => {
+                                tel = Some(crate::telemetry::Event::Error {
+                                    kind: "chat", detail: e.clone(),
+                                });
+                                c.error = Some(e);
+                            }
+                        }
+                    }
+                }
+                if let Some(event) = tel {
+                    self.telemetry.record(event);
+                }
             }
             Message::ClaudeSessionClosed(tid) => {
                 // Same accidental-click guard as session tabs: confirm first.
@@ -969,14 +1298,15 @@ impl Frms {
             }
             Message::ClaudeRenameStarted(tid) => {
                 let sess = &self.sessions[self.active_session];
-                let draft = sess.terminals.iter()
-                    .find(|t| t.id == tid)
-                    .and_then(|t| t.name.clone())
+                let draft = sess.panes.iter()
+                    .find(|p| p.id() == tid)
+                    .and_then(|p| p.name().map(str::to_owned))
                     .unwrap_or_else(|| {
                         // Fall back to the displayed positional label so the
                         // user starts editing what they actually see.
-                        let idx = sess.terminals.iter().position(|t| t.id == tid).unwrap_or(0);
-                        format!("Claude {}", idx + 1)
+                        let idx = sess.panes.iter().position(|p| p.id() == tid).unwrap_or(0);
+                        let kind = sess.panes.get(idx).map(|p| p.kind()).unwrap_or_default();
+                        format!("{} {}", kind.label(), idx + 1)
                     });
                 self.renaming_claude = Some((tid, draft));
                 return text_input::focus(text_input::Id::new("claude-rename"));
@@ -989,12 +1319,12 @@ impl Frms {
             Message::ClaudeRenameConfirmed => {
                 if let Some((tid, name)) = self.renaming_claude.take() {
                     let trimmed = name.trim().to_string();
-                    if let Some(t) = self.sessions
+                    if let Some(p) = self.sessions
                         .iter_mut()
-                        .flat_map(|s| s.terminals.iter_mut())
-                        .find(|t| t.id == tid)
+                        .flat_map(|s| s.panes.iter_mut())
+                        .find(|p| p.id() == tid)
                     {
-                        t.name = if trimmed.is_empty() { None } else { Some(trimmed) };
+                        p.set_name(if trimmed.is_empty() { None } else { Some(trimmed) });
                     }
                     self.save_persisted();
                 }
@@ -1003,6 +1333,11 @@ impl Frms {
                 self.renaming_claude = None;
             }
             Message::TerminalInput(s) => {
+                // A full-screen picker overlay swallows keystrokes so they
+                // don't leak into the terminal hidden behind it.
+                if self.file_picker.is_some() {
+                    return Task::none();
+                }
                 // While the close-confirmation dialog is up, keys must not
                 // leak into the terminal behind it: Enter confirms, Esc
                 // cancels, everything else is swallowed.
@@ -1012,6 +1347,13 @@ impl Frms {
                         "\x1b"      => self.pending_close = None,
                         _           => {}
                     }
+                    return Task::none();
+                }
+                // A focused receiver SSH terminal (panel-global) wins over the
+                // active session's terminals.
+                if let Some(t) = self.receivers.focused_ssh_mut() {
+                    if let Ok(mut g) = t.pane.grid.lock() { g.snap_to_bottom(); }
+                    t.pane.write_input(s.as_bytes());
                     return Task::none();
                 }
                 let sess = &mut self.sessions[self.active_session];
@@ -1051,6 +1393,10 @@ impl Frms {
                             g.scroll_by(delta);
                         }
                     }
+                } else if let Some(t) = self.receivers.ssh_mut(id) {
+                    if let Ok(mut g) = t.pane.grid.lock() {
+                        g.scroll_by(delta);
+                    }
                 }
             }
             Message::TerminalMouseDown(id, row, col) => {
@@ -1058,7 +1404,7 @@ impl Frms {
                 // on either kind of terminal pane (Claude or shell) becomes the
                 // input target before the selection drag begins.
                 if let Some(idx) = self.sessions.iter()
-                    .position(|s| s.terminals.iter().any(|t| t.id == id))
+                    .position(|s| s.panes.iter().any(|p| p.id() == id))
                 {
                     self.active_session = idx;
                     let s = &mut self.sessions[idx];
@@ -1066,6 +1412,7 @@ impl Frms {
                     s.center_tab               = crate::session::CenterTab::Claude(id);
                     s.db_panel.focus_active    = false;
                     s.terminals_plugin.focused = false;
+                    self.receivers.unfocus_ssh();
                     eprintln!("[copydbg] MouseDown claude id={id} ({row},{col})");
                     if let Some(t) = s.terminal_mut(id) {
                         t.selection = Some(crate::terminal::Selection::new(row, col));
@@ -1078,7 +1425,18 @@ impl Frms {
                     s.terminals_plugin.select(id);
                     s.terminals_plugin.focused = true;
                     s.db_panel.focus_active    = false;
+                    self.receivers.unfocus_ssh();
                     if let Some(t) = s.terminals_plugin.terminal_mut(id) {
+                        t.pane.selection = Some(crate::terminal::Selection::new(row, col));
+                    }
+                } else if self.receivers.has_ssh(id) {
+                    // Focus the clicked receiver SSH terminal and begin a
+                    // selection, dropping focus from any other SSH session.
+                    self.sessions[self.active_session].terminals_plugin.focused = false;
+                    self.sessions[self.active_session].db_panel.focus_active    = false;
+                    self.receivers.unfocus_ssh();
+                    if let Some(t) = self.receivers.ssh_mut(id) {
+                        t.focused   = true;
                         t.pane.selection = Some(crate::terminal::Selection::new(row, col));
                     }
                 }
@@ -1096,6 +1454,10 @@ impl Frms {
                         if let Some(sel) = t.pane.selection.as_mut() {
                             if sel.active { sel.head = (row, col); }
                         }
+                    }
+                } else if let Some(t) = self.receivers.ssh_mut(id) {
+                    if let Some(sel) = t.pane.selection.as_mut() {
+                        if sel.active { sel.head = (row, col); }
                     }
                 }
             }
@@ -1115,6 +1477,8 @@ impl Frms {
                     if let Some(t) = s.terminals_plugin.terminal_mut(id) {
                         clear_if_empty(&mut t.pane.selection);
                     }
+                } else if let Some(t) = self.receivers.ssh_mut(id) {
+                    clear_if_empty(&mut t.pane.selection);
                 }
             }
             Message::TerminalCopy => {
@@ -1136,7 +1500,7 @@ impl Frms {
                         })
                 };
                 if let Some(t) = text.filter(|s| !s.is_empty()) {
-                    return iced::clipboard::write(t);
+                    return Task::perform(crate::clipboard::write(t), |_| Message::ClipboardWritten);
                 }
             }
             Message::TerminalCopyFrom(id) => {
@@ -1155,13 +1519,18 @@ impl Frms {
                         let g = t.pane.grid.lock().ok()?;
                         Some(sel.text(&g))
                     })
+                } else if let Some(t) = self.receivers.ssh_mut(id) {
+                    t.pane.selection.take().and_then(|sel| {
+                        let g = t.pane.grid.lock().ok()?;
+                        Some(sel.text(&g))
+                    })
                 } else {
                     None
                 };
                 eprintln!("[copydbg] TerminalCopyFrom text = {:?}", text);
                 if let Some(t) = text.filter(|s| !s.is_empty()) {
                     eprintln!("[copydbg] writing {} bytes to clipboard", t.len());
-                    return iced::clipboard::write(t);
+                    return Task::perform(crate::clipboard::write(t), |_| Message::ClipboardWritten);
                 }
             }
             Message::TerminalSendToNote => {
@@ -1186,7 +1555,7 @@ impl Frms {
                 // Focus the clicked terminal so the subsequent paste lands in
                 // it, mirroring the focus logic in `TerminalMouseDown`.
                 if let Some(idx) = self.sessions.iter()
-                    .position(|s| s.terminals.iter().any(|t| t.id == id))
+                    .position(|s| s.panes.iter().any(|p| p.id() == id))
                 {
                     self.active_session = idx;
                     let s = &mut self.sessions[idx];
@@ -1194,6 +1563,7 @@ impl Frms {
                     s.center_tab               = crate::session::CenterTab::Claude(id);
                     s.db_panel.focus_active    = false;
                     s.terminals_plugin.focused = false;
+                    self.receivers.unfocus_ssh();
                 } else if let Some(idx) = self.sessions.iter()
                     .position(|s| s.terminals_plugin.has_terminal(id))
                 {
@@ -1202,16 +1572,29 @@ impl Frms {
                     s.terminals_plugin.select(id);
                     s.terminals_plugin.focused = true;
                     s.db_panel.focus_active    = false;
+                    self.receivers.unfocus_ssh();
+                } else if self.receivers.has_ssh(id) {
+                    self.sessions[self.active_session].terminals_plugin.focused = false;
+                    self.receivers.unfocus_ssh();
+                    if let Some(t) = self.receivers.ssh_mut(id) { t.focused = true; }
                 }
-                return iced::clipboard::read().map(Message::TerminalPasteReady);
+                return Task::perform(crate::clipboard::read(), Message::TerminalPasteReady);
             }
             Message::TerminalPaste => {
-                return iced::clipboard::read().map(Message::TerminalPasteReady);
+                return Task::perform(crate::clipboard::read(), Message::TerminalPasteReady);
             }
             Message::TerminalPasteReady(contents) => {
                 let Some(text) = contents.filter(|s| !s.is_empty()) else {
                     return Task::none();
                 };
+                if let Some(t) = self.receivers.focused_ssh_mut() {
+                    let bracketed = t.pane.grid.lock()
+                        .map(|g| g.bracketed_paste)
+                        .unwrap_or(false);
+                    if let Ok(mut g) = t.pane.grid.lock() { g.snap_to_bottom(); }
+                    t.pane.write_input(paste_payload(&text, bracketed).as_bytes());
+                    return Task::none();
+                }
                 let sess = &mut self.sessions[self.active_session];
                 if sess.terminals_plugin.focused {
                     if let Some(id) = sess.terminals_plugin.selected {
@@ -1234,14 +1617,15 @@ impl Frms {
                     }
                 }
             }
+            Message::ClipboardWritten => {}
             Message::TabPressed { shift } => {
                 // Swallow Tab while the close-confirmation dialog is up.
                 if self.pending_close.is_some() {
                     return Task::none();
                 }
                 let s = &self.sessions[self.active_session];
-                let db_form_focused = s.plugin_panel.visible
-                    && s.plugin_panel.active_tab == PluginTab::Db
+                let db_form_focused = s.center_tab == crate::session::CenterTab::Database
+                    && !s.db_panel.form_collapsed
                     && s.db_panel.focus_active;
                 if db_form_focused {
                     return if shift {
@@ -1271,8 +1655,36 @@ impl Frms {
                     self.notes.naming = false;
                     return iced::widget::focus_next();
                 }
+                // The Receivers (SSH) panel shows credential/import forms whose
+                // plain text_inputs don't auto-advance on Tab. When one of those
+                // forms is up — and no SSH terminal has grabbed focus — walk
+                // between its fields instead of emitting a tab byte.
+                let receiver_form = s.plugin_panel.visible
+                    && (s.plugin_panel.active_tab == PluginTab::Receivers
+                        || (s.plugin_panel.split
+                            && s.plugin_panel.bottom_tab == PluginTab::Receivers))
+                    && (self.receivers.selected_receiver.is_some()
+                        || self.receivers.selected_container.is_some());
                 // Otherwise treat as a normal terminal Tab/Shift-Tab.
                 let bytes: &[u8] = if shift { b"\x1b[Z" } else { b"\t" };
+                // A focused receiver SSH terminal wins over the active session's
+                // terminals — same precedence as ordinary keystrokes — so shell
+                // Tab-completion works while connected to a receiver. (Clicking
+                // the terminal focuses it; clicking back into a form field does
+                // not, so the form-nav case below only runs when no SSH terminal
+                // holds focus.)
+                if let Some(t) = self.receivers.focused_ssh_mut() {
+                    if let Ok(mut g) = t.pane.grid.lock() { g.snap_to_bottom(); }
+                    t.pane.write_input(bytes);
+                    return Task::none();
+                }
+                if receiver_form {
+                    return if shift {
+                        iced::widget::focus_previous()
+                    } else {
+                        iced::widget::focus_next()
+                    };
+                }
                 let sess = &mut self.sessions[self.active_session];
                 if sess.terminals_plugin.focused {
                     if let Some(id) = sess.terminals_plugin.selected {
@@ -1427,10 +1839,19 @@ impl Frms {
 
             // ── prompt response ───────────────────────────────────────────────
             Message::PromptAccepted => {
-                self.respond_to_prompt(b"1\r");
+                // Claude pre-highlights "❯ 1. Yes", so a bare Enter accepts the
+                // focused option. Sending the literal "1" risked it landing in
+                // the text input (if the menu wasn't focused at that instant)
+                // and being submitted as a stray "1" message to Claude.
+                self.respond_to_prompt(b"\r");
             }
             Message::PromptRejected => {
-                self.respond_to_prompt(b"3\r");
+                // The Accept/Reject pane only renders for the 3-option edit
+                // menu (Yes / Yes-don't-ask / No), with option 1 pre-focused.
+                // Arrow down twice to reach "3. No, and tell Claude…" then
+                // Enter — same idea as Accept: no literal digit that could leak
+                // into the text input as a stray "3" message.
+                self.respond_to_prompt(b"\x1b[B\x1b[B\r");
             }
 
             // ── window ────────────────────────────────────────────────────────
@@ -1440,13 +1861,19 @@ impl Frms {
 
             // ── stats ─────────────────────────────────────────────────────────
             Message::StatsRefresh => {
-                return Task::perform(
-                    stats::load(),
-                    |s| Message::StatsLoaded(s.unwrap_or_default()),
-                );
+                return Task::batch([
+                    Task::perform(
+                        stats::load(),
+                        |s| Message::StatsLoaded(s.unwrap_or_default()),
+                    ),
+                    Task::perform(stats::load_procs(), Message::ProcsLoaded),
+                ]);
             }
             Message::StatsLoaded(s) => {
                 self.claude_stats = s;
+            }
+            Message::ProcsLoaded(p) => {
+                self.claude_procs = p;
             }
             Message::StatsRefreshIntervalChanged(i) => {
                 self.stats_refresh_interval = i;
@@ -1464,46 +1891,48 @@ impl Frms {
                     && panel.visible
                     && panel.active_tab == tab;
                 if toggle_hide {
-                    panel.visible           = false;
-                    s.db_panel.focus_active = false;
+                    panel.visible = false;
                 } else {
                     panel.visible = true;
                     panel.set_tab(slot, tab);
-                    if tab == PluginTab::Db {
-                        s.db_panel.focus_active = true;
-                        return text_input::focus(
-                            text_input::Id::new(crate::ui::db_panel::FIELD_HOST),
-                        );
-                    } else {
-                        s.db_panel.focus_active = false;
-                    }
                 }
+                self.save_persisted();
+            }
+            Message::PluginTabHidden(tab) => {
+                let panel = &mut self.sessions[self.active_session].plugin_panel;
+                panel.hide_tab(tab);
+                self.save_persisted();
+            }
+            Message::PluginTabShown(tab) => {
+                let panel = &mut self.sessions[self.active_session].plugin_panel;
+                panel.show_tab(tab);
+                // Surface the just-added plugin and close the picker.
+                panel.active_tab = tab;
+                panel.adding = false;
+                panel.visible = true;
+                self.save_persisted();
+            }
+            Message::PluginAddPickerToggled => {
+                let panel = &mut self.sessions[self.active_session].plugin_panel;
+                panel.adding = !panel.adding;
             }
             Message::PluginPanelDockToggled => {
                 self.sessions[self.active_session].plugin_panel.toggle_dock();
+                self.save_persisted();
             }
             Message::PluginPanelSplitToggled => {
                 self.sessions[self.active_session].plugin_panel.toggle_split();
+                self.save_persisted();
             }
             Message::PluginPanelHide => {
                 let s = &mut self.sessions[self.active_session];
-                s.plugin_panel.visible  = false;
-                s.db_panel.focus_active = false;
+                s.plugin_panel.visible = false;
+                self.save_persisted();
             }
             Message::PluginPanelToggled => {
                 let s = &mut self.sessions[self.active_session];
-                if s.plugin_panel.visible {
-                    s.plugin_panel.visible  = false;
-                    s.db_panel.focus_active = false;
-                } else {
-                    s.plugin_panel.visible = true;
-                    if s.plugin_panel.active_tab == PluginTab::Db {
-                        s.db_panel.focus_active = true;
-                        return text_input::focus(
-                            text_input::Id::new(crate::ui::db_panel::FIELD_HOST),
-                        );
-                    }
-                }
+                s.plugin_panel.visible = !s.plugin_panel.visible;
+                self.save_persisted();
             }
             Message::PluginPanelResizeStart => {
                 self.plugin_panel_drag = Some(PluginPanelDrag { last_x: None });
@@ -1532,7 +1961,10 @@ impl Frms {
                 }
             }
             Message::PluginPanelResizeEnd => {
-                self.plugin_panel_drag = None;
+                if self.plugin_panel_drag.take().is_some() {
+                    // Persist the final width once per drag, not per move.
+                    self.save_persisted();
+                }
             }
             Message::PluginSplitResizeStart => {
                 self.plugin_split_drag = Some(PluginSplitDrag { last_y: None });
@@ -1555,7 +1987,10 @@ impl Frms {
                 }
             }
             Message::PluginSplitResizeEnd => {
-                self.plugin_split_drag = None;
+                if self.plugin_split_drag.take().is_some() {
+                    // Persist the final slot height once per drag, not per move.
+                    self.save_persisted();
+                }
             }
 
             // ── notes ─────────────────────────────────────────────────────────
@@ -1678,6 +2113,270 @@ impl Frms {
                 }
             }
 
+            // ── receivers plugin ──────────────────────────────────────────────
+            Message::ReceiverContainerAdd(parent) => {
+                self.receivers.add_container(parent);
+            }
+            Message::ReceiverContainerSelect(id) => {
+                self.receivers.select_container(id);
+            }
+            Message::ReceiverContainerRenamed(id, name) => {
+                self.receivers.rename_container(id, name);
+            }
+            Message::ReceiverContainerDelete(id) => {
+                self.receivers.delete_container(id);
+            }
+            Message::ReceiverContainerToggle(id) => {
+                self.receivers.toggle_expanded(id);
+            }
+            Message::ReceiverAdd(container) => {
+                self.receivers.add_receiver(container);
+            }
+            Message::ReceiverSelect(id) => {
+                self.receivers.select_receiver(id);
+                // The detail pane shows this receiver's SSH session (if any), so
+                // route keyboard to it and drop focus from other sessions —
+                // otherwise a hidden, still-focused session would swallow keys.
+                self.receivers.focus_ssh_for(id);
+            }
+            Message::ReceiverDelete(id) => {
+                self.receivers.delete_receiver(id);
+            }
+            Message::ReceiverNameEdited(s) => {
+                self.receivers.name_input = s;
+                self.receivers.commit_edits();
+            }
+            Message::ReceiverHostEdited(s) => {
+                self.receivers.host_input = s;
+                self.receivers.commit_edits();
+            }
+            Message::ReceiverUserEdited(s) => {
+                self.receivers.user_input = s;
+                self.receivers.commit_edits();
+            }
+            Message::ReceiverPasswordEdited(s) => {
+                self.receivers.password_input = s;
+                self.receivers.commit_edits();
+            }
+            Message::ReceiverPortEdited(s) => {
+                // Keep digits only; an empty field is allowed (falls back to 22).
+                if s.is_empty() || s.chars().all(|c| c.is_ascii_digit()) {
+                    self.receivers.port_input = s;
+                    self.receivers.commit_edits();
+                }
+            }
+            Message::ReceiverConnect(id) => {
+                let Some(r) = self.receivers.receiver_by_id(id).cloned() else {
+                    return Task::none();
+                };
+                if r.host.trim().is_empty() || r.username.trim().is_empty() {
+                    self.receivers.status =
+                        Some(Err("set a host and username before connecting".into()));
+                    return Task::none();
+                }
+                let tid = self.next_terminal_id;
+                self.next_terminal_id += 1;
+                let (prog, args, envs) = r.ssh_command();
+                match crate::terminal::TerminalPane::spawn_args(tid, &prog, &args, &envs, None) {
+                    Ok(pane) => {
+                        // Other terminals lose keyboard focus to the new SSH pane.
+                        self.sessions[self.active_session].terminals_plugin.focused = false;
+                        // Replaces any prior session to *this* receiver; sessions
+                        // to other receivers keep running so their panes survive.
+                        self.receivers.set_ssh(crate::receivers::SshTerminal {
+                            id: tid,
+                            receiver: id,
+                            name: r.name.clone(),
+                            pane,
+                            focused: true,
+                            exited: false,
+                        });
+                        self.receivers.status =
+                            Some(Ok(format!("Connected to {}", r.destination())));
+                    }
+                    Err(e) => {
+                        self.receivers.status = Some(Err(format!("ssh failed: {e}")));
+                    }
+                }
+            }
+            Message::ReceiverSshDisconnect(receiver) => {
+                self.receivers.remove_ssh_for(receiver);
+            }
+            Message::ReceiverCopyPick => {
+                let Some(receiver) = self.receivers.selected_receiver else {
+                    self.receivers.status = Some(Err("select a receiver first".into()));
+                    return Task::none();
+                };
+                // Root the picker at the open file's directory when there is
+                // one, else the active session's working directory.
+                let sess = &self.sessions[self.active_session];
+                let start = sess.editor.path.as_ref()
+                    .and_then(|p| p.parent())
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| sess.working_dir.clone());
+                let mut browser = FileBrowserState::new();
+                browser.navigate(start);
+                self.file_picker = Some(FilePicker { browser, receiver });
+            }
+            Message::ReceiverPickerBrowse(path) => {
+                if let Some(fp) = self.file_picker.as_mut() {
+                    fp.browser.navigate(path);
+                }
+            }
+            Message::ReceiverPickerChoose(path) => {
+                let receiver = self.file_picker.as_ref().map(|fp| fp.receiver);
+                self.file_picker = None;
+                if let Some(receiver) = receiver {
+                    return self.copy_files_to(receiver, vec![path]);
+                }
+            }
+            Message::ReceiverPickerCancel => {
+                self.file_picker = None;
+            }
+            Message::ReceiverCopyFile(path) => {
+                return self.start_receiver_copy(vec![path]);
+            }
+            Message::ReceiverCopyDone(result) => {
+                self.receivers.status = Some(result);
+            }
+            Message::ReceiverImportDbStart => {
+                let Some(container) = self.receivers.selected_container else {
+                    self.receivers.status = Some(Err("select a container to import into".into()));
+                    return Task::none();
+                };
+                if self.sessions[self.active_session].db_panel.client.is_none() {
+                    self.receivers.status =
+                        Some(Err("connect a database in the Database tool first".into()));
+                    return Task::none();
+                }
+                self.receivers.begin_db_import(container);
+            }
+            Message::ReceiverImportTablePicked(key) => {
+                self.receivers.set_import_table(key.clone());
+                let p = &self.sessions[self.active_session].db_panel;
+                let (Some(client), Some(table)) = (p.client.clone(), p.table_by_key(&key).cloned())
+                else {
+                    self.receivers.set_import_error("table not found".into());
+                    return Task::none();
+                };
+                return Task::perform(
+                    crate::db::list_columns(client, table),
+                    Message::ReceiverImportColumnsLoaded,
+                );
+            }
+            Message::ReceiverImportColumnsLoaded(result) => {
+                match result {
+                    Ok(cols) => self.receivers.set_import_columns(cols),
+                    Err(e)   => self.receivers.set_import_error(e),
+                }
+            }
+            Message::ReceiverImportCsvStart => {
+                let Some(container) = self.receivers.selected_container else {
+                    self.receivers.status = Some(Err("select a container to import into".into()));
+                    return Task::none();
+                };
+                self.receivers.begin_csv_import(container);
+                // Pre-fill the path with the open file when it's a CSV.
+                if let Some(p) = &self.sessions[self.active_session].editor.path {
+                    if p.extension().and_then(|e| e.to_str()) == Some("csv") {
+                        self.receivers.set_csv_path(p.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            Message::ReceiverImportCsvPathEdited(s) => {
+                self.receivers.set_csv_path(s);
+            }
+            Message::ReceiverImportCsvLoad => {
+                let path = self.receivers.import.as_ref().map(|d| d.csv_path.clone());
+                let Some(path) = path.filter(|p| !p.trim().is_empty()) else {
+                    self.receivers.set_import_error("enter a CSV file path".into());
+                    return Task::none();
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => match crate::receivers::parse_csv(&text) {
+                        Some((header, rows)) => {
+                            self.receivers.set_import_columns(header);
+                            // Stash parsed rows on the draft via origin reuse is
+                            // awkward; instead create immediately is wrong — keep
+                            // rows in a field. Store on the state.
+                            self.csv_import_rows = rows;
+                        }
+                        None => self.receivers.set_import_error("CSV is empty".into()),
+                    },
+                    Err(e) => self.receivers.set_import_error(format!("read failed: {e}")),
+                }
+            }
+            Message::ReceiverImportFieldMapped(field, column) => {
+                self.receivers.set_import_field(field, column);
+            }
+            Message::ReceiverImportLiteralEdited(field, value) => {
+                self.receivers.set_import_literal(field, value);
+            }
+            Message::ReceiverImportFilterColumn(column) => {
+                self.receivers.set_import_filter_column(column);
+            }
+            Message::ReceiverImportFilterOp(op) => {
+                self.receivers.set_import_filter_op(op);
+            }
+            Message::ReceiverImportFilterValue(value) => {
+                self.receivers.set_import_filter_value(value);
+            }
+            Message::ReceiverImportConfirm => {
+                let Some(draft) = self.receivers.import.clone() else { return Task::none(); };
+                if !draft.is_ready() {
+                    self.receivers.set_import_error("map a host column first".into());
+                    return Task::none();
+                }
+                match draft.source {
+                    crate::receivers::ImportSource::Csv => {
+                        let rows = std::mem::take(&mut self.csv_import_rows);
+                        let n = self.receivers.create_from_rows(rows);
+                        self.receivers.status = Some(Ok(format!("Imported {n} receiver(s) from CSV")));
+                    }
+                    crate::receivers::ImportSource::Database => {
+                        let p = &self.sessions[self.active_session].db_panel;
+                        let Some(client) = p.client.clone() else {
+                            self.receivers.set_import_error("database disconnected".into());
+                            return Task::none();
+                        };
+                        let Some(table) = p.table_by_key(&draft.origin).cloned() else {
+                            self.receivers.set_import_error("table not found".into());
+                            return Task::none();
+                        };
+                        let engine = p.engine();
+                        // Select the mapped columns in `draft.columns` order so the
+                        // returned rows line up with `create_from_rows`.
+                        let cols = draft.columns.iter()
+                            .map(|c| engine.quote_ident(c))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
+                            "SELECT {cols} FROM {}{}",
+                            table.quoted(engine),
+                            draft.db_where(engine),
+                        );
+                        return Task::perform(
+                            crate::db::run_query(client, sql),
+                            |r| Message::ReceiverImportRowsLoaded(r.map(|qr| qr.rows)),
+                        );
+                    }
+                }
+            }
+            Message::ReceiverImportRowsLoaded(result) => {
+                match result {
+                    Ok(rows) => {
+                        let n = self.receivers.create_from_rows(rows);
+                        self.receivers.status =
+                            Some(Ok(format!("Imported {n} receiver(s) from database")));
+                    }
+                    Err(e) => self.receivers.set_import_error(e),
+                }
+            }
+            Message::ReceiverImportCancel => {
+                self.receivers.cancel_import();
+                self.csv_import_rows.clear();
+            }
+
             // ── database panel ────────────────────────────────────────────────
             Message::DbEngineChanged(engine) => {
                 let p = &mut self.sessions[self.active_session].db_panel;
@@ -1694,6 +2393,15 @@ impl Frms {
             Message::DbProviderChanged(provider) => {
                 let p = &mut self.sessions[self.active_session].db_panel;
                 p.config.provider = provider;
+            }
+            Message::DbFormToggleCollapsed => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.form_collapsed = !p.form_collapsed;
+                // A collapsed form has no focusable fields, so Tab should fall
+                // back to the terminal rather than cycling hidden inputs.
+                if p.form_collapsed {
+                    p.focus_active = false;
+                }
             }
             Message::DbFieldSubmitted(field) => {
                 // Enter advances focus through the form; on the last field,
@@ -1753,9 +2461,12 @@ impl Frms {
                 s.db_panel.conn_state   = ConnState::Connecting;
                 s.db_panel.client       = None;
                 s.db_panel.tables.clear();
+                s.db_panel.foreign_keys.clear();
                 s.db_panel.selected_tables.clear();
                 s.db_panel.columns_by_table.clear();
-                s.db_panel.selected_columns.clear();
+                s.db_panel.selected_cols.clear();
+                s.db_panel.joins.clear();
+                s.db_panel.dragging_field = None;
                 s.db_panel.query_result = None;
                 s.db_panel.query_error  = None;
                 return Task::perform(
@@ -1766,10 +2477,16 @@ impl Frms {
             Message::DbConnected(session_id, result) => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                     match result {
-                        Ok((client, tables)) => {
-                            s.db_panel.conn_state = ConnState::Connected;
-                            s.db_panel.client     = Some(client);
-                            s.db_panel.tables     = tables;
+                        Ok((client, tables, fks, routines)) => {
+                            s.db_panel.conn_state   = ConnState::Connected;
+                            s.db_panel.client       = Some(client);
+                            s.db_panel.tables       = tables;
+                            s.db_panel.foreign_keys = fks;
+                            s.db_panel.routines     = routines;
+                            // Connected — fold the form away so the builder and
+                            // results get the space.
+                            s.db_panel.form_collapsed = true;
+                            s.db_panel.focus_active   = false;
                         }
                         Err(err) => {
                             s.db_panel.conn_state = ConnState::Failed(err);
@@ -1783,22 +2500,44 @@ impl Frms {
                 p.client = None;
                 p.conn_state = ConnState::Disconnected;
                 p.tables.clear();
+                p.foreign_keys.clear();
+                p.routines.clear();
+                p.selected_routine = None;
+                p.routine_code     = None;
+                p.routine_loading  = false;
                 p.selected_tables.clear();
                 p.columns_by_table.clear();
-                p.selected_columns.clear();
+                p.selected_cols.clear();
+                p.joins.clear();
+                p.dragging_field = None;
                 p.loading_columns.clear();
                 p.query_result = None;
                 p.query_error  = None;
+                // Reopen the form so the user can reconnect.
+                p.form_collapsed = false;
             }
             Message::DbTableToggled(key) => {
                 let s   = &mut self.sessions[self.active_session];
                 let sid = s.id;
                 let p   = &mut s.db_panel;
-                if p.selected_tables.contains(&key) {
-                    p.selected_tables.remove(&key);
-                    p.selected_columns.remove(&key);
+                if let Some(pos) = p.selected_tables.iter().position(|t| *t == key) {
+                    p.selected_tables.remove(pos);
+                    // Drop any picked or grouped columns that belonged to the removed table.
+                    p.selected_cols.retain(|c| c.table != key);
+                    p.group_by.retain(|c| c.table != key);
+                    // Drop this table's own join condition and any condition that
+                    // referenced it as the left side.
+                    p.joins.remove(&key);
+                    p.joins.retain(|_, j| j.left_table != key);
                 } else {
-                    p.selected_tables.insert(key.clone());
+                    // Any table can be added; if a foreign key links it to the
+                    // current selection, pre-fill the JOIN condition from it,
+                    // otherwise the user supplies the ON columns manually.
+                    let included = p.selected_tables.clone();
+                    if let Some(jc) = p.fk_join_default(&key, &included) {
+                        p.joins.insert(key.clone(), jc);
+                    }
+                    p.selected_tables.push(key.clone());
                     // Lazy-load columns only on first expand.
                     if !p.columns_by_table.contains_key(&key) && !p.loading_columns.contains(&key) {
                         if let (Some(client), Some(table)) = (
@@ -1814,6 +2553,41 @@ impl Frms {
                     }
                 }
             }
+            Message::DbRoutineSelected(routine) => {
+                let s   = &mut self.sessions[self.active_session];
+                let sid = s.id;
+                let p   = &mut s.db_panel;
+                let Some(client) = p.client.clone() else { return Task::none(); };
+                p.selected_routine = Some(routine.clone());
+                p.routine_code     = None;
+                p.routine_loading  = true;
+                // Make sure the source view is visible even if the builder had
+                // the results row hidden behind a collapsed Row 1.
+                return Task::perform(
+                    db::routine_definition(client, routine),
+                    move |r| Message::DbRoutineLoaded(sid, r),
+                );
+            }
+            Message::DbRoutineLoaded(session_id, result) => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    let p = &mut s.db_panel;
+                    p.routine_loading = false;
+                    match result {
+                        Ok(code) => { p.routine_code = Some(code); }
+                        Err(err) => {
+                            p.routine_code     = None;
+                            p.selected_routine = None;
+                            p.query_error      = Some(err);
+                        }
+                    }
+                }
+            }
+            Message::DbRoutineClosed => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.selected_routine = None;
+                p.routine_code     = None;
+                p.routine_loading  = false;
+            }
             Message::DbColumnsLoaded(session_id, key, result) => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                     s.db_panel.loading_columns.remove(&key);
@@ -1825,34 +2599,171 @@ impl Frms {
             }
             Message::DbColumnToggled(table_key, col) => {
                 let p = &mut self.sessions[self.active_session].db_panel;
-                let entry = p.selected_columns.entry(table_key).or_default();
-                if entry.contains(&col) {
-                    entry.remove(&col);
+                if let Some(pos) = p.selected_cols
+                    .iter()
+                    .position(|c| c.table == table_key && c.column == col)
+                {
+                    p.selected_cols.remove(pos);
                 } else {
-                    entry.insert(col);
+                    p.selected_cols.push(ColRef { table: table_key, column: col });
                 }
             }
-            Message::DbBuildQuery => {
+            Message::DbFieldsSelectAll(select) => {
                 let p = &mut self.sessions[self.active_session].db_panel;
-                if let Some(sql) = p.build_select() {
-                    p.query = sql;
+                if select {
+                    for c in p.available_cols() {
+                        if !p.is_col_selected(&c.table, &c.column) {
+                            p.selected_cols.push(c);
+                        }
+                    }
+                } else {
+                    p.selected_cols.clear();
                 }
             }
-            Message::DbQueryEdited(s) => {
-                self.sessions[self.active_session].db_panel.query = s;
+            Message::DbFieldDragStart(i) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.dragging_field = (i < p.selected_cols.len()).then_some(i);
+            }
+            Message::DbFieldDragOver(target) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                if let Some(from) = p.dragging_field {
+                    if target < p.selected_cols.len() && from != target {
+                        let item = p.selected_cols.remove(from);
+                        p.selected_cols.insert(target, item);
+                        p.dragging_field = Some(target);
+                    }
+                }
+            }
+            Message::DbFieldDragEnd => {
+                self.sessions[self.active_session].db_panel.dragging_field = None;
+            }
+            Message::DbFieldRemoved(i) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                if i < p.selected_cols.len() {
+                    p.selected_cols.remove(i);
+                }
+                p.dragging_field = None;
+            }
+            Message::DbFilterAdd => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                // Seed the new condition with the first available column so it's
+                // valid (and previewed in the SQL) the moment a value is typed.
+                let (table, column) = p.available_cols()
+                    .into_iter()
+                    .next()
+                    .map(|c| (c.table, c.column))
+                    .unwrap_or_default();
+                p.filters.push(Filter {
+                    table,
+                    column,
+                    op:    FilterOp::Eq,
+                    value: String::new(),
+                    conj:  Conj::And,
+                });
+            }
+            Message::DbFilterColumnChanged(i, col) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                if let Some(f) = p.filters.get_mut(i) {
+                    f.table  = col.table;
+                    f.column = col.column;
+                }
+            }
+            Message::DbFilterOpChanged(i, op) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                if let Some(f) = p.filters.get_mut(i) {
+                    f.op = op;
+                }
+            }
+            Message::DbFilterValueChanged(i, value) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                if let Some(f) = p.filters.get_mut(i) {
+                    f.value = value;
+                }
+            }
+            Message::DbFilterConjToggled(i) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                if let Some(f) = p.filters.get_mut(i) {
+                    f.conj = f.conj.toggled();
+                }
+            }
+            Message::DbFilterRemoved(i) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                if i < p.filters.len() {
+                    p.filters.remove(i);
+                }
+            }
+            Message::DbGroupToggled(table_key, col) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                if let Some(pos) = p.group_by
+                    .iter()
+                    .position(|c| c.table == table_key && c.column == col)
+                {
+                    p.group_by.remove(pos);
+                } else {
+                    p.group_by.push(ColRef { table: table_key, column: col });
+                }
+            }
+            Message::DbJoinLeftTableChanged(joined, left) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                let jc = p.joins.entry(joined).or_default();
+                jc.left_table = left;
+                // The previously chosen left column belongs to the old table.
+                jc.left_col = String::new();
+            }
+            Message::DbJoinLeftColChanged(joined, col) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.joins.entry(joined).or_default().left_col = col;
+            }
+            Message::DbJoinRightColChanged(joined, col) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.joins.entry(joined).or_default().right_col = col;
             }
             Message::DbRunQuery => {
                 let s   = &mut self.sessions[self.active_session];
                 let sid = s.id;
                 let p   = &mut s.db_panel;
-                let sql = p.query.trim().to_string();
-                if sql.is_empty() { return Task::none(); }
+                let sql = match p.build_select() {
+                    Some(sql) => sql,
+                    None      => return Task::none(),
+                };
                 let client = match p.client.clone() {
                     Some(c) => c,
                     None    => return Task::none(),
                 };
-                p.query_running = true;
-                p.query_error   = None;
+                p.query            = sql.clone();
+                p.query_running    = true;
+                p.query_error      = None;
+                p.statement_status = None;
+                return Task::perform(
+                    db::run_query(client, sql),
+                    move |r| Message::DbQueryResult(sid, r),
+                );
+            }
+            Message::DbRefreshResults => {
+                // Re-run the most recently executed query (data may have changed
+                // since); fall back to building from the current builder state if
+                // nothing has been run yet.
+                let s   = &mut self.sessions[self.active_session];
+                let sid = s.id;
+                let p   = &mut s.db_panel;
+                if p.query_running {
+                    return Task::none();
+                }
+                let sql = if !p.query.is_empty() {
+                    p.query.clone()
+                } else {
+                    match p.build_select() {
+                        Some(sql) => { p.query = sql.clone(); sql }
+                        None      => return Task::none(),
+                    }
+                };
+                let client = match p.client.clone() {
+                    Some(c) => c,
+                    None    => return Task::none(),
+                };
+                p.query_running    = true;
+                p.query_error      = None;
+                p.statement_status = None;
                 return Task::perform(
                     db::run_query(client, sql),
                     move |r| Message::DbQueryResult(sid, r),
@@ -1867,22 +2778,98 @@ impl Frms {
                     }
                 }
             }
-            Message::DbResetQuery => {
+            Message::DbSetSqlMode(on) => {
+                self.sessions[self.active_session].db_panel.sql_mode = on;
+            }
+            Message::DbSqlAction(action) => {
+                self.sessions[self.active_session].db_panel.sql_input.perform(action);
+            }
+            Message::DbRunSql => {
+                let s   = &mut self.sessions[self.active_session];
+                let sid = s.id;
+                let p   = &mut s.db_panel;
+                let sql = p.sql_input.text();
+                if sql.trim().is_empty() {
+                    return Task::none();
+                }
+                let client = match p.client.clone() {
+                    Some(c) => c,
+                    None    => return Task::none(),
+                };
+                p.query            = sql.clone();
+                p.query_running    = true;
+                p.query_error      = None;
+                p.statement_status = None;
+                return Task::perform(
+                    db::run_statement(client, sql),
+                    move |r| Message::DbStatementResult(sid, r),
+                );
+            }
+            Message::DbStatementResult(session_id, result) => {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    let p = &mut s.db_panel;
+                    p.query_running = false;
+                    match result {
+                        Ok(StatementOutcome::Rows(r)) => {
+                            p.query_result      = Some(r);
+                            p.query_error       = None;
+                            p.statement_status  = None;
+                        }
+                        Ok(StatementOutcome::Affected(n)) => {
+                            p.query_result      = None;
+                            p.query_error       = None;
+                            p.statement_status  =
+                                Some(format!("Statement OK — {n} row{} affected", if n == 1 { "" } else { "s" }));
+                        }
+                        Err(err) => { p.query_error = Some(err); }
+                    }
+                }
+            }
+            Message::DbObjectFilterChanged(s) => {
+                self.sessions[self.active_session].db_panel.object_filter = s;
+            }
+            Message::DbTablesToggleCollapsed => {
                 let p = &mut self.sessions[self.active_session].db_panel;
-                p.query        = String::new();
-                p.query_result = None;
-                p.query_error  = None;
+                p.tables_collapsed = !p.tables_collapsed;
+            }
+            Message::DbObjectsToggleCollapsed => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.objects_collapsed = !p.objects_collapsed;
             }
             Message::DbResetTables => {
                 let p = &mut self.sessions[self.active_session].db_panel;
                 p.selected_tables.clear();
-                p.selected_columns.clear();
+                p.selected_cols.clear();
+                p.filters.clear();
+                p.group_by.clear();
+                p.joins.clear();
+                p.dragging_field = None;
                 p.query_result = None;
                 p.query_error  = None;
+                p.statement_status = None;
+            }
+            Message::DbRow1ToggleCollapsed => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.row1_collapsed = !p.row1_collapsed;
+            }
+            Message::DbCopyValue(value) => {
+                return Task::perform(crate::clipboard::write(value), |_| Message::ClipboardWritten);
             }
             Message::CenterTabSelected(tab) => {
-                self.sessions[self.active_session].center_tab = tab;
+                let s = &mut self.sessions[self.active_session];
+                s.center_tab = tab;
+                // Entering the Database tab with an expanded form puts keyboard
+                // focus in the connection fields so Tab cycles them; any other
+                // tab releases that focus back to the terminal.
+                let focus_db = tab == crate::session::CenterTab::Database
+                    && !s.db_panel.form_collapsed;
+                s.db_panel.focus_active = focus_db;
                 self.save_persisted();
+                if focus_db {
+                    return text_input::focus(
+                        text_input::Id::new(crate::ui::db_panel::FIELD_HOST),
+                    );
+                }
             }
 
             // ── preferences ───────────────────────────────────────────────────
@@ -1944,6 +2931,38 @@ impl Frms {
                 self.prefs.terminal_font_scale = f;
                 self.prefs.save();
             }
+            Message::PrefsTelemetryToggled(on) => {
+                self.prefs.telemetry = on;
+                self.prefs.save();
+                // Apply immediately: start a fresh sender, or drop to a no-op.
+                self.telemetry = if on {
+                    crate::telemetry::Telemetry::start(true)
+                } else {
+                    crate::telemetry::Telemetry::disabled()
+                };
+            }
+            Message::NdaChoice(accepted) => {
+                if accepted {
+                    self.prefs.nda_accepted = true;
+                    self.prefs.save();
+                } else {
+                    // Declined — close the window, which exits the app.
+                    return iced::window::get_latest().and_then(iced::window::close);
+                }
+            }
+            Message::TelemetryNoticeChoice(keep_on) => {
+                self.prefs.telemetry           = keep_on;
+                self.prefs.telemetry_notice_ack = true;
+                self.prefs.save();
+                // Consent given: start telemetry now (if kept on) and record the
+                // first launch — the one we deliberately held back in `new`.
+                if keep_on {
+                    self.telemetry = crate::telemetry::Telemetry::start(true);
+                    self.telemetry.record(crate::telemetry::Event::Launch);
+                } else {
+                    self.telemetry = crate::telemetry::Telemetry::disabled();
+                }
+            }
             Message::ThemeAnimTick => {
                 if matches!(&self.theme_anim, Some(a) if a.finished()) {
                     self.theme_anim = None;
@@ -1964,6 +2983,19 @@ impl Frms {
 
         let colors = self.current_colors();
 
+        // First-run NDA gate — must be accepted before the app can be used
+        // (declining exits). One acceptance for every install format.
+        if !self.prefs.nda_accepted {
+            return ui::nda_dialog::view(colors);
+        }
+
+        // First-run telemetry notice — shown once (after the NDA), before
+        // anything else, so the user sees what's collected (and can opt out)
+        // before any data is sent. No telemetry fires until acknowledged.
+        if !self.prefs.telemetry_notice_ack {
+            return ui::telemetry_notice::view(colors);
+        }
+
         // Preferences dialog takes precedence — full-screen overlay.
         if self.showing_prefs {
             return ui::prefs_dialog::view(
@@ -1971,6 +3003,14 @@ impl Frms {
                 &self.prefs_file_browser,
                 colors,
             );
+        }
+
+        // Receiver file picker — full-screen overlay for choosing a file to scp.
+        if let Some(fp) = &self.file_picker {
+            let receiver_name = self.receivers.receiver_by_id(fp.receiver)
+                .map(|r| r.name.as_str())
+                .unwrap_or("receiver");
+            return ui::file_picker::view(&fp.browser, receiver_name, colors);
         }
 
         // If the new-session dialog is open, show it full-screen instead of the IDE
@@ -1989,6 +3029,7 @@ impl Frms {
         let header        = ui::header::view(
             plugin_panel.visible,
             &self.claude_stats,
+            &self.claude_procs,
             self.stats_refresh_interval,
             self.header_collapsed,
             colors,
@@ -2080,14 +3121,14 @@ impl Frms {
             PendingClose::Claude(tid) => {
                 let label = self.sessions.iter()
                     .find_map(|s| {
-                        let pos = s.terminals.iter().position(|t| t.id == tid)?;
-                        Some(s.terminals[pos].name.clone()
-                            .unwrap_or_else(|| format!("Claude {}", pos + 1)))
+                        let pos = s.panes.iter().position(|p| p.id() == tid)?;
+                        Some(s.panes[pos].name().map(str::to_owned)
+                            .unwrap_or_else(|| format!("{} {}", s.panes[pos].kind().label(), pos + 1)))
                     })
-                    .unwrap_or_else(|| "Claude".to_string());
+                    .unwrap_or_else(|| "Agent".to_string());
                 (
-                    "Close Claude tab?".to_string(),
-                    format!("“{label}” will be closed and its Claude process ended."),
+                    "Close agent tab?".to_string(),
+                    format!("“{label}” will be closed."),
                 )
             }
         };
@@ -2119,7 +3160,7 @@ impl Frms {
         let panes        = &session.layout.panes;
         let file_browser = &session.file_browser;
         let editor       = &session.editor;
-        let terminals    = &session.terminals;
+        let agent_panes  = &session.panes;
         let active_term  = session.active_terminal;
         let url_input    = &session.url_input;
         let session_id   = session.id;
@@ -2142,11 +3183,12 @@ impl Frms {
                 editor,
                 &session.db_panel,
                 center_tab,
-                terminals,
+                agent_panes,
                 active_term,
                 pending,
                 prompt_src,
                 &self.renaming_claude,
+                self.agent_menu_open,
             );
             let editor_bordered = iced::widget::container(editor_el)
                 .width(Length::Fill)
@@ -2169,11 +3211,12 @@ impl Frms {
                             editor,
                             &session.db_panel,
                             center_tab,
-                            terminals,
+                            agent_panes,
                             active_term,
                             pending,
                             prompt_src,
                             &self.renaming_claude,
+                            self.agent_menu_open,
                         )
                     }
                     PaneKind::Browser => {
@@ -2204,11 +3247,15 @@ impl Frms {
         if session.plugin_panel.visible {
             let panel = ui::plugin_panel::view(
                 &session.plugin_panel,
-                &session.db_panel,
                 &self.prefs,
                 &self.notes,
                 session.working_dir.to_str(),
                 &session.terminals_plugin,
+                &self.receivers,
+                session.db_panel.client.is_some(),
+                &session.db_panel.tables,
+                self.claude_installed,
+                self.prefs.telemetry,
             );
             // Dock side decides whether the panel sits left of the file browser
             // or right of everything.
@@ -2224,12 +3271,25 @@ impl Frms {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let claude_pty_subs = self.sessions.iter()
-            .flat_map(|s| s.terminals.iter())
-            .map(|t| terminal::pty_subscription(t.id, t.reader.clone(), Message::TerminalData));
+            .flat_map(|s| s.panes.iter())
+            .filter_map(|p| p.as_terminal())
+            .map(|t| terminal::pty_subscription(
+                t.id, t.reader.clone(), t.child.clone(),
+                Message::TerminalData, Message::TerminalExited));
         let plugin_pty_subs = self.sessions.iter()
             .flat_map(|s| s.terminals_plugin.terminals.iter())
-            .map(|t| terminal::pty_subscription(t.id, t.pane.reader.clone(), Message::TerminalData));
-        let pty_subs = claude_pty_subs.chain(plugin_pty_subs);
+            .map(|t| terminal::pty_subscription(
+                t.id, t.pane.reader.clone(), t.pane.child.clone(),
+                Message::TerminalData, Message::TerminalExited));
+        // Every live receiver SSH session (one per connected receiver). An
+        // exited session is skipped — its read loop has already ended, so
+        // re-subscribing the dead PTY would just immediately re-fire exit.
+        let receiver_pty_sub = self.receivers.ssh.iter()
+            .filter(|t| !t.exited)
+            .map(|t| terminal::pty_subscription(
+                t.id, t.pane.reader.clone(), t.pane.child.clone(),
+                Message::TerminalData, Message::TerminalExited));
+        let pty_subs = claude_pty_subs.chain(plugin_pty_subs).chain(receiver_pty_sub);
 
         // Video frames — only while splash is shown and yt-dlp is ready.
         let video_sub: Option<Subscription<Message>> =
@@ -2364,10 +3424,16 @@ impl Frms {
         let session = Session::new(id, name, kind, first_term, dir);
         self.sessions.push(session);
         self.active_session = self.sessions.len() - 1;
+        self.telemetry.record(crate::telemetry::Event::SessionCreated {
+            kind: match kind {
+                SessionKind::Terminal => "terminal",
+                SessionKind::Browser  => "browser",
+            },
+        });
     }
 
     fn session_for_terminal_mut(&mut self, id: TerminalId) -> Option<&mut Session> {
-        self.sessions.iter_mut().find(|s| s.terminals.iter().any(|t| t.id == id))
+        self.sessions.iter_mut().find(|s| s.panes.iter().any(|p| p.id() == id))
     }
 
     fn session_for_plugin_terminal_mut(&mut self, id: TerminalId) -> Option<&mut Session> {
@@ -2418,6 +3484,35 @@ impl Frms {
     /// Capture terminal `id`'s selection into a brand-new note (clearing the
     /// selection), then reveal the Notes plugin so the note is on screen and
     /// ready to edit. Works for both Claude panes and shell-plugin terminals.
+    /// Copy `files` to the currently-selected receiver. Thin wrapper over
+    /// [`copy_files_to`] used by the file-browser row action.
+    fn start_receiver_copy(&mut self, files: Vec<std::path::PathBuf>) -> Task<Message> {
+        let Some(id) = self.receivers.selected_receiver else {
+            self.receivers.status = Some(Err("select a receiver first".into()));
+            return Task::none();
+        };
+        self.copy_files_to(id, files)
+    }
+
+    /// Copy `files` to receiver `id`'s home directory over scp, after
+    /// validating it has the credentials needed. Records an immediate error in
+    /// the status line when prerequisites are missing.
+    fn copy_files_to(&mut self, id: u64, files: Vec<std::path::PathBuf>) -> Task<Message> {
+        let Some(r) = self.receivers.receiver_by_id(id).cloned() else {
+            self.receivers.status = Some(Err("receiver not found".into()));
+            return Task::none();
+        };
+        if r.host.trim().is_empty() || r.username.trim().is_empty() {
+            self.receivers.status = Some(Err("receiver is missing a host or username".into()));
+            return Task::none();
+        }
+        self.receivers.status = Some(Ok(format!("Copying to {}…", r.destination())));
+        Task::perform(
+            crate::scp::copy(r.host, r.username, r.password, r.port, files),
+            Message::ReceiverCopyDone,
+        )
+    }
+
     fn selection_to_note(&mut self, id: TerminalId) {
         let text = if let Some(s) = self.session_for_terminal_mut(id) {
             s.terminal_mut(id).and_then(|t| {
@@ -2579,6 +3674,14 @@ fn main_key_listener(
     status: iced::event::Status,
     _window: iced::window::Id,
 ) -> Option<Message> {
+    // TEMP DEBUG (FRMS_KEYLOG=1): log every key press + its capture status so we
+    // can see whether ArrowRight is arriving Captured (eaten by a widget) or
+    // Ignored (so the swallow is downstream). Remove once the arrow bug is found.
+    if std::env::var("FRMS_KEYLOG").is_ok() {
+        if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) = &event {
+            eprintln!("[keylog] key={key:?} status={status:?}");
+        }
+    }
     let is_tab = matches!(
         &event,
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
