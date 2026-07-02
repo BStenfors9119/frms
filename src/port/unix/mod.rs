@@ -4,9 +4,11 @@
 //! gate in [`port`](crate::port) selects it, so every file here is plain
 //! single-platform code.
 
+mod browser;
 mod clipboard;
 mod dirs;
 mod fs;
+mod proc;
 mod shell;
 mod window;
 

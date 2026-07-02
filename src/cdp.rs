@@ -36,9 +36,9 @@ pub async fn launch(port: u16) -> Result<(), String> {
 
     let mut last_err = "no Chromium binary found — install chromium or google-chrome".to_string();
 
-    // ── 1. Direct binary names ─────────────────────────────────────────────────
-    for binary in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"] {
-        if try_launch(binary, &base_flags, port).await {
+    // ── 1. Direct binary names (Edge/Chrome paths on Windows) ──────────────────
+    for binary in crate::port::browser::chromium_binaries() {
+        if try_launch(&binary, &base_flags, port).await {
             return Ok(());
         }
         last_err = format!("{binary} could not start CDP on port {port}");

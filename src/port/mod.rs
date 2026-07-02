@@ -77,6 +77,22 @@ pub mod clipboard {
     }
 }
 
+/// Inspecting the system process table and memory. Wraps the OS impl.
+pub mod proc {
+    pub use super::api::ProcSample;
+    use super::api::Proc;
+    use super::imp::Sys;
+
+    /// RSS + CPU for every running `claude` process except this one.
+    pub fn claude_procs() -> Vec<ProcSample> {
+        <Sys as Proc>::claude_procs()
+    }
+    /// Total physical RAM in KiB, or `0` if unknown.
+    pub fn mem_total_kb() -> u64 {
+        <Sys as Proc>::mem_total_kb()
+    }
+}
+
 /// Filesystem operations whose mechanism differs by platform.
 pub mod fs {
     use super::api::Fs;
@@ -86,6 +102,17 @@ pub mod fs {
     /// Restrict `path` to the owning user (credentials files). See [`Fs`](super::api::Fs).
     pub fn restrict_to_owner(path: &Path) {
         <Sys as Fs>::restrict_to_owner(path)
+    }
+}
+
+/// Locating a Chromium-family browser for headless CDP / screenshots.
+pub mod browser {
+    use super::api::Browser;
+    use super::imp::Sys;
+
+    /// Ordered Chromium-family executables to try launching directly.
+    pub fn chromium_binaries() -> Vec<String> {
+        <Sys as Browser>::chromium_binaries()
     }
 }
 

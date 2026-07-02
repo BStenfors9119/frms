@@ -5,9 +5,11 @@
 //! is plain single-platform code. Targeted at desktop Windows (incl. IoT
 //! Enterprise / LTSC), not IoT Core.
 
+mod browser;
 mod clipboard;
 mod dirs;
 mod fs;
+mod proc;
 mod shell;
 mod window;
 

@@ -3825,7 +3825,9 @@ async fn take_screenshot(session_id: usize, url: String) -> (usize, Result<Vec<u
     eprintln!("[take_screenshot] session={session_id} url={url}");
 
     // Use $HOME — accessible by both the toolbox and Firefox/Chromium Flatpaks on the host
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/var/tmp".to_string());
+    let home = crate::port::dirs::home()
+        .and_then(|p| p.to_str().map(str::to_owned))
+        .unwrap_or_else(|| "/var/tmp".to_string());
     let tmp = std::path::PathBuf::from(format!("{home}/.cache/frms_screenshot_{session_id}.png"));
     // Ensure the directory exists
     let _ = fs::create_dir_all(tmp.parent().unwrap());
@@ -3884,8 +3886,8 @@ async fn take_screenshot(session_id: usize, url: String) -> (usize, Result<Vec<u
         chrome_screenshot.as_str(),
         url.as_str(),
     ];
-    for binary in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"] {
-        try_cmd!(binary, &chrome_args, binary);
+    for binary in crate::port::browser::chromium_binaries() {
+        try_cmd!(&binary, &chrome_args, binary);
     }
 
     // ── Firefox helper ────────────────────────────────────────────────────────

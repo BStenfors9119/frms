@@ -61,12 +61,39 @@ pub trait Clipboard {
     async fn write(text: String);
 }
 
+/// One running process's resource usage, as sampled by [`Proc`].
+pub struct ProcSample {
+    /// Resident set size in KiB.
+    pub rss_kb: u64,
+    /// CPU utilisation percentage. `0.0` where the platform can't sample it
+    /// cheaply (currently Windows).
+    pub cpu_pct: f32,
+}
+
+/// Inspecting the system process table and memory.
+pub trait Proc {
+    /// RSS + CPU for every running `claude` process except this one. Empty when
+    /// the platform can't enumerate processes.
+    fn claude_procs() -> Vec<ProcSample>;
+    /// Total physical RAM in KiB, or `0` if unknown.
+    fn mem_total_kb() -> u64;
+}
+
 /// Filesystem operations whose mechanism differs by platform.
 pub trait Fs {
     /// Restrict `path` so only the owning user can read it. Used for files that
     /// hold plaintext credentials. `chmod 600` on unix; on Windows a no-op today
     /// (profile-directory ACLs already exclude other standard users).
     fn restrict_to_owner(path: &std::path::Path);
+}
+
+/// Locating a Chromium-family browser for headless CDP / screenshots.
+pub trait Browser {
+    /// Ordered Chromium-family executables to try launching directly — package
+    /// names on unix (`chromium`, `google-chrome`, …); absolute Edge/Chrome
+    /// install paths (plus bare names) on Windows. All accept the same
+    /// `--headless=new` / `--remote-debugging-port` flags.
+    fn chromium_binaries() -> Vec<String>;
 }
 
 /// Platform-specific window configuration applied at startup.
