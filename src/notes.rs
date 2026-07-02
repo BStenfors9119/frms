@@ -463,8 +463,7 @@ fn title_from(body: &str) -> String {
 }
 
 fn notes_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".frms").join("notes.json"))
+    Some(crate::port::dirs::config()?.join("notes.json"))
 }
 
 fn read_from_disk() -> Option<Vec<Note>> {

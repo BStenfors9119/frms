@@ -75,8 +75,7 @@ pub struct PersistedState {
 }
 
 fn path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".frms").join("sessions.json"))
+    Some(crate::port::dirs::config()?.join("sessions.json"))
 }
 
 fn kind_as_str(k: SessionKind) -> &'static str {

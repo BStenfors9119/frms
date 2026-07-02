@@ -3419,7 +3419,7 @@ impl Frms {
         self.next_session_id  += 1;
         self.next_terminal_id += 1;
         let dir = working_dir.unwrap_or_else(|| {
-            std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
+            crate::port::dirs::home().unwrap_or_else(|| PathBuf::from("."))
         });
         let session = Session::new(id, name, kind, first_term, dir);
         self.sessions.push(session);

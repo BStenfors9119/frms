@@ -18,8 +18,7 @@ pub struct DbHistory {
 }
 
 fn history_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".frms").join("db_history.json"))
+    Some(crate::port::dirs::config()?.join("db_history.json"))
 }
 
 impl DbHistory {

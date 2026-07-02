@@ -192,8 +192,7 @@ fn now_secs() -> u64 {
 // ── anonymous id ────────────────────────────────────────────────────────────
 
 fn id_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".frms").join("telemetry_id"))
+    Some(crate::port::dirs::config()?.join("telemetry_id"))
 }
 
 /// Persistent random id (UUID-like, 16 bytes hex). Created once, then reused —
@@ -242,7 +241,7 @@ fn random_hex16() -> String {
 /// secret-shaped tokens, and cap the length.
 fn scrub(s: &str) -> String {
     let mut out = s.to_string();
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = crate::port::dirs::home().and_then(|h| h.to_str().map(str::to_owned)) {
         if !home.is_empty() {
             out = out.replace(&home, "~");
         }

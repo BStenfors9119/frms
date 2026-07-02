@@ -74,8 +74,8 @@ pub fn load_sync() -> Option<ClaudeStats> {
 }
 
 fn read_usage() -> Option<ClaudeStats> {
-    let home  = std::env::var("HOME").ok()?;
-    let creds = std::fs::read(format!("{home}/.claude/.credentials.json")).ok()?;
+    let creds_path = crate::port::dirs::home()?.join(".claude").join(".credentials.json");
+    let creds = std::fs::read(creds_path).ok()?;
     let creds: serde_json::Value = serde_json::from_slice(&creds).ok()?;
     let token = creds["claudeAiOauth"]["accessToken"].as_str()?.to_string();
 

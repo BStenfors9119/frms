@@ -3,7 +3,6 @@
 //! bundled in `assets/fonts/`) supplies the letterforms via `ab_glyph`; the
 //! glasses are drawn with simple circle math.
 
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
@@ -92,8 +91,7 @@ pub fn export_png(path: &std::path::Path) -> Option<()> {
 }
 
 fn export_assets(rgba: &[u8]) -> Option<()> {
-    let home = std::env::var("HOME").ok()?;
-    let dir  = PathBuf::from(home).join(".cache").join("frms");
+    let dir = crate::port::dirs::cache()?;
     std::fs::create_dir_all(&dir).ok()?;
 
     let png_path     = dir.join("frms-icon.png");

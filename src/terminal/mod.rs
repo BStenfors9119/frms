@@ -143,14 +143,12 @@ impl TerminalPane {
         for arg in args {
             cmd.arg(arg);
         }
-        // CommandBuilder inherits the parent env verbatim and sets no TERM of
-        // its own. When the IDE is launched from a desktop entry (rather than
-        // a shell), TERM is unset — children then assume a dumb terminal: no
-        // color anywhere, and terminfo users like `clear` fail outright. So
-        // advertise the same xterm flavor children saw when the IDE was run
-        // from a terminal during development.
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
+        // CommandBuilder inherits the parent env verbatim. Layer on the
+        // platform's baseline terminal env (TERM/COLORTERM on unix, so children
+        // launched from a desktop entry still emit colour; nothing on Windows).
+        for (k, v) in crate::port::shell::terminal_env() {
+            cmd.env(k, v);
+        }
         for (k, v) in envs {
             cmd.env(k, v);
         }

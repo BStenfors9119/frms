@@ -16,19 +16,10 @@ pub enum SessionKind {
     Browser,
 }
 
-/// True if `cmd` is an executable file reachable on `PATH`. Used to decide
-/// whether the `claude` CLI is installed before we try to spawn it.
-fn on_path(cmd: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths)
-            .any(|dir| std::fs::metadata(dir.join(cmd)).map(|m| m.is_file()).unwrap_or(false))
-    })
-}
-
 /// Whether the `claude` CLI is installed (on `PATH`). Both Build panes and the
 /// native chat panes drive it, so the Profile tab surfaces this to the user.
 pub fn claude_on_path() -> bool {
-    on_path("claude")
+    crate::port::shell::on_path("claude")
 }
 
 /// Spawn a Build (Claude Code) agent pane in a PTY.
@@ -41,18 +32,12 @@ pub fn claude_on_path() -> bool {
 /// exactly how to get Claude Code, while leaving them a usable shell in the
 /// pane. Re-running an agent pane after installing picks up `claude` normally.
 fn spawn_agent_pane(id: TerminalId, dir: Option<&std::path::Path>) -> TerminalPane {
-    if on_path("claude") {
+    if crate::port::shell::on_path("claude") {
         if let Ok(pane) = TerminalPane::spawn(id, "claude", dir) {
             return pane;
         }
     }
 
-    // Single-quote a string for safe inclusion in a `sh -c` script: wrap in
-    // quotes and replace each embedded quote with the '\'' idiom.
-    fn sq(s: &str) -> String {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let lines = [
         "Claude Code CLI ('claude') was not found on your PATH.",
         "Agent panes use it to run Claude. To install it:",
@@ -60,13 +45,8 @@ fn spawn_agent_pane(id: TerminalId, dir: Option<&std::path::Path>) -> TerminalPa
         "(requires Node.js / npm). Then restart frms or open a new agent pane.",
         "",
     ];
-    let script = format!(
-        "printf '%s\\n' {}; exec {}",
-        lines.iter().map(|l| sq(l)).collect::<Vec<_>>().join(" "),
-        sq(&shell),
-    );
-    let args = vec!["-c".to_string(), script];
-    TerminalPane::spawn_args(id, "/bin/sh", &args, &[], dir)
+    let (prog, args) = crate::port::shell::guidance_shell(&lines);
+    TerminalPane::spawn_args(id, &prog, &args, &[], dir)
         .unwrap_or_else(|e| panic!("Failed to spawn fallback shell for agent pane {id}: {e}"))
 }
 

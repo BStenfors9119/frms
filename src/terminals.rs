@@ -58,8 +58,8 @@ impl TerminalsState {
         name:        String,
         pinned:      bool,
     ) {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".into());
-        let pane = match TerminalPane::spawn(id, &shell, Some(working_dir)) {
+        let (shell, args) = crate::port::shell::login_shell();
+        let pane = match TerminalPane::spawn_args(id, &shell, &args, &[], Some(working_dir)) {
             Ok(p)  => p,
             Err(e) => { eprintln!("[terminals] spawn {shell} failed: {e}"); return; }
         };

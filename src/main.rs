@@ -18,6 +18,7 @@ mod notes;
 mod pane;
 mod persisted;
 mod plugin_panel;
+mod port;
 mod prefs;
 mod receivers;
 mod scp;
@@ -62,12 +63,9 @@ fn main() -> iced::Result {
         icon:     icon::build(),
         ..Default::default()
     };
-    // Wayland app_id / X11 WM_CLASS — must match the .desktop filename
-    // (frms.desktop) so GNOME associates the window with the pinned launcher.
-    #[cfg(target_os = "linux")]
-    {
-        window_settings.platform_specific.application_id = "frms".into();
-    }
+    // Platform tweaks (e.g. the Linux Wayland/X11 app_id that binds the window
+    // to frms.desktop) live in the port layer, not behind a cfg here.
+    port::window::configure(&mut window_settings);
 
     iced::application(app::title, app::update, app::view)
         .theme(app::theme)

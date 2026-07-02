@@ -319,11 +319,7 @@ impl ReceiversState {
         if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
             if std::fs::write(&path, bytes).is_ok() {
                 // Credentials live here in plaintext; keep them owner-only.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
+                crate::port::fs::restrict_to_owner(&path);
             }
         }
     }
@@ -735,8 +731,7 @@ pub fn parse_csv(text: &str) -> Option<(Vec<String>, Vec<Vec<String>>)> {
 }
 
 fn receivers_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".frms").join("receivers.json"))
+    Some(crate::port::dirs::config()?.join("receivers.json"))
 }
 
 /// Serialize the inventory to the on-disk JSON shape. Split out so the

@@ -48,8 +48,7 @@ impl Default for Prefs {
 }
 
 fn prefs_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".frms").join("prefs.json"))
+    Some(crate::port::dirs::config()?.join("prefs.json"))
 }
 
 impl Prefs {
@@ -116,9 +115,7 @@ impl Prefs {
                 return d.to_path_buf();
             }
         }
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."))
+        crate::port::dirs::home().unwrap_or_else(|| PathBuf::from("."))
     }
 
     pub fn colors(&self) -> ThemeColors {
