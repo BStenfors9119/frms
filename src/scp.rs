@@ -1,10 +1,11 @@
-//! Copy local files to a TSR receiver with `sshpass` + `scp`.
+//! Copy local files to a TSR receiver over SSH.
 //!
 //! Mirrors the project's "shell out instead of linking a library" approach
-//! (see `clipboard.rs` and the `curl` networking in `chat_api.rs`). The
-//! receiver's password is handed to `sshpass` through the `SSHPASS`
-//! environment variable rather than the argument list (which is world-readable
-//! via `/proc`). Files land in the receiver's `/home/<username>/` directory.
+//! (see `clipboard.rs` and the `curl` networking in `chat_api.rs`). The actual
+//! transport command is platform-specific and built by `port::transfer`:
+//! `sshpass + scp` on unix (password in the environment, out of the argv),
+//! PuTTY's `pscp -pw` on Windows. Files land in the receiver's
+//! `/home/<username>/` directory.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -25,23 +26,25 @@ pub async fn copy(
         return Err("no file selected to copy".to_string());
     }
 
-    // `scp -P <port> -o accept-new <files…> user@host:/home/user/`
+    // Build the platform-appropriate copy command: `sshpass + scp` on unix,
+    // PuTTY's `pscp -pw` on Windows (or a clear error if neither is available).
+    // Files land in the receiver's `/home/<user>/` — always a Linux path,
+    // since the receiver is a TSR Linux device regardless of the local OS.
     let dest = format!("{user}@{host}:/home/{user}/");
-    let mut cmd = tokio::process::Command::new("sshpass");
-    cmd.arg("-e") // read password from $SSHPASS
-        .arg("scp")
-        .arg("-P").arg(port.to_string())
-        .arg("-o").arg("StrictHostKeyChecking=accept-new");
-    for f in &files {
-        cmd.arg(f);
+    let spec = crate::port::transfer::scp_command(&host, &user, &password, port, &files, &dest)?;
+
+    let mut cmd = tokio::process::Command::new(&spec.program);
+    cmd.args(&spec.args);
+    for (k, v) in &spec.envs {
+        cmd.env(k, v);
     }
-    cmd.arg(&dest)
-        .env("SSHPASS", &password)
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| format!("could not run sshpass/scp: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not run {}: {e}", spec.program))?;
 
     let status = child.wait().await.map_err(|e| format!("scp wait failed: {e}"))?;
     if status.success() {

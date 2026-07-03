@@ -1,6 +1,6 @@
 [package]
 name = "frms"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [[bin]]
@@ -19,3 +19,10 @@ image             = { version = "0.24", default-features = false, features = ["j
 tokio-postgres    = "0.7"
 mysql_async       = { version = "0.36", default-features = false }
 ab_glyph          = "0.2"
+
+# Build-time only: embed the Windows .ico into frms.exe (see build.rs). Kept
+# unconditional (not host-gated) so it's available to build.rs when we
+# cross-compile the Windows target from Linux; build.rs itself only invokes it
+# for `CARGO_CFG_TARGET_OS == "windows"`.
+[build-dependencies]
+winresource = "0.1"

@@ -187,6 +187,10 @@ pub struct DbPanel {
     pub filters:           Vec<Filter>,
     /// Columns to GROUP BY, in selection order. Empty means no GROUP BY clause.
     pub group_by:          Vec<ColRef>,
+    /// Optional row cap for generated SELECTs, entered in the Filters column.
+    /// Empty means no `LIMIT` (every matching row); a positive number appends
+    /// `LIMIT n`. Kept digits-only on input so the clause is always valid.
+    pub limit_input:       String,
     /// Manual JOIN conditions keyed by joined table key. A non-base table with
     /// no entry (or an incomplete one) falls back to its foreign key, or a
     /// CROSS JOIN when no key links it.
@@ -264,6 +268,7 @@ impl Default for DbPanel {
             selected_cols:    Vec::new(),
             filters:          Vec::new(),
             group_by:         Vec::new(),
+            limit_input:      String::new(),
             joins:            HashMap::new(),
             dragging_field:   None,
             row1_collapsed:   false,
@@ -455,10 +460,21 @@ impl DbPanel {
         }
 
         Some(format!(
-            "SELECT {select} FROM {from}{}{} LIMIT 100",
+            "SELECT {select} FROM {from}{}{}{}",
             self.where_clause(engine),
             self.group_by_clause(engine),
+            self.limit_clause(),
         ))
+    }
+
+    /// ` LIMIT n` when the user has set a positive row cap in the Filters
+    /// column, else empty — no limit, every matching row is returned. (There is
+    /// deliberately no default cap: unlimited unless the user opts in.)
+    fn limit_clause(&self) -> String {
+        match self.limit_input.trim().parse::<u64>() {
+            Ok(n) if n > 0 => format!(" LIMIT {n}"),
+            _ => String::new(),
+        }
     }
 
     /// Render the ` GROUP BY …` clause from the chosen grouping columns, or an

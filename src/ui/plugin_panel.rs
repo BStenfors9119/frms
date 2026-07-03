@@ -270,10 +270,44 @@ fn profile_body<'a>(prefs: &'a Prefs, pctx: &ProfileCtx) -> Element<'a, Message>
         Space::new(Length::Shrink, Length::Fixed(8.0)),
         claude_status_section(pctx),
         Space::new(Length::Shrink, Length::Fixed(8.0)),
+        keyboard_shortcuts_section(),
+        Space::new(Length::Shrink, Length::Fixed(8.0)),
         privacy_section(pctx),
     ]
     .spacing(8)
     .into()
+}
+
+/// Reference list of the app's keyboard shortcuts. Purely informational — the
+/// bindings themselves live in `app::handle_key`; keep the two in sync.
+fn keyboard_shortcuts_section() -> Element<'static, Message> {
+    // (keys, what it does). Grouped: navigation, then actions.
+    let shortcuts: &[(&str, &str)] = &[
+        ("Ctrl+Tab  /  Ctrl+Shift+Tab", "Cycle panes (includes the toolbox)"),
+        ("Ctrl+Shift+↓  /  ↑",          "Next / previous pane needing attention"),
+        ("Ctrl+Shift+]  /  [",          "Next / previous project session"),
+        ("Ctrl+1 … 9",                  "Jump to project session N"),
+        ("Ctrl+Shift+B",                "Toggle the toolbox panel"),
+        ("Ctrl+Shift+T",                "New agent pane"),
+        ("Ctrl+Shift+W",                "Close the focused agent pane"),
+        ("Ctrl+Shift+Enter  /  R",      "Answer the surfaced prompt (Accept / Reject)"),
+        ("Ctrl+Shift+C  /  V",          "Copy / paste in the terminal"),
+        ("Ctrl+Shift+N",                "New note from the selection"),
+    ];
+
+    let mut col = column![text("Keyboard shortcuts").size(15)].spacing(5);
+    for (keys, desc) in shortcuts {
+        col = col.push(
+            row![
+                container(text(*keys).font(Font::MONOSPACE).size(11))
+                    .width(Length::Fixed(215.0)),
+                text(*desc).font(UI_FONT).size(11),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        );
+    }
+    col.into()
 }
 
 /// Privacy / telemetry controls. Telemetry is on by default; this is the opt-out

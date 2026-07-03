@@ -116,6 +116,26 @@ pub mod browser {
     }
 }
 
+/// Copying local files to a receiver over SSH. Wraps the OS impl.
+pub mod transfer {
+    pub use super::api::CopyCommand;
+    use super::api::Transfer;
+    use super::imp::Sys;
+    use std::path::PathBuf;
+
+    /// Build the platform-appropriate password-scp command (see [`Transfer`](super::api::Transfer)).
+    pub fn scp_command(
+        host: &str,
+        user: &str,
+        password: &str,
+        port: u16,
+        files: &[PathBuf],
+        dest: &str,
+    ) -> Result<CopyCommand, String> {
+        <Sys as Transfer>::scp_command(host, user, password, port, files, dest)
+    }
+}
+
 /// Platform-specific window configuration. Neutral wrapper over the OS impl.
 pub mod window {
     use super::api::Window;

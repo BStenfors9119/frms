@@ -13,12 +13,24 @@ pub const W: u32 = 256;
 pub const H: u32 = 256;
 /// White text + glasses — looks good on any taskbar background.
 const FG: (u8, u8, u8) = (245, 245, 245);
+/// Opaque backdrop composited behind the wordmark. Without a solid background
+/// the white-on-transparent icon renders as a blank square on the Windows
+/// taskbar (a transparent icon with invisible white content).
+const BG: (u8, u8, u8) = (34, 36, 40);
+/// Corner radius (px) of the icon's rounded-rect background.
+const CORNER_RADIUS: f32 = 44.0;
 
 pub fn build() -> Option<iced::window::Icon> {
-    let buf = rgba()?.clone();
+    let mut buf = rgba()?.clone();
     // Write a PNG and a .desktop template once per launch so the icon is
     // installable on Wayland (where the in-process winit icon is ignored).
+    // Desktop integration gets the plain (transparent) logo.
     let _ = export_assets(&buf);
+    // The window/taskbar icon gets an opaque rounded backdrop so it stays
+    // visible on any panel (notably the Windows taskbar, where a transparent
+    // white logo shows as a blank square). The splash uses the transparent logo
+    // directly via `rgba()`, so this backdrop is confined to the window icon.
+    composite_background(&mut buf, BG, CORNER_RADIUS);
     iced::window::icon::from_rgba(buf, W, H).ok()
 }
 
@@ -73,7 +85,39 @@ fn render_rgba() -> Option<Vec<u8>> {
 
     draw_glyph(&mut buf, &font, scale, 's', x, baseline);
 
+    // Note: the transparent logo is returned as-is. The opaque backdrop for the
+    // window/taskbar icon is applied in `build()`, so the splash (via `rgba()`)
+    // keeps the plain logo.
     Some(buf)
+}
+
+/// True if pixel `(x, y)` falls inside a rounded rectangle spanning the whole
+/// icon with corner `radius`.
+fn inside_rounded(x: u32, y: u32, radius: f32) -> bool {
+    let (w, h) = (W as f32, H as f32);
+    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+    let cx = if fx < radius { radius - fx } else if fx > w - radius { fx - (w - radius) } else { 0.0 };
+    let cy = if fy < radius { radius - fy } else if fy > h - radius { fy - (h - radius) } else { 0.0 };
+    cx * cx + cy * cy <= radius * radius
+}
+
+/// Blend the already-drawn (white, coverage-alpha) pixels over an opaque
+/// background `(r, g, b)` inside the rounded-rect region, leaving the four
+/// corners transparent so the icon isn't a hard square.
+fn composite_background(buf: &mut [u8], (r, g, b): (u8, u8, u8), radius: f32) {
+    for y in 0..H {
+        for x in 0..W {
+            if !inside_rounded(x, y, radius) {
+                continue;
+            }
+            let i = ((y * W + x) * 4) as usize;
+            let a = buf[i + 3] as f32 / 255.0;
+            buf[i]     = (buf[i]     as f32 * a + r as f32 * (1.0 - a)).round() as u8;
+            buf[i + 1] = (buf[i + 1] as f32 * a + g as f32 * (1.0 - a)).round() as u8;
+            buf[i + 2] = (buf[i + 2] as f32 * a + b as f32 * (1.0 - a)).round() as u8;
+            buf[i + 3] = 255;
+        }
+    }
 }
 
 // ── exporting the icon for desktop integration ────────────────────────────────

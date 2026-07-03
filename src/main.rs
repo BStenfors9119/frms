@@ -61,6 +61,10 @@ fn main() -> iced::Result {
         size:     Size::new(1400.0, 900.0),
         min_size: Some(Size::new(800.0, 500.0)),
         icon:     icon::build(),
+        // The title-bar X is routed through `window_close_listener` →
+        // `Message::Quit` → our hard shutdown, so disable iced's built-in
+        // graceful exit (which hangs on Windows joining blocked PTY threads).
+        exit_on_close_request: false,
         ..Default::default()
     };
     // Platform tweaks (e.g. the Linux Wayland/X11 app_id that binds the window

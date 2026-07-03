@@ -644,11 +644,28 @@ fn filters_col(panel: &DbPanel) -> Element<'_, Message> {
         }
     }
 
-    column![add_btn, scrollable(col).width(Length::Fill).height(Length::Fill)]
-        .spacing(6)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    // Row cap. Blank = no LIMIT (all rows); a number caps the result set. Pinned
+    // below the filter list so it's always reachable regardless of filter count.
+    let limit = row![
+        text("Limit").font(UI_FONT).size(11),
+        text_input("all rows", &panel.limit_input)
+            .on_input(Message::DbLimitChanged)
+            .font(UI_FONT)
+            .size(11)
+            .width(Length::Fixed(90.0)),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    column![
+        add_btn,
+        scrollable(col).width(Length::Fill).height(Length::Fill),
+        limit,
+    ]
+    .spacing(6)
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 /// One WHERE-clause condition: an AND/OR connector (or a "where" label on the

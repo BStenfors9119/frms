@@ -96,6 +96,9 @@ pub struct FilePicker {
 pub struct Frms {
     pub sessions:                Vec<Session>,
     pub active_session:          usize,
+    /// Ctrl+Tab pane cycling treats the toolbox as one more stop; this is true
+    /// while that stop is the current focus so the next cycle steps off it.
+    pub pane_focus_toolbox:      bool,
     pub split_view:              Option<SplitView>,
     /// `Some` while the receiver file-copy picker overlay is on screen.
     pub file_picker:             Option<FilePicker>,
@@ -124,6 +127,9 @@ pub struct Frms {
     /// Code status. Probed once at startup (an external install/sign-in via
     /// `frms-setup-claude` is picked up on the next launch).
     pub claude_installed:        bool,
+    /// True once the "Claude Code required" startup prompt has been dismissed
+    /// this session (shown whenever `claude` is missing; not persisted).
+    pub claude_notice_dismissed: bool,
     /// Anonymous usage telemetry sender (no-op when the user has opted out).
     pub telemetry:               crate::telemetry::Telemetry,
     pub notes:                   NotesState,
@@ -325,6 +331,21 @@ pub enum Message {
     SplashAnimTick,
     // Window
     Quit,
+    // Keyboard navigation (see `handle_key` and the Profile shortcuts callout)
+    /// Cycle keyboard focus across the active project's panes (and the toolbox).
+    CyclePane { forward: bool },
+    /// Jump to the next/previous pane that's waiting on the user (a surfaced
+    /// question or a review), across all sessions.
+    CycleAttention { forward: bool },
+    /// Switch to the next/previous project session (the top tabs).
+    CycleSession { forward: bool },
+    /// Close the currently focused agent pane (same confirm flow as its ✕).
+    CloseActiveAgent,
+    // Claude-Code-required startup prompt
+    /// Continue without the `claude` CLI for this session.
+    ClaudeNoticeDismissed,
+    /// Re-probe the PATH for `claude` (after installing it in a terminal).
+    ClaudeRecheck,
     // Stats
     StatsRefresh,
     StatsLoaded(ClaudeStats),
@@ -489,6 +510,8 @@ pub enum Message {
     DbFilterValueChanged(usize, String),
     DbFilterConjToggled(usize),
     DbFilterRemoved(usize),
+    /// Row-cap ("Limit") field edited; empty = no LIMIT (all rows).
+    DbLimitChanged(String),
     /// Toggle a (table, column) into/out of the GROUP BY clause.
     DbGroupToggled(String, String),
     /// Manual JOIN-condition edits, keyed by the joined table. The first arg is
@@ -596,6 +619,7 @@ impl Frms {
         let mut app = Self {
             sessions:                 Vec::new(),
             active_session:           0,
+            pane_focus_toolbox:       false,
             split_view:               None,
             pending_close:            None,
             creating_session:         true,
@@ -615,6 +639,7 @@ impl Frms {
             prefs_dev_dir_input,
             prefs_file_browser:       prefs_browser,
             claude_installed:         crate::session::claude_on_path(),
+            claude_notice_dismissed:  false,
             telemetry:                crate::telemetry::Telemetry::disabled(),
             notes:                    NotesState::load(),
             receivers:                crate::receivers::ReceiversState::load(),
@@ -1210,6 +1235,7 @@ impl Frms {
                 self.agent_menu_open = false;
                 let new_id = self.next_terminal_id;
                 self.next_terminal_id += 1;
+                self.pane_focus_toolbox = false;
                 let s = &mut self.sessions[self.active_session];
                 s.add_agent(new_id, kind);
                 s.active_terminal = new_id;
@@ -1407,6 +1433,7 @@ impl Frms {
                     .position(|s| s.panes.iter().any(|p| p.id() == id))
                 {
                     self.active_session = idx;
+                    self.pane_focus_toolbox = false;
                     let s = &mut self.sessions[idx];
                     s.active_terminal          = id;
                     s.center_tab               = crate::session::CenterTab::Claude(id);
@@ -1558,6 +1585,7 @@ impl Frms {
                     .position(|s| s.panes.iter().any(|p| p.id() == id))
                 {
                     self.active_session = idx;
+                    self.pane_focus_toolbox = false;
                     let s = &mut self.sessions[idx];
                     s.active_terminal          = id;
                     s.center_tab               = crate::session::CenterTab::Claude(id);
@@ -1856,7 +1884,40 @@ impl Frms {
 
             // ── window ────────────────────────────────────────────────────────
             Message::Quit => {
-                return iced::exit();
+                self.shutdown();
+            }
+
+            // ── keyboard navigation ─────────────────────────────────────────────
+            Message::CyclePane { forward } => {
+                self.cycle_pane(forward);
+            }
+            Message::CycleAttention { forward } => {
+                self.cycle_attention(forward);
+            }
+            Message::CycleSession { forward } => {
+                let n = self.sessions.len();
+                if n > 1 {
+                    self.active_session = if forward {
+                        (self.active_session + 1) % n
+                    } else {
+                        (self.active_session + n - 1) % n
+                    };
+                    self.pane_focus_toolbox = false;
+                    self.save_persisted();
+                }
+            }
+            Message::CloseActiveAgent => {
+                // Same confirm flow as the agent tab's ✕.
+                let tid = self.sessions[self.active_session].active_terminal;
+                self.pending_close = Some(PendingClose::Claude(tid));
+            }
+            Message::ClaudeNoticeDismissed => {
+                self.claude_notice_dismissed = true;
+            }
+            Message::ClaudeRecheck => {
+                // Re-probe; if `claude` is now installed the notice's view gate
+                // stops firing on its own. Otherwise the prompt stays up.
+                self.claude_installed = crate::session::claude_on_path();
             }
 
             // ── stats ─────────────────────────────────────────────────────────
@@ -2692,6 +2753,12 @@ impl Frms {
                     p.filters.remove(i);
                 }
             }
+            Message::DbLimitChanged(s) => {
+                // Digits only, so the generated LIMIT clause stays valid;
+                // empty = no limit (all rows).
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.limit_input = s.chars().filter(|c| c.is_ascii_digit()).collect();
+            }
             Message::DbGroupToggled(table_key, col) => {
                 let p = &mut self.sessions[self.active_session].db_panel;
                 if let Some(pos) = p.group_by
@@ -2946,8 +3013,8 @@ impl Frms {
                     self.prefs.nda_accepted = true;
                     self.prefs.save();
                 } else {
-                    // Declined — close the window, which exits the app.
-                    return iced::window::get_latest().and_then(iced::window::close);
+                    // Declined — terminate the app (hard shutdown; see `shutdown`).
+                    self.shutdown();
                 }
             }
             Message::TelemetryNoticeChoice(keep_on) => {
@@ -2994,6 +3061,13 @@ impl Frms {
         // before any data is sent. No telemetry fires until acknowledged.
         if !self.prefs.telemetry_notice_ack {
             return ui::telemetry_notice::view(colors);
+        }
+
+        // Claude Code is required to run agents. If the `claude` CLI isn't on
+        // the PATH, prompt for it on every launch until it's installed or the
+        // user chooses to continue anyway for this session.
+        if !self.claude_installed && !self.claude_notice_dismissed {
+            return ui::claude_missing::view(colors);
         }
 
         // Preferences dialog takes precedence — full-screen overlay.
@@ -3375,7 +3449,108 @@ impl Frms {
             );
         }
 
+        // Route the window-manager close request (title-bar X) through our
+        // hard-shutdown path. `exit_on_close_request` is disabled in main.rs, so
+        // without this the X would do nothing — and with iced's default it would
+        // hang on Windows exactly like the old `Message::Quit` path did.
+        subs.push(iced::event::listen_with(window_close_listener));
+
         Subscription::batch(subs)
+    }
+
+    /// Terminate frms immediately.
+    ///
+    /// We hard-exit instead of returning `iced::exit()` / closing the window
+    /// because on Windows the tokio runtime's shutdown joins the blocking PTY
+    /// read threads (`spawn_blocking` + a synchronous `read()`), and a read on a
+    /// live ConPTY never returns — so a graceful exit hangs forever. Killing the
+    /// child processes first closes their PTY ends (tidy on every platform);
+    /// `process::exit` then skips the runtime join entirely. State is already
+    /// persisted incrementally (on each mutation), so nothing is lost here.
+    /// Move keyboard focus to agent pane `tid` in session `idx`, clearing the
+    /// other focus owners — the shared logic behind pane clicks and Ctrl+Tab.
+    fn focus_pane(&mut self, idx: usize, tid: TerminalId) {
+        self.active_session = idx;
+        self.pane_focus_toolbox = false;
+        let s = &mut self.sessions[idx];
+        s.active_terminal          = tid;
+        s.center_tab               = crate::session::CenterTab::Claude(tid);
+        s.db_panel.focus_active    = false;
+        s.terminals_plugin.focused = false;
+        self.receivers.unfocus_ssh();
+    }
+
+    /// Ctrl+Tab: cycle focus across the active session's agent panes, with the
+    /// toolbox as one extra stop after the last pane.
+    fn cycle_pane(&mut self, forward: bool) {
+        let idx = self.active_session;
+        let ids: Vec<TerminalId> = self.sessions[idx].panes.iter().map(|p| p.id()).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let n = ids.len();
+        let total = n + 1; // agent panes + the toolbox
+        let cur = if self.pane_focus_toolbox {
+            n
+        } else {
+            ids.iter()
+                .position(|&t| t == self.sessions[idx].active_terminal)
+                .unwrap_or(0)
+        };
+        let next = if forward { (cur + 1) % total } else { (cur + total - 1) % total };
+        if next == n {
+            // Land on the toolbox: open it and mark it the current stop.
+            self.pane_focus_toolbox = true;
+            self.sessions[idx].plugin_panel.visible = true;
+            self.save_persisted();
+        } else {
+            self.focus_pane(idx, ids[next]);
+        }
+    }
+
+    /// Ctrl+Shift+↑/↓: jump to the next/previous pane that's waiting on the user
+    /// (a surfaced question or a review), scanning across every session.
+    fn cycle_attention(&mut self, forward: bool) {
+        let mut waiting: Vec<(usize, TerminalId)> = Vec::new();
+        for (si, s) in self.sessions.iter().enumerate() {
+            for p in &s.panes {
+                if p.waiting_on_user() {
+                    waiting.push((si, p.id()));
+                }
+            }
+        }
+        if waiting.is_empty() {
+            return;
+        }
+        let here = (
+            self.active_session,
+            self.sessions[self.active_session].active_terminal,
+        );
+        let len = waiting.len();
+        let target = match waiting.iter().position(|&w| w == here) {
+            Some(i) => if forward { (i + 1) % len } else { (i + len - 1) % len },
+            None    => if forward { 0 } else { len - 1 },
+        };
+        let (si, tid) = waiting[target];
+        self.focus_pane(si, tid);
+    }
+
+    fn shutdown(&mut self) -> ! {
+        for session in &mut self.sessions {
+            for pane in &mut session.panes {
+                if let Some(t) = pane.as_terminal_mut() {
+                    if let Ok(mut c) = t.child.lock() {
+                        let _ = c.kill();
+                    }
+                }
+            }
+            for t in &mut session.terminals_plugin.terminals {
+                if let Ok(mut c) = t.pane.child.lock() {
+                    let _ = c.kill();
+                }
+            }
+        }
+        std::process::exit(0);
     }
 
     pub fn theme(&self) -> Theme {
@@ -3651,6 +3826,20 @@ fn plugin_panel_drag_listener(
     }
 }
 
+/// Always-on listener that turns the window-manager close request (the
+/// title-bar X) into `Message::Quit`, so it runs through our hard-shutdown
+/// path instead of iced's default graceful exit (which hangs on Windows).
+fn window_close_listener(
+    event:   iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Quit),
+        _ => None,
+    }
+}
+
 /// `listen_with` listener active only while the split-divider drag is in
 /// progress. Forwards cursor motion and mouse-release events so the top-slot
 /// height keeps tracking outside the thin divider strip.
@@ -3719,25 +3908,64 @@ fn handle_key(
     text: Option<String>,
 ) -> Option<Message> {
     if modifiers.control() {
+        // Ctrl+Tab / Ctrl+Shift+Tab — cycle panes (incl. the toolbox). Checked
+        // first: it isn't a terminal control code, so the shell never wants it.
+        if matches!(key, keyboard::Key::Named(key::Named::Tab)) {
+            return Some(Message::CyclePane { forward: !modifiers.shift() });
+        }
+
+        // Ctrl+Shift+<key> — app-level chords, handled before the generic
+        // Ctrl+<letter> → control-byte mapping so they don't reach the shell.
+        if modifiers.shift() {
+            match &key {
+                keyboard::Key::Named(key::Named::ArrowDown) =>
+                    return Some(Message::CycleAttention { forward: true }),
+                keyboard::Key::Named(key::Named::ArrowUp) =>
+                    return Some(Message::CycleAttention { forward: false }),
+                keyboard::Key::Named(key::Named::Enter) =>
+                    return Some(Message::PromptAccepted),
+                keyboard::Key::Character(s) => {
+                    // Session switch. Accept both the base and shifted glyphs
+                    // ("[" vs "{") since layouts report either for Shift+[.
+                    match s.as_ref() {
+                        "[" | "{" => return Some(Message::CycleSession { forward: false }),
+                        "]" | "}" => return Some(Message::CycleSession { forward: true }),
+                        _ => {}
+                    }
+                    match s.to_ascii_lowercase().as_str() {
+                        // Ctrl+Shift+C/V → terminal copy / paste (shift frees the
+                        // unshifted Ctrl+C → SIGINT and Ctrl+V for the shell);
+                        // Ctrl+Shift+N → new note from the selection.
+                        "c" => return Some(Message::TerminalCopy),
+                        "v" => return Some(Message::TerminalPaste),
+                        "n" => return Some(Message::TerminalSendToNote),
+                        // Toolbox toggle / new agent / close focused agent.
+                        "b" => return Some(Message::PluginPanelToggled),
+                        "t" => return Some(Message::AgentAdded(crate::agent::AgentKind::Build)),
+                        "w" => return Some(Message::CloseActiveAgent),
+                        // Answer the surfaced prompt: Enter accepts, R rejects.
+                        "r" => return Some(Message::PromptRejected),
+                        _   => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // General Ctrl+<key> → ASCII control byte, sent to the focused terminal.
+        // Ctrl+A…Ctrl+Z map to 0x01…0x1A and Ctrl+[ \ ] ^ _ @ to 0x1B…0x1F / 0x00
+        // — the standard caret-notation control codes — so readline chords
+        // (Ctrl+A, Ctrl+E, Ctrl+R, Ctrl+U, Ctrl+W, …) reach the shell.
         if let keyboard::Key::Character(s) = &key {
-            // Ctrl+Shift+C / Ctrl+Shift+V → terminal copy / paste. The shift
-            // disambiguates from the existing Ctrl+C → SIGINT and frees the
-            // unshifted Ctrl+V for any future terminal use. Ctrl+Shift+N
-            // turns the selection into a new note.
-            if modifiers.shift() {
-                match s.to_ascii_lowercase().as_str() {
-                    "c" => return Some(Message::TerminalCopy),
-                    "v" => return Some(Message::TerminalPaste),
-                    "n" => return Some(Message::TerminalSendToNote),
-                    _   => {}
+            let ch = s.chars().next()?;
+            // Ctrl+1…9 → jump straight to project session N (like browser tabs).
+            // Only the unshifted digits: Ctrl+Shift+<digit> yields a symbol
+            // ("!", "@", …) that falls through to a no-op below.
+            if let Some(d) = ch.to_digit(10) {
+                if (1..=9).contains(&d) {
+                    return Some(Message::SessionSelected(d as usize - 1));
                 }
             }
-            // General Ctrl+<key> → ASCII control byte, sent to the focused
-            // terminal. Ctrl+A…Ctrl+Z map to 0x01…0x1A and Ctrl+[ \ ] ^ _ @
-            // to 0x1B…0x1F / 0x00 — the standard caret-notation control codes —
-            // so readline chords (Ctrl+A, Ctrl+E, Ctrl+R, Ctrl+U, Ctrl+W, …)
-            // reach the shell, not just the old c/d/z/l subset.
-            let ch = s.chars().next()?;
             if ch.is_ascii_alphabetic() || "@[\\]^_".contains(ch) {
                 let byte = (ch.to_ascii_uppercase() as u8) & 0x1f;
                 return Some(Message::TerminalInput((byte as char).to_string()));

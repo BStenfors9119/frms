@@ -87,6 +87,30 @@ pub trait Fs {
     fn restrict_to_owner(path: &std::path::Path);
 }
 
+/// A ready-to-spawn command: program, arguments, and extra environment.
+pub struct CopyCommand {
+    pub program: String,
+    pub args:    Vec<String>,
+    pub envs:    Vec<(String, String)>,
+}
+
+/// Copying local files to a receiver over SSH with password auth. The transport
+/// differs by platform: `sshpass + scp` on unix (password in the environment,
+/// out of the argv), PuTTY's `pscp -pw` on Windows (no sshpass there).
+pub trait Transfer {
+    /// Build the command that copies `files` to `dest` on `host` as
+    /// `user`/`password` on `port`. `Err` carries a user-facing message when the
+    /// platform can't do non-interactive password scp (e.g. no PuTTY on Windows).
+    fn scp_command(
+        host: &str,
+        user: &str,
+        password: &str,
+        port: u16,
+        files: &[std::path::PathBuf],
+        dest: &str,
+    ) -> Result<CopyCommand, String>;
+}
+
 /// Locating a Chromium-family browser for headless CDP / screenshots.
 pub trait Browser {
     /// Ordered Chromium-family executables to try launching directly — package

@@ -5,6 +5,7 @@ use crate::fonts::UI_FONT;
 
 pub mod browser;
 pub mod buttons;
+pub mod claude_missing;
 pub mod confirm_dialog;
 pub mod db_panel;
 pub mod editor;

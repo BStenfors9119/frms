@@ -87,10 +87,10 @@ pub fn view(
     .width(Length::Fill);
 
     // ── right column: action buttons ──────────────────────────────────────────
-    // One consolidated plugin button — opens the right-docked panel whose
+    // One consolidated toolbox button — opens the right-docked panel whose
     // own tab control switches between DB / Profile / Notes / Terminals.
     let plugin_btn = button(
-        text("❇")
+        text("\u{1F6E0}") // 🛠 hammer & wrench — the toolbox panel toggle
             .font(ICON_FONT)
             .size(22)
             .line_height(LineHeight::Absolute(Pixels(16.0))),

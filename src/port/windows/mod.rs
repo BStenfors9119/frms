@@ -11,6 +11,7 @@ mod dirs;
 mod fs;
 mod proc;
 mod shell;
+mod transfer;
 mod window;
 
 /// Zero-sized handle that carries this platform's trait impls (see
