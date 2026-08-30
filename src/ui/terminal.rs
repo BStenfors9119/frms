@@ -9,7 +9,7 @@ use portable_pty::MasterPty;
 
 use crate::app::Message;
 use crate::fonts::{MONO_ADVANCE_RATIO, MONO_FONT};
-use crate::terminal::{Grid, Selection, TerminalId, COLS, ROWS};
+use crate::terminal::{FindHighlights, Grid, Selection, TerminalId, COLS, ROWS};
 use crate::theme::TerminalFontScale;
 
 /// Line-box height at `TerminalFontScale::Medium`. The font scale multiplies
@@ -22,6 +22,97 @@ const BASE_CELL_H: f32 = 17.0;
 const FONT_RATIO: f32 = 0.80;
 /// Floor on cell height so the smallest scale stays legible.
 const MIN_CELL_H: f32 = 8.0;
+/// Accent for rows the user typed: the active theme's primary lifted most of
+/// the way to white. The saturated violet it replaced sat too close in
+/// brightness to the CLI's own output to catch the eye, and agent panes always
+/// paint on a dark background (see `draw`), so a pale tint reads at a glance
+/// whichever palette and mode the profile picked.
+pub fn user_accent(theme: &iced::Theme) -> Color {
+    lighten(theme_accent(theme), 0.72)
+}
+
+/// Accent for rows the agent produced — also drawn from the theme, but pushed
+/// across the wheel from [`user_accent`] so the two sides can never be confused
+/// for one another. The profile palettes are monochrome (three shades of one
+/// hue), so hue alone can't separate the speakers: this takes the theme's hue
+/// about halfway round and saturates it, leaving "pale wash = me, colored bar =
+/// the agent". A near-neutral palette (Grays) has no hue worth rotating, so
+/// there the two separate by brightness alone.
+pub fn agent_accent(theme: &iced::Theme) -> Color {
+    let (h, s, _) = to_hsl(theme_accent(theme));
+    if s < 0.10 {
+        from_hsl(h, s, 0.55)
+    } else {
+        // Saturation stays modest on purpose — the palettes are muted, and a
+        // vivid complement would read as an error color rather than a speaker.
+        from_hsl((h + 160.0) % 360.0, (s * 1.6).clamp(0.28, 0.45), 0.60)
+    }
+}
+
+/// The palette color both speaker accents are derived from.
+fn theme_accent(theme: &iced::Theme) -> Color {
+    theme.extended_palette().primary.base.color
+}
+
+/// `t` of the way from `c` to white.
+fn lighten(c: Color, t: f32) -> Color {
+    Color {
+        r: c.r + (1.0 - c.r) * t,
+        g: c.g + (1.0 - c.g) * t,
+        b: c.b + (1.0 - c.b) * t,
+        a: 1.0,
+    }
+}
+
+/// RGB → HSL, hue in degrees.
+fn to_hsl(c: Color) -> (f32, f32, f32) {
+    let max = c.r.max(c.g).max(c.b);
+    let min = c.r.min(c.g).min(c.b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d <= f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs()).max(f32::EPSILON);
+    let h = if max == c.r {
+        60.0 * (((c.g - c.b) / d) % 6.0)
+    } else if max == c.g {
+        60.0 * ((c.b - c.r) / d + 2.0)
+    } else {
+        60.0 * ((c.r - c.g) / d + 4.0)
+    };
+    ((h + 360.0) % 360.0, s.clamp(0.0, 1.0), l)
+}
+
+/// HSL → RGB, hue in degrees.
+fn from_hsl(h: f32, s: f32, l: f32) -> Color {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match h {
+        h if h < 60.0  => (c, x, 0.0),
+        h if h < 120.0 => (x, c, 0.0),
+        h if h < 180.0 => (0.0, c, x),
+        h if h < 240.0 => (0.0, x, c),
+        h if h < 300.0 => (x, 0.0, c),
+        _              => (c, 0.0, x),
+    };
+    Color { r: r + m, g: g + m, b: b + m, a: 1.0 }
+}
+
+/// Opacity of the full-width speaker wash. Deliberately faint: it has to sit
+/// under a CLI's own colored output without muddying it. The user's rows get
+/// the heavier of the two — a pale wash carries less weight than a saturated
+/// one, and the user's own turns are what they scan back for.
+const SPEAKER_WASH_ALPHA:      f32 = 0.10;
+const USER_SPEAKER_WASH_ALPHA: f32 = 0.16;
+/// Width of the solid speaker bar at the left edge, in logical px.
+const SPEAKER_BAR_W: f32 = 3.0;
+
+/// Find highlights: every hit washed amber, the current one solid.
+const FIND_MATCH:   Color = Color { r: 0.85, g: 0.65, b: 0.20, a: 0.30 };
+const FIND_CURRENT: Color = Color { r: 0.95, g: 0.72, b: 0.20, a: 0.60 };
+
 /// Label of the floating button shown next to a finished selection — clicking
 /// it turns the selected text into a new note.
 const NOTE_BTN_LABEL: &str = "+ Note";
@@ -30,19 +121,47 @@ const NOTE_BTN_PAD: f32 = 6.0;
 
 // ── public view function ──────────────────────────────────────────────────────
 
-pub fn view(
-    id:           TerminalId,
-    grid:         Arc<Mutex<Grid>>,
-    master:       Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    focused:      bool,
-    is_shell:     bool,
-    font_scale:   TerminalFontScale,
-    selection:    Option<Selection>,
-) -> Element<'static, Message> {
-    Canvas::new(TerminalCanvas { id, grid, master, focused, is_shell, font_scale, selection })
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+/// Everything one terminal canvas renders from. A struct rather than a long
+/// positional argument list — the pane kinds differ only in a couple of these.
+pub struct View {
+    pub id:         TerminalId,
+    pub grid:       Arc<Mutex<Grid>>,
+    pub master:     Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    pub focused:    bool,
+    pub is_shell:   bool,
+    pub font_scale: TerminalFontScale,
+    pub selection:  Option<Selection>,
+    /// Tint the two sides of the conversation apart. On for Build panes, which
+    /// run an AI CLI; off for plain shells and SSH sessions, where the
+    /// heuristics in [`crate::transcript`] have nothing to find.
+    pub transcript: bool,
+    /// Hits to paint for an open find bar.
+    pub find:       Option<FindHighlights>,
+}
+
+pub fn view(v: View) -> Element<'static, Message> {
+    Canvas::new(TerminalCanvas {
+        id:         v.id,
+        grid:       v.grid,
+        master:     v.master,
+        focused:    v.focused,
+        is_shell:   v.is_shell,
+        font_scale: v.font_scale,
+        selection:  v.selection,
+        transcript: v.transcript,
+        find:       v.find,
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+/// The accent for one side of the conversation, and the opacity of its wash.
+pub fn speaker_accent(speaker: crate::transcript::Speaker, theme: &iced::Theme) -> (Color, f32) {
+    match speaker {
+        crate::transcript::Speaker::User  => (user_accent(theme),  USER_SPEAKER_WASH_ALPHA),
+        crate::transcript::Speaker::Agent => (agent_accent(theme), SPEAKER_WASH_ALPHA),
+    }
 }
 
 // ── canvas program ────────────────────────────────────────────────────────────
@@ -55,6 +174,8 @@ struct TerminalCanvas {
     is_shell:   bool,
     font_scale: TerminalFontScale,
     selection:  Option<Selection>,
+    transcript: bool,
+    find:       Option<FindHighlights>,
 }
 
 impl TerminalCanvas {
@@ -77,7 +198,7 @@ impl TerminalCanvas {
         if bounds.width >= cell_w && bounds.height >= cell_h {
             self.ensure_size(cols, rows);
         }
-        Layout { cell_w, cell_h, x_offset: 0.0, y_offset: 0.0 }
+        Layout { cell_w, cell_h, x_offset: 0.0, y_offset: 0.0, rows }
     }
 
     /// Resize the grid and PTY to `cols`×`rows` when (and only when) they
@@ -100,7 +221,7 @@ impl TerminalCanvas {
     /// Coordinates are clamped to the grid so drags off the edge still snap
     /// to the nearest valid row/column.
     fn pixel_to_cell(&self, p: Point, bounds: Rectangle) -> (usize, usize) {
-        let Layout { cell_w, cell_h, x_offset, y_offset } = self.layout(bounds);
+        let Layout { cell_w, cell_h, x_offset, y_offset, .. } = self.layout(bounds);
         let (rows, cols) = self
             .grid
             .lock()
@@ -113,26 +234,46 @@ impl TerminalCanvas {
         (row, col)
     }
 
+    /// Absolute row index of the topmost visible row — the offset that turns a
+    /// viewport row into the [`Selection`]'s absolute coordinate space.
+    fn abs_top(&self) -> usize {
+        self.grid.lock().map(|g| g.abs_top()).unwrap_or(0)
+    }
+
     /// Bounds (canvas-relative) of the floating "+ Note" button, shown only
     /// while a finished, non-empty selection is on screen. Placed just below
     /// the selection's last row, flipping above its first row when the pane
     /// bottom is too close, and clamped horizontally so it never overflows.
+    /// Hidden entirely once the selection has scrolled out of view.
     ///
-    /// Takes the precomputed `layout` rather than calling [`Self::layout`]
-    /// itself: `layout()` locks the grid mutex (via `ensure_size`), and this
-    /// is called from `draw()` *while the grid lock is already held* —
+    /// Takes the precomputed `layout` and `abs_top` rather than calling
+    /// [`Self::layout`] / [`Self::abs_top`] itself: both lock the grid mutex,
+    /// and this is called from `draw()` *while the grid lock is already held* —
     /// re-locking there would deadlock the render thread (the app froze the
     /// first frame after any drag-selection finished).
-    fn note_button_rect(&self, bounds: Rectangle, layout: &Layout) -> Option<Rectangle> {
+    fn note_button_rect(
+        &self,
+        bounds:  Rectangle,
+        layout:  &Layout,
+        abs_top: usize,
+    ) -> Option<Rectangle> {
         let sel = self.selection.filter(|s| !s.active && !s.is_empty())?;
-        let &Layout { cell_w, cell_h, x_offset, y_offset } = layout;
+        let &Layout { cell_w, cell_h, x_offset, y_offset, .. } = layout;
         let font_size = (cell_h * FONT_RATIO).max(6.0);
 
         let w = NOTE_BTN_LABEL.chars().count() as f32 * font_size * MONO_ADVANCE_RATIO
             + 2.0 * NOTE_BTN_PAD;
         let h = cell_h + 2.0 * NOTE_BTN_PAD;
 
-        let ((sr, _), (er, ec)) = sel.range();
+        // Absolute rows → viewport rows, clamped to the visible window so a
+        // selection that only partly overlaps the viewport still anchors the
+        // button to the part the user can see.
+        let rows = layout.rows;
+        let ((abs_sr, _), (abs_er, ec)) = sel.range();
+        if abs_er < abs_top || abs_sr >= abs_top + rows { return None; }
+        let sr = abs_sr.saturating_sub(abs_top);
+        let er = (abs_er - abs_top).min(rows.saturating_sub(1));
+
         let mut y = y_offset + (er + 1) as f32 * cell_h + 4.0;
         if y + h > bounds.height {
             y = (y_offset + sr as f32 * cell_h - h - 4.0).max(0.0);
@@ -150,6 +291,9 @@ struct Layout {
     cell_h:   f32,
     x_offset: f32,
     y_offset: f32,
+    /// Visible row count — also the grid's row count, since the layout pushes
+    /// this size down to the grid and PTY.
+    rows:     usize,
 }
 
 impl canvas::Program<Message> for TerminalCanvas {
@@ -173,7 +317,8 @@ impl canvas::Program<Message> for TerminalCanvas {
                     // can become a new selection drag (which would clear the
                     // very selection the button is about to capture).
                     let layout = self.layout(bounds);
-                    if matches!(self.note_button_rect(bounds, &layout), Some(btn) if btn.contains(p)) {
+                    let abs_top = self.abs_top();
+                    if matches!(self.note_button_rect(bounds, &layout, abs_top), Some(btn) if btn.contains(p)) {
                         return (Status::Captured, Some(Message::TerminalSendToNoteFrom(self.id)));
                     }
                     let (row, col) = self.pixel_to_cell(p, bounds);
@@ -184,6 +329,23 @@ impl canvas::Program<Message> for TerminalCanvas {
                 if let Some(p) = inside {
                     let (row, col) = self.pixel_to_cell(p, bounds);
                     return (Status::Captured, Some(Message::TerminalMouseMove(self.id, row, col)));
+                }
+                // Dragging past the top or bottom edge scrolls the viewport a
+                // row at a time and takes the selection head with it, so the
+                // user can reach content that isn't on screen yet.
+                if let Some(p) = cursor.position() {
+                    let rel = Point::new(p.x - bounds.x, p.y - bounds.y);
+                    let lines = if rel.y < 0.0 { 1.0 }
+                                else if rel.y > bounds.height { -1.0 }
+                                else { 0.0 };
+                    if lines != 0.0 {
+                        let clamped = Point::new(rel.x, rel.y.clamp(0.0, bounds.height - 1.0));
+                        let (row, col) = self.pixel_to_cell(clamped, bounds);
+                        return (
+                            Status::Captured,
+                            Some(Message::TerminalScrollDrag(self.id, lines, row, col)),
+                        );
+                    }
                 }
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if drag_active => {
@@ -213,7 +375,18 @@ impl canvas::Program<Message> for TerminalCanvas {
                     mouse::ScrollDelta::Lines  { y, .. } => y,
                     mouse::ScrollDelta::Pixels { y, .. } => y / 16.0,
                 };
-                return (Status::Captured, Some(Message::TerminalScroll(self.id, lines)));
+                // Scrolling mid-drag also drags: the selection head follows the
+                // content that scrolls under the (stationary) mouse, so the
+                // highlight extends past the visible window instead of being
+                // capped at one screenful.
+                let msg = match inside.filter(|_| drag_active) {
+                    Some(p) => {
+                        let (row, col) = self.pixel_to_cell(p, bounds);
+                        Message::TerminalScrollDrag(self.id, lines, row, col)
+                    }
+                    None => Message::TerminalScroll(self.id, lines),
+                };
+                return (Status::Captured, Some(msg));
             }
             _ => {}
         }
@@ -229,7 +402,8 @@ impl canvas::Program<Message> for TerminalCanvas {
         match cursor.position_in(bounds) {
             Some(p) => {
                 let layout = self.layout(bounds);
-                if matches!(self.note_button_rect(bounds, &layout), Some(btn) if btn.contains(p)) {
+                let abs_top = self.abs_top();
+                if matches!(self.note_button_rect(bounds, &layout, abs_top), Some(btn) if btn.contains(p)) {
                     mouse::Interaction::Pointer
                 } else {
                     mouse::Interaction::Text
@@ -243,12 +417,12 @@ impl canvas::Program<Message> for TerminalCanvas {
         &self,
         _state: &Self::State,
         renderer: &iced::Renderer,
-        _theme: &iced::Theme,
+        theme: &iced::Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let layout = self.layout(bounds);
-        let Layout { cell_w, cell_h, x_offset, y_offset } = layout;
+        let Layout { cell_w, cell_h, x_offset, y_offset, .. } = layout;
         let font_size = (cell_h * FONT_RATIO).max(6.0);
 
         let mut frame = Frame::new(renderer, bounds.size());
@@ -262,10 +436,46 @@ impl canvas::Program<Message> for TerminalCanvas {
         );
 
         let selection_color = Color::from_rgba8(80, 130, 220, 0.35);
+        // Selections live in absolute row space, so each viewport row is
+        // tested against the buffer line it is currently showing. A selection
+        // taller than the pane simply draws the slice that's on screen.
+        let abs_top = grid.abs_top();
+
+        // Who said what, for the visible rows only — an unrecognised row (and
+        // every row of a non-agent pane) simply gets no tint.
+        let speakers = if self.transcript {
+            crate::transcript::speakers(&grid, abs_top, grid.rows)
+        } else {
+            Vec::new()
+        };
 
         for row in 0..grid.rows {
+            let abs_row = abs_top + row;
             let y = y_offset + row as f32 * cell_h;
             if y + cell_h <= 0.0 || y >= bounds.height { continue; }
+
+            // Speaker band: a full-width wash plus a solid bar at the left
+            // edge. The wash is faint enough to sit under the CLI's own colored
+            // backgrounds (drawn per-cell below); the bar is what actually
+            // reads from across the room.
+            if let Some(Some(speaker)) = speakers.get(row) {
+                let (accent, wash) = speaker_accent(*speaker, theme);
+                frame.fill_rectangle(
+                    Point::new(x_offset, y),
+                    Size::new(bounds.width - x_offset, cell_h),
+                    Color { a: wash, ..accent },
+                );
+                frame.fill_rectangle(
+                    Point::new(x_offset, y),
+                    Size::new(SPEAKER_BAR_W, cell_h),
+                    accent,
+                );
+            }
+
+            // Find hits on this row, resolved once so the per-cell test below
+            // is a walk over a handful of entries rather than the whole list.
+            let row_hits = self.find.as_ref().map(|f| f.on_row(abs_row));
+
             for col in 0..grid.cols {
                 let cell = grid.view_cell(row, col);
                 let x = x_offset + col as f32 * cell_w;
@@ -281,10 +491,23 @@ impl canvas::Program<Message> for TerminalCanvas {
                     );
                 }
 
+                // Find hit — under the selection so an explicit highlight still
+                // wins, but over the cell background so it reads on colored
+                // output. The current hit is the strong one.
+                if let (Some(hits), Some(find)) = (row_hits.as_ref(), self.find.as_ref()) {
+                    if let Some(is_current) = crate::terminal::hit_at(hits, col, find.width) {
+                        frame.fill_rectangle(
+                            Point::new(x, y),
+                            Size::new(cell_w, cell_h),
+                            if is_current { FIND_CURRENT } else { FIND_MATCH },
+                        );
+                    }
+                }
+
                 // Selection highlight — drawn under the glyph so the text
                 // stays legible.
                 if let Some(sel) = self.selection {
-                    if !sel.is_empty() && sel.contains(row, col) {
+                    if !sel.is_empty() && sel.contains(abs_row, col) {
                         frame.fill_rectangle(
                             Point::new(x, y),
                             Size::new(cell_w, cell_h),
@@ -328,7 +551,7 @@ impl canvas::Program<Message> for TerminalCanvas {
         // Floating "+ Note" button next to a finished selection — click to
         // capture the selected text into a new note. Uses the layout computed
         // above — must not call `self.layout()` here, the grid lock is held.
-        if let Some(btn) = self.note_button_rect(bounds, &layout) {
+        if let Some(btn) = self.note_button_rect(bounds, &layout, grid.abs_top()) {
             let path = canvas::Path::rounded_rectangle(
                 btn.position(),
                 btn.size(),

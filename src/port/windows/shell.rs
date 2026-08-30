@@ -33,6 +33,15 @@ impl Shell for Sys {
         ("cmd".to_string(), vec!["/c".to_string(), script])
     }
 
+    fn install_shell(command: &str) -> (String, Vec<String>) {
+        // Run the install command, then hand off to an interactive cmd session
+        // so the user can see the result and sign in. `command` is passed
+        // through verbatim (it's meant for the shell to interpret); the `&`
+        // chains the follow-on `cmd`.
+        let script = format!("{command} & echo. & echo --- install finished; you can sign in now --- & cmd");
+        ("cmd".to_string(), vec!["/c".to_string(), script])
+    }
+
     fn terminal_env() -> Vec<(String, String)> {
         // The ConPTY exposes VT capability to children directly; native console
         // programs ignore TERM, so there's nothing useful to inject here.

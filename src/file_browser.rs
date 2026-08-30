@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,6 +7,10 @@ pub struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub is_dir: bool,
+    /// True when this directory is a git submodule of the enclosing repo
+    /// (listed in the repo's `.gitmodules`). Used to color it distinctly so
+    /// submodule projects are easy to tell apart from the parent's own folders.
+    pub is_submodule: bool,
 }
 
 /// In-progress directory operation in the file browser pane. Only one can be
@@ -101,13 +106,20 @@ fn valid_name(draft: &str) -> Result<&str, String> {
 }
 
 fn read_dir(path: &Path) -> Vec<Entry> {
+    let submodules = submodule_paths(path);
+
     let mut entries: Vec<Entry> = match fs::read_dir(path) {
         Ok(iter) => iter
             .filter_map(|e| e.ok())
-            .map(|e| Entry {
-                name: e.file_name().to_string_lossy().into_owned(),
-                path: e.path(),
-                is_dir: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+            .map(|e| {
+                let entry_path = e.path();
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                Entry {
+                    name: e.file_name().to_string_lossy().into_owned(),
+                    is_submodule: is_dir && submodules.contains(&entry_path),
+                    path: entry_path,
+                    is_dir,
+                }
             })
             .collect(),
         Err(_) => Vec::new(),
@@ -116,4 +128,40 @@ fn read_dir(path: &Path) -> Vec<Entry> {
     // Directories first, then alphabetical within each group
     entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.cmp(&b.name)));
     entries
+}
+
+/// Absolute paths of the git submodules whose working trees live directly
+/// inside `dir`. We find the enclosing repo root (nearest ancestor holding a
+/// `.git`), read its `.gitmodules`, and resolve each declared `path = …` to an
+/// absolute path. Empty when `dir` isn't in a repo or the repo has no
+/// submodules. Paths are built from the same `dir`/root strings that
+/// `read_dir` uses, so they compare equal without canonicalization.
+fn submodule_paths(dir: &Path) -> HashSet<PathBuf> {
+    let Some(root) = repo_root(dir) else { return HashSet::new() };
+    let Ok(contents) = fs::read_to_string(root.join(".gitmodules")) else {
+        return HashSet::new();
+    };
+
+    contents
+        .lines()
+        .filter_map(|line| {
+            // Submodule stanzas carry a `path = <relative path>` line.
+            let value = line.trim().strip_prefix("path")?.trim_start();
+            let value = value.strip_prefix('=')?.trim();
+            (!value.is_empty()).then(|| root.join(value))
+        })
+        .collect()
+}
+
+/// Nearest ancestor of `start` (inclusive) that contains a `.git` entry — the
+/// working-tree root of the repo `start` belongs to, if any.
+fn repo_root(start: &Path) -> Option<PathBuf> {
+    let mut cur = Some(start);
+    while let Some(dir) = cur {
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
 }

@@ -14,7 +14,9 @@ use iced::widget::{
 
 use crate::app::Message;
 use crate::fonts::{ICON_FONT, UI_FONT};
-use crate::receivers::{ImportFilterOp, ImportSource, MapField, ReceiversState};
+use crate::receivers::{
+    node_sort_key, ImportFilterOp, ImportSource, MapField, ReceiversState,
+};
 use crate::ui::buttons;
 use crate::ui::plugin_panel::ReceiverCtx;
 use crate::ui::terminal as terminal_ui;
@@ -47,9 +49,9 @@ fn tree(rs: &ReceiversState) -> Element<'_, Message> {
         .width(Length::Fill);
 
     let mut rows: Vec<Element<'_, Message>> = Vec::new();
-    // Roots in stable id order.
+    // Clients first by leading number (ascending), then alphabetically.
     let mut roots = rs.root_containers();
-    roots.sort_by_key(|c| c.id);
+    roots.sort_by_key(|c| node_sort_key(&c.name));
     for c in roots {
         push_container(&mut rows, rs, c.id, 0);
     }
@@ -123,14 +125,14 @@ fn push_container<'a>(
         return;
     }
 
-    // Child containers first, then receivers.
+    // Child containers first, then receivers — same numeric-aware ordering.
     let mut kids = rs.child_containers(id);
-    kids.sort_by_key(|c| c.id);
+    kids.sort_by_key(|c| node_sort_key(&c.name));
     for kid in kids {
         push_container(out, rs, kid.id, depth + 1);
     }
     let mut recvs = rs.receivers_in(id);
-    recvs.sort_by_key(|r| r.id);
+    recvs.sort_by_key(|r| node_sort_key(&r.name));
     for r in recvs {
         let selected = rs.selected_receiver == Some(r.id);
         out.push(
@@ -222,8 +224,81 @@ fn container_detail<'a>(ctx: &ReceiverCtx<'a>, id: u64) -> Element<'a, Message> 
     ]
     .spacing(6);
 
-    column![header, actions, import_section(ctx)]
-        .spacing(12)
+    // Bulk SSH over the whole branch (this container plus its sub-locations),
+    // so "connect this client" is one click instead of one per receiver. Both
+    // buttons are inert with nothing to act on, hence `on_press_maybe`.
+    let under = rs.receivers_under(id);
+    // An exited pane counts as connectable (Connect All retries it) *and* as
+    // something to clear, so the two counts can overlap.
+    let idle = under.iter().filter(|r| !rs.is_connected(r.id)).count();
+    let live = under.iter()
+        .filter(|r| rs.ssh.iter().any(|s| s.receiver == r.id))
+        .count();
+    let bulk_ssh = row![
+        button(
+            text(format!("Connect All ({idle})")).font(UI_FONT).size(buttons::TEXT_SIZE)
+        )
+            .on_press_maybe((idle > 0).then_some(Message::ReceiverConnectAll(id)))
+            .padding(buttons::PADDING)
+            .style(buttons::primary),
+        button(
+            text(format!("Disconnect All ({live})")).font(UI_FONT).size(buttons::TEXT_SIZE)
+        )
+            .on_press_maybe((live > 0).then_some(Message::ReceiverDisconnectAll(id)))
+            .padding(buttons::PADDING)
+            .style(buttons::danger),
+    ]
+    .spacing(6);
+
+    // Reparent this container. Its own subtree is excluded (moving a branch
+    // inside itself would detach it), and "(top level)" promotes it to a client.
+    let move_self = row![
+        text("Move to").size(12).width(Length::Fixed(90.0)),
+        pick_list(
+            rs.container_choices(Some(id), true),
+            Some(rs.choice_for(c.parent)),
+            move |choice| Message::ReceiverContainerMoveTo(id, choice.id),
+        )
+        .text_size(12)
+        .width(Length::Fill),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    let mut col = column![header, actions, bulk_ssh, move_self].spacing(12);
+
+    // Bulk move: the common cleanup is receivers parked at a location's root
+    // that belong in one of its sub-locations, so offer it only when this
+    // container directly holds any.
+    let held = rs.receivers_in(id).len();
+    if held > 0 {
+        col = col.push(
+            row![
+                text(format!(
+                    "Move {held} receiver{} to",
+                    if held == 1 { "" } else { "s" },
+                ))
+                .size(12)
+                .width(Length::Fixed(150.0)),
+                pick_list(
+                    rs.container_choices(None, false)
+                        .into_iter()
+                        .filter(|choice| choice.id != Some(id))
+                        .collect::<Vec<_>>(),
+                    // Always unselected: this is an action, not a stored field.
+                    None::<crate::receivers::ContainerChoice>,
+                    move |choice| Message::ReceiverMoveAll(id, choice.id.unwrap_or(id)),
+                )
+                .placeholder("pick a destination")
+                .text_size(12)
+                .width(Length::Fill),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+
+    col.push(import_section(ctx))
         .height(Length::Fill)
         .into()
 }
@@ -433,12 +508,28 @@ fn receiver_detail<'a>(ctx: &ReceiverCtx<'a>) -> Element<'a, Message> {
         .align_y(Alignment::Center)
     };
 
+    // Which container holds this receiver — changing the pick moves it there.
+    let location = row![
+        text("Location").size(12).width(Length::Fixed(80.0)),
+        pick_list(
+            rs.container_choices(None, false),
+            rs.receiver_by_id(id).map(|r| rs.choice_for(Some(r.container))),
+            move |choice| Message::ReceiverMoveTo(id, choice.id.unwrap_or_default()),
+        )
+        .placeholder("pick a location")
+        .text_size(13)
+        .width(Length::Fill),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
     let form = column![
         field("Name",     &rs.name_input,     false, Message::ReceiverNameEdited),
         field("Host",     &rs.host_input,     false, Message::ReceiverHostEdited),
         field("Username", &rs.user_input,     false, Message::ReceiverUserEdited),
         field("Password", &rs.password_input, true,  Message::ReceiverPasswordEdited),
         field("Port",     &rs.port_input,     false, Message::ReceiverPortEdited),
+        location,
     ]
     .spacing(6);
 
@@ -461,7 +552,46 @@ fn receiver_detail<'a>(ctx: &ReceiverCtx<'a>) -> Element<'a, Message> {
     ]
     .spacing(6);
 
-    let mut col = column![form, actions].spacing(12);
+    // The credential form + connect actions can be collapsed once an SSH pane
+    // is live, handing the reclaimed height to the terminal below.
+    let has_ssh = rs.ssh.iter().any(|s| s.receiver == id);
+    let collapsed = has_ssh && rs.connection_collapsed;
+
+    let mut col = column![].spacing(12);
+    if collapsed {
+        col = col.push(
+            button(
+                // ▸ / ▾ come from ICON_FONT: Liberation Sans is Latin-only and
+                // renders them as tofu boxes.
+                row![
+                    text("\u{25B8}").font(ICON_FONT).size(buttons::TEXT_SIZE),
+                    text("Connection details").font(UI_FONT).size(buttons::TEXT_SIZE),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            )
+            .on_press(Message::ReceiverToggleConnectionForm)
+            .padding(buttons::PADDING)
+            .style(buttons::secondary),
+        );
+    } else {
+        col = col.push(form).push(actions);
+        if has_ssh {
+            col = col.push(
+                button(
+                    row![
+                        text("\u{25BE}").font(ICON_FONT).size(buttons::TEXT_SIZE),
+                        text("Hide connection details").font(UI_FONT).size(buttons::TEXT_SIZE),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                )
+                .on_press(Message::ReceiverToggleConnectionForm)
+                .padding(buttons::PADDING)
+                .style(buttons::secondary),
+            );
+        }
+    }
 
     // Embedded SSH terminal, shown under the receiver it belongs to. The pane
     // persists after the session ends so its final output stays readable.
@@ -503,15 +633,17 @@ fn receiver_detail<'a>(ctx: &ReceiverCtx<'a>) -> Element<'a, Message> {
             );
         }
 
-        let term = terminal_ui::view(
-            ssh.id,
-            ssh.pane.grid.clone(),
-            ssh.pane.master(),
-            ssh.focused,
-            true,
-            ctx.font_scale,
-            ssh.pane.selection,
-        );
+        let term = terminal_ui::view(terminal_ui::View {
+            id:         ssh.id,
+            grid:       ssh.pane.grid.clone(),
+            master:     ssh.pane.master(),
+            focused:    ssh.focused,
+            is_shell:   true,
+            font_scale: ctx.font_scale,
+            selection:  ssh.pane.selection,
+            transcript: false,
+            find:       None,
+        });
         col = col.push(header).push(
             container(term)
                 .width(Length::Fill)

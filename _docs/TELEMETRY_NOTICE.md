@@ -3,23 +3,31 @@
   the wording is mirrored by the in-app first-run notice
   (src/ui/telemetry_notice.rs) and the Profile > Privacy text.
 
-  Presentation: a one-time modal on first launch, shown BEFORE any telemetry is
-  sent (consent before collection). Both choices ("Keep it on" / "Turn it off")
-  acknowledge it so it won't reappear; the opt-out also lives in Profile.
-  Telemetry is on by default, so this discloses rather than hard-gates — unlike
-  the install-time NDA accept/decline (see _docs/NDA.md).
+  Presentation: a one-time modal on first launch. Both choices ("Keep it on" /
+  "Turn off optional data") acknowledge it so it won't reappear; the opt-out
+  also lives in Profile. Two tiers: install + app-open counts always report and
+  are disclosed here; everything else is on by default and opt-out. This
+  discloses rather than hard-gates — unlike the install-time NDA accept/decline
+  (see _docs/NDA.md).
 -->
 
 # frms — Telemetry & Diagnostics Notice
 
 To improve frms and fix problems, the app collects a small amount of
 **anonymous** usage and diagnostic data. This notice explains what it does and
-does not collect, and how to turn it off.
+does not collect, and what you can turn off.
 
-## What it collects
+## What it always collects
+
+frms reports that it was **installed**, and reports each time the app is
+**opened**. This is the licence and adoption count, and it is not covered by
+the opt-out below. Each of those reports carries only:
 
 - An **anonymous install id** (a random value — not tied to you or your account)
 - The app **version**, your **operating system**, and **CPU architecture**
+
+## What you can turn off
+
 - **Coarse feature usage** — e.g. which kinds of panes you open and which models
   are used, and when sessions start
 - **Error and crash diagnostics** — error categories and scrubbed messages, to
@@ -34,11 +42,12 @@ any other personal information. Free-form error text is automatically scrubbed
 
 ## Your choice
 
-Telemetry is **on by default**, and you can turn it off at any time:
+The optional data above is **on by default**, and you can turn it off at any
+time — the install and app-open counts continue either way:
 
 - In the app: **Profile tab → Privacy → uncheck "Share anonymous usage data."**
 - Before launch: set the environment variable **`DO_NOT_TRACK=1`** (or
-  **`FRMS_NO_TELEMETRY=1`**) and frms sends nothing.
+  **`FRMS_NO_TELEMETRY=1`**).
 
 By continuing with the installation, you acknowledge this notice. You can change
 your choice at any time as described above.

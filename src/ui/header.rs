@@ -1,16 +1,21 @@
-use iced::{Alignment, Background, Border, Color, Element, Length, Pixels, Theme};
-use iced::widget::{button, column, container, pick_list, progress_bar, row, text};
+use iced::{mouse, Alignment, Background, Border, Color, Element, Length, Pixels, Theme};
+use iced::widget::{button, column, container, mouse_area, pick_list, progress_bar, row, text, Space};
 use iced::widget::text::LineHeight;
 
 use crate::app::Message;
 use crate::fonts::{ICON_FONT, RESET_FONT, UI_FONT};
-use crate::stats::{ClaudeStats, ProcStats, RefreshInterval};
+use crate::stats::{ClaudeStats, ProcStats, RefreshInterval, UsageWindow};
 use crate::theme::ThemeColors;
 use crate::ui::buttons;
+
+/// The amber the usage bars use for "getting close" — reused for the stale-stats
+/// note so a degraded readout carries the same visual weight as a filling bar.
+const WARN: Color = Color::from_rgb(234.0 / 255.0, 179.0 / 255.0, 8.0 / 255.0);
 
 pub fn view(
     plugin_visible:   bool,
     stats:            &ClaudeStats,
+    stats_stale:      bool,
     procs:            &ProcStats,
     refresh_interval: RefreshInterval,
     collapsed:        bool,
@@ -50,23 +55,47 @@ pub fn view(
     }
 
     // ── left column: usage bars + their action row ────────────────────────────
+    // Either bar is clickable: the API gives one percentage per window with no
+    // model detail, so a click opens the per-model token breakdown for it.
     let session_bar = usage_bar(
         format!("Session (5h)  {:.0}%", stats.five_hour_pct),
         stats.five_hour_resets.clone(),
         stats.five_hour_fraction(),
         bar_color(stats.five_hour_fraction()),
+        UsageWindow::FiveHour,
+        colors,
     );
     let week_bar = usage_bar(
         format!("Week (7d)  {:.0}%", stats.seven_day_pct),
         stats.seven_day_resets.clone(),
         stats.seven_day_fraction(),
         bar_color(stats.seven_day_fraction()),
+        UsageWindow::SevenDay,
+        colors,
     );
 
     let refresh_btn = button(text("Refresh").font(UI_FONT).size(buttons::TEXT_SIZE))
         .on_press(Message::StatsRefresh)
         .padding(buttons::PADDING)
         .style(buttons::secondary);
+
+    // The last fetch failed, so the bars are either an older reading or nothing
+    // at all. Say which — an unlabelled 0% bar reads as "plenty of headroom",
+    // which is the one wrong conclusion a usage meter must never invite.
+    let stale_note: Element<'static, Message> = if stats_stale {
+        let msg = if stats.has_reading() {
+            "last check failed — showing the previous reading"
+        } else {
+            "usage unavailable — check sign-in, or retry"
+        };
+        text(msg)
+            .font(UI_FONT)
+            .size(11)
+            .style(|_: &Theme| text::Style { color: Some(WARN) })
+            .into()
+    } else {
+        Space::with_width(Length::Shrink).into()
+    };
 
     let interval_picker = pick_list(
         &RefreshInterval::ALL[..],
@@ -79,7 +108,7 @@ pub fn view(
     let left_col = column![
         row![session_bar, week_bar].spacing(16),
         proc_tracker(procs),
-        row![refresh_btn, interval_picker]
+        row![refresh_btn, interval_picker, stale_note]
             .spacing(8)
             .align_y(Alignment::Center),
     ]
@@ -134,6 +163,8 @@ fn usage_bar(
     resets:   Option<String>,
     fraction: f32,
     color:    Color,
+    window:   UsageWindow,
+    colors:   ThemeColors,
 ) -> Element<'static, Message> {
     // The ↺ glyph lives in its own micro-font (RESET_FONT) — Liberation Sans
     // tofus on it — so the reset time renders as separate text widgets.
@@ -145,7 +176,22 @@ fn usage_bar(
             .push(text("↺").font(RESET_FONT).size(13))
             .push(text(r).font(UI_FONT).size(13));
     }
-    column![
+    // A bar looks like a readout, not a control, so say the click is there.
+    // The ▸ needs ICON_FONT — Liberation Sans is Latin-only and drew it as a
+    // tofu box — so the hint is two widgets rather than one string.
+    let hint = move |_: &Theme| text::Style { color: Some(colors.secondary) };
+    label_row = label_row
+        .push(Space::with_width(Length::Fill))
+        .push(
+            row![
+                text("by model").font(UI_FONT).size(11).style(hint),
+                text("\u{25B8}").font(ICON_FONT).size(11).style(hint),
+            ]
+            .spacing(3)
+            .align_y(Alignment::Center),
+        );
+
+    let stacked = column![
         label_row,
         progress_bar(0.0..=1.0, fraction)
             .width(Length::Fill)
@@ -157,8 +203,12 @@ fn usage_bar(
             }),
     ]
     .width(Length::Fill)
-    .spacing(3)
-    .into()
+    .spacing(3);
+
+    mouse_area(stacked)
+        .on_press(Message::UsageBreakdownOpened(window))
+        .interaction(mouse::Interaction::Pointer)
+        .into()
 }
 
 /// Compact summary of every `claude` process on the machine — count, total
@@ -204,7 +254,7 @@ fn bar_color(fraction: f32) -> Color {
     if fraction < 0.6 {
         Color::from_rgb8(56, 189, 96)
     } else if fraction < 0.85 {
-        Color::from_rgb8(234, 179, 8)
+        WARN
     } else {
         Color::from_rgb8(239, 68, 68)
     }

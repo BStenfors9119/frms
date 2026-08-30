@@ -56,6 +56,13 @@ impl Proc for Sys {
         procs
     }
 
+    fn process_cwd(_pid: u32) -> Option<std::path::PathBuf> {
+        // A process's cwd isn't cheaply readable on Windows (no procfs; it needs
+        // remote-thread injection or a debugger API). Deferred — pinned
+        // terminals fall back to the session's working directory on restore.
+        None
+    }
+
     fn mem_total_kb() -> u64 {
         // TotalVisibleMemorySize is already reported in KiB.
         powershell("(Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize")

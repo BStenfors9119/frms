@@ -71,6 +71,22 @@ fn palette_256(idx: u16) -> Rgb {
     }
 }
 
+// ── container ─────────────────────────────────────────────────────────────────
+
+/// A container a shell has entered — the innermost toolbox/distrobox it's
+/// sitting in. Learned from the OSC 777 notifications those tools emit (see
+/// [`Grid::osc_dispatch`]), which is also how VTE-based terminals badge their
+/// tabs. Recorded per terminal so a pinned shell can be dropped back into the
+/// same container on the next launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Container {
+    /// The container name, e.g. `bottle`.
+    pub name:    String,
+    /// The tool that owns it, e.g. `toolbox` or `distrobox`. Kept because it
+    /// decides which `… enter <name>` command re-enters the container.
+    pub runtime: String,
+}
+
 // ── cell ──────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -102,6 +118,12 @@ pub struct Grid {
     /// How many rows above the live bottom the user is currently viewing.
     /// 0 = at the bottom (live), 1..=scrollback.len() = looking into history.
     pub scroll_offset: usize,
+    /// How many rows have been dropped off the front of `scrollback` since the
+    /// grid was created. Only ever grows, so `trimmed + index` is a stable
+    /// identifier for a line of output — see [`Grid::abs_top`]. Selections are
+    /// stored in that space, which is what keeps a highlight pinned to its text
+    /// while the viewport scrolls underneath it.
+    pub trimmed:       usize,
     pub cursor_row:    usize,
     pub cursor_col:    usize,
     /// Saved cursor position for DECSC/DECRC (`ESC 7` / `ESC 8`) and the
@@ -112,6 +134,10 @@ pub struct Grid {
     /// paste mode, pasted text must be wrapped with `\e[200~` / `\e[201~`
     /// so it isn't interpreted as typed input. Toggled by `CSI ?2004 h/l`.
     pub bracketed_paste: bool,
+    /// Containers this terminal's shell has entered, outermost first — pushed
+    /// and popped by the OSC 777 notifications in [`Grid::osc_dispatch`].
+    /// Empty means the shell is on the host.
+    containers:        Vec<Container>,
     // Current SGR attributes applied to new characters
     cur_fg:   Rgb,
     cur_bg:   Rgb,
@@ -132,14 +158,22 @@ impl Grid {
             cells:         vec![vec![Cell::default(); cols]; rows],
             scrollback:    Vec::new(),
             scroll_offset: 0,
+            trimmed:       0,
             cursor_row:    0,
             cursor_col:    0,
             saved_cursor:  (0, 0),
             bracketed_paste: false,
+            containers:    Vec::new(),
             cur_fg:        DEFAULT_FG,
             cur_bg:        DEFAULT_BG,
             cur_bold:      false,
         }
+    }
+
+    /// The container the shell is currently inside — the innermost one it has
+    /// entered — or `None` when it's running on the host.
+    pub fn container(&self) -> Option<&Container> {
+        self.containers.last()
     }
 
     /// Resize the live grid to `cols`×`rows`. Each live row is padded or
@@ -171,6 +205,7 @@ impl Grid {
             }
             while self.scrollback.len() > SCROLLBACK_LIMIT {
                 self.scrollback.remove(0);
+                self.trimmed += 1;
             }
         } else {
             for _ in 0..(rows - self.cells.len()) {
@@ -219,6 +254,84 @@ impl Grid {
         row.and_then(|row| row.get(c)).cloned().unwrap_or_default()
     }
 
+    /// Absolute row index of the topmost visible viewport row. Absolute rows
+    /// number every line the grid has ever held — trimmed history first, then
+    /// the surviving scrollback, then the live screen — so they stay attached
+    /// to their text as the buffer scrolls. Viewport row `r` is `abs_top() + r`.
+    pub fn abs_top(&self) -> usize {
+        self.trimmed + self.scrollback.len() - self.scroll_offset.min(self.scrollback.len())
+    }
+
+    /// Absolute row index of the oldest row still in the buffer.
+    pub fn abs_first(&self) -> usize {
+        self.trimmed
+    }
+
+    /// One past the absolute index of the last live row.
+    pub fn abs_end(&self) -> usize {
+        self.trimmed + self.scrollback.len() + self.rows
+    }
+
+    /// Cell at an absolute row/column. Rows outside the buffer — and columns
+    /// past the end of a narrower historical row — read as blanks, matching
+    /// [`Grid::view_cell`]'s defensive behaviour.
+    pub fn abs_cell(&self, abs: usize, c: usize) -> Cell {
+        let Some(idx) = abs.checked_sub(self.trimmed) else { return Cell::default() };
+        let history = self.scrollback.len();
+        let row = if idx < history {
+            self.scrollback.get(idx)
+        } else {
+            self.cells.get(idx - history)
+        };
+        row.and_then(|row| row.get(c)).cloned().unwrap_or_default()
+    }
+
+    /// The text of an absolute row, trailing blanks trimmed. The buffer stores
+    /// one character per cell, so the returned string indexes by *character*
+    /// exactly as the row's columns do.
+    pub fn abs_row_text(&self, abs: usize) -> String {
+        let mut s = String::with_capacity(self.cols);
+        for c in 0..self.cols {
+            s.push(self.abs_cell(abs, c).c);
+        }
+        s.trim_end().to_string()
+    }
+
+    /// Every case-insensitive occurrence of `needle` in the buffer, as absolute
+    /// `(row, column)` pairs, oldest first. Matches don't span rows: a phrase
+    /// broken across a wrap point is two rows to the grid, and finding it would
+    /// mean reconstructing logical lines the terminal never recorded.
+    pub fn search(&self, needle: &str) -> Vec<(usize, usize)> {
+        // One lowercase char per input char, so a match's index stays a column.
+        let lower = |c: char| c.to_lowercase().next().unwrap_or(c);
+        let needle: Vec<char> = needle.chars().map(lower).collect();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        for abs in self.abs_first()..self.abs_end() {
+            let row: Vec<char> = self.abs_row_text(abs).chars().map(lower).collect();
+            if row.len() < needle.len() {
+                continue;
+            }
+            for (col, window) in row.windows(needle.len()).enumerate() {
+                if window == needle.as_slice() {
+                    hits.push((abs, col));
+                }
+            }
+        }
+        hits
+    }
+
+    /// Scroll so absolute row `abs` sits `margin` rows below the top of the
+    /// viewport — enough context above the hit to read what leads into it.
+    /// Rows below the live bottom simply snap the viewport to the bottom.
+    pub fn scroll_to_abs(&mut self, abs: usize, margin: usize) {
+        let want_top = abs.saturating_sub(margin);
+        let bottom_top = self.trimmed + self.scrollback.len();
+        self.scroll_offset = bottom_top.saturating_sub(want_top).min(self.scrollback.len());
+    }
+
     /// Where the cursor sits in viewport coordinates. `None` when scrolled
     /// far enough that the cursor's row is below the visible window.
     pub fn cursor_view_pos(&self) -> Option<(usize, usize)> {
@@ -260,6 +373,7 @@ impl Grid {
             self.scrollback.push(removed);
             if self.scrollback.len() > SCROLLBACK_LIMIT {
                 self.scrollback.remove(0);
+                self.trimmed += 1;
             }
             self.cells.push(vec![Cell::default(); self.cols]);
         }
@@ -501,7 +615,13 @@ impl Perform for Grid {
         match byte {
             // RIS — full reset, but keep the current dimensions so we don't snap
             // back to the 80×24 default and force a re-resize on the next frame.
-            b'c' => *self = Grid::with_size(self.cols, self.rows),
+            // The container stack survives too: `reset` repaints the screen, it
+            // doesn't move the shell out of the toolbox it's sitting in.
+            b'c' => {
+                let containers = std::mem::take(&mut self.containers);
+                *self = Grid::with_size(self.cols, self.rows);
+                self.containers = containers;
+            }
             // DECSC / DECRC — save / restore cursor position.
             b'7' => self.saved_cursor = (self.cursor_row, self.cursor_col),
             b'8' => {
@@ -516,7 +636,40 @@ impl Perform for Grid {
     fn hook(&mut self, _: &Params, _: &[u8], _: bool, _: char) {}
     fn put(&mut self, _: u8) {}
     fn unhook(&mut self) {}
-    fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {}
+    /// Only OSC 777 is interesting: it's the container notification toolbox and
+    /// distrobox emit as a shell enters and leaves them —
+    ///
+    /// ```text
+    /// OSC 777 ; container ; push ; <name> ; <runtime> ; <uid>  ST
+    /// OSC 777 ; container ; pop  ;        ;           ; <uid>  ST
+    /// ```
+    ///
+    /// It's the only reliable way to know which toolbox a terminal is in:
+    /// podman puts the container's shell in its own PID namespace, so walking
+    /// our child's process tree finds the `podman exec` client and stops there.
+    /// Everything else OSC carries (titles, hyperlinks) we don't render.
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.first().copied() != Some(b"777".as_slice())
+            || params.get(1).copied() != Some(b"container".as_slice())
+        {
+            return;
+        }
+        match params.get(2).copied() {
+            Some(b"push") => {
+                let field = |i: usize| params.get(i)
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .unwrap_or_default();
+                let name = field(3);
+                // A push with no name tells us nothing we could re-enter later.
+                if name.is_empty() {
+                    return;
+                }
+                self.containers.push(Container { name, runtime: field(4) });
+            }
+            Some(b"pop") => { self.containers.pop(); }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +706,100 @@ mod tests {
         assert_eq!(render(b"abcdef\x1b[6D\x1b[3P"), "def");
         // ECH: "abcdef", home, erase 3 in place → "   def"
         assert_eq!(render(b"abcdef\x1b[6D\x1b[3X"), "   def");
+    }
+
+    /// Five lines through a 3-row grid: two rows in scrollback, three live.
+    fn scrolled_grid() -> Grid {
+        let mut grid = Grid::with_size(10, 3);
+        let mut parser = Parser::new();
+        for &b in b"aaa\r\nbbb\r\nccc\r\nddd\r\neee" {
+            parser.advance(&mut grid, b);
+        }
+        grid
+    }
+
+    #[test]
+    fn absolute_rows_track_content_through_scrolling() {
+        let mut grid = scrolled_grid();
+        assert_eq!(grid.scrollback.len(), 2);
+        // Absolute row 0 is the oldest line ever written, on screen or not.
+        assert_eq!(grid.abs_cell(0, 0).c, 'a');
+        assert_eq!(grid.abs_cell(4, 0).c, 'e');
+        assert_eq!(grid.abs_first(), 0);
+        assert_eq!(grid.abs_end(), 5);
+        // At the live bottom the viewport starts at the third line…
+        assert_eq!(grid.abs_top(), 2);
+        // …and scrolling into history walks that offset back, so the same
+        // absolute row keeps naming the same text.
+        grid.scroll_by(2);
+        assert_eq!(grid.abs_top(), 0);
+        assert_eq!(grid.abs_cell(grid.abs_top(), 0).c, grid.view_cell(0, 0).c);
+    }
+
+    #[test]
+    fn search_spans_scrollback_and_ignores_case() {
+        let grid = scrolled_grid();
+        // "bbb" is in scrollback, "eee" is live — both findable, and the hits
+        // come back oldest first.
+        assert_eq!(grid.search("BBB"), vec![(1, 0)]);
+        assert_eq!(grid.search("e"),   vec![(4, 0), (4, 1), (4, 2)]);
+        assert!(grid.search("zzz").is_empty());
+        assert!(grid.search("").is_empty());
+    }
+
+    #[test]
+    fn scroll_to_abs_puts_the_row_below_the_top_edge() {
+        let mut grid = scrolled_grid();
+        // Row 0 with one row of context above it: there is none, so it lands at
+        // the very top — offset counts all the way back through scrollback.
+        grid.scroll_to_abs(0, 1);
+        assert_eq!(grid.abs_top(), 0);
+        // Row 1 asked for with no margin sits at the top of the viewport.
+        grid.scroll_to_abs(1, 0);
+        assert_eq!(grid.abs_top(), 1);
+        // A live row can't be scrolled past the bottom.
+        grid.scroll_to_abs(4, 0);
+        assert_eq!(grid.scroll_offset, 0);
+    }
+
+    /// Feed raw bytes through a real vte parser into a fresh grid.
+    fn fed(bytes: &[u8]) -> Grid {
+        let mut grid = Grid::with_size(80, 24);
+        let mut parser = Parser::new();
+        for &b in bytes {
+            parser.advance(&mut grid, b);
+        }
+        grid
+    }
+
+    #[test]
+    fn osc_777_tracks_the_container_a_shell_enters_and_leaves() {
+        // The exact sequences `toolbox enter bottle` and its `exit` emit.
+        let grid = fed(b"\x1b]777;container;push;bottle;toolbox;1000\x1b\\");
+        let c = grid.container().expect("in a container");
+        assert_eq!(c.name, "bottle");
+        assert_eq!(c.runtime, "toolbox");
+
+        let grid = fed(b"\x1b]777;container;push;bottle;toolbox;1000\x1b\\\
+                         \x1b]777;container;pop;;;1000\x1b\\");
+        assert!(grid.container().is_none(), "pop returns the shell to the host");
+    }
+
+    #[test]
+    fn nested_containers_report_the_innermost() {
+        let grid = fed(b"\x1b]777;container;push;outer;toolbox;1000\x1b\\\
+                         \x1b]777;container;push;inner;distrobox;1000\x1b\\");
+        assert_eq!(grid.container().unwrap().name, "inner");
+    }
+
+    #[test]
+    fn container_survives_reset_but_other_osc_is_ignored() {
+        // `reset` (RIS) repaints the screen; it doesn't leave the toolbox.
+        let grid = fed(b"\x1b]777;container;push;bottle;toolbox;1000\x1b\\\x1bc");
+        assert_eq!(grid.container().unwrap().name, "bottle");
+        // A window-title OSC must not be mistaken for a container push.
+        let grid = fed(b"\x1b]0;some title\x07");
+        assert!(grid.container().is_none());
     }
 
     #[test]

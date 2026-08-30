@@ -52,6 +52,10 @@ pub mod shell {
     pub fn guidance_shell(lines: &[&str]) -> (String, Vec<String>) {
         <Sys as Shell>::guidance_shell(lines)
     }
+    /// A `(program, args)` that runs the install `command` then drops into a shell.
+    pub fn install_shell(command: &str) -> (String, Vec<String>) {
+        <Sys as Shell>::install_shell(command)
+    }
     /// Extra env vars every PTY child should inherit (`TERM`/`COLORTERM` on unix).
     pub fn terminal_env() -> Vec<(String, String)> {
         <Sys as Shell>::terminal_env()
@@ -90,6 +94,10 @@ pub mod proc {
     /// Total physical RAM in KiB, or `0` if unknown.
     pub fn mem_total_kb() -> u64 {
         <Sys as Proc>::mem_total_kb()
+    }
+    /// Current working directory of process `pid`, or `None` if unavailable.
+    pub fn cwd(pid: u32) -> Option<std::path::PathBuf> {
+        <Sys as Proc>::process_cwd(pid)
     }
 }
 

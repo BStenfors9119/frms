@@ -38,6 +38,13 @@ pub trait Shell {
     /// shell language (`sh -c 'printf …; exec …'` vs `cmd /c "echo …& cmd"`).
     fn guidance_shell(lines: &[&str]) -> (String, Vec<String>);
 
+    /// A `(program, args)` that runs the one-shot install `command`, then drops
+    /// the user into an interactive shell so they can see the result and sign
+    /// in. Drives the Profile tab's "Install" button. `command` is a full shell
+    /// line (may contain pipes) run by the platform shell — `sh -c 'CMD; exec
+    /// $SHELL'` on unix, `cmd /c "CMD & cmd"` on Windows.
+    fn install_shell(command: &str) -> (String, Vec<String>);
+
     /// Extra environment variables every PTY child should inherit. `TERM` /
     /// `COLORTERM` on unix so children emit colour; empty on Windows, where the
     /// ConPTY provides the capability and native consoles ignore `TERM`.
@@ -77,6 +84,10 @@ pub trait Proc {
     fn claude_procs() -> Vec<ProcSample>;
     /// Total physical RAM in KiB, or `0` if unknown.
     fn mem_total_kb() -> u64;
+    /// Current working directory of process `pid`, if it can be read cheaply.
+    /// `None` when the process is gone or the platform can't inspect it (e.g.
+    /// Windows today). Used to persist where a pinned terminal's shell was left.
+    fn process_cwd(pid: u32) -> Option<std::path::PathBuf>;
 }
 
 /// Filesystem operations whose mechanism differs by platform.

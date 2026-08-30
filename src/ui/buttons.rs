@@ -9,7 +9,7 @@
 //! `button(label).padding(buttons::PADDING).style(buttons::primary)`.
 
 use iced::gradient::Linear;
-use iced::widget::button;
+use iced::widget::{button, pick_list};
 use iced::{Background, Border, Color, Gradient, Radians, Shadow, Theme, Vector};
 
 // ── uniform sizing ────────────────────────────────────────────────────────────
@@ -37,6 +37,17 @@ fn lighten(c: Color, amount: f32) -> Color {
 fn mix_black(c: Color, t: f32) -> Color {
     let k = 1.0 - t.clamp(0.0, 1.0);
     Color { r: c.r * k, g: c.g * k, b: c.b * k, a: c.a }
+}
+
+/// Linear interpolate `c` toward white. `t = 0.0` returns `c`; `t = 1.0` returns white.
+fn mix_white(c: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color {
+        r: c.r + (1.0 - c.r) * t,
+        g: c.g + (1.0 - c.g) * t,
+        b: c.b + (1.0 - c.b) * t,
+        a: c.a,
+    }
 }
 
 fn contrast_text(bg: Color) -> Color {
@@ -103,12 +114,104 @@ pub fn secondary(theme: &Theme, status: button::Status) -> button::Style {
     glass_style(theme.extended_palette().secondary.base.color, status)
 }
 
+/// `pick_list` styled to read as a button rather than a form select — same
+/// glassy fill, border, and text color, with the handle (arrow) tinted to match
+/// so it reads as a subtle affordance, not a chrome dropdown.
+fn pick_list_glass(base: Color, status: pick_list::Status) -> pick_list::Style {
+    // Map the pick_list's state onto the button states glass_style understands.
+    let bstatus = match status {
+        pick_list::Status::Hovered => button::Status::Hovered,
+        pick_list::Status::Opened  => button::Status::Pressed,
+        pick_list::Status::Active  => button::Status::Active,
+    };
+    let g = glass_style(base, bstatus);
+    pick_list::Style {
+        text_color:        g.text_color,
+        placeholder_color: with_alpha(g.text_color, 0.85),
+        handle_color:      with_alpha(g.text_color, 0.7),
+        background:        g.background.unwrap_or(Background::Color(Color::TRANSPARENT)),
+        border:            g.border,
+    }
+}
+
 pub fn danger(theme: &Theme, status: button::Status) -> button::Style {
     glass_style(theme.extended_palette().danger.base.color, status)
 }
 
 pub fn success(theme: &Theme, status: button::Status) -> button::Style {
     glass_style(theme.extended_palette().success.base.color, status)
+}
+
+/// Default highlight violet for git-submodule directories, used when the user
+/// hasn't picked their own in the Profile tab. Distinct from the primary color
+/// so a submodule project reads as clearly separate from the parent repo's own
+/// folders; fixed regardless of theme so it stands out in light and dark.
+pub const SUBMODULE: Color = Color { r: 0.55, g: 0.44, b: 0.86, a: 1.0 };
+
+/// File-browser row style. `submodule` carries the user's chosen highlight
+/// color for submodule directories; `None` (a normal folder/file) falls back to
+/// the theme's primary color. Same glass look either way, just a different base.
+pub fn file_row(submodule: Option<Color>)
+    -> impl Fn(&Theme, button::Status) -> button::Style + Copy
+{
+    move |theme, status| {
+        let base = submodule
+            .unwrap_or_else(|| theme.extended_palette().primary.base.color);
+        glass_style(base, status)
+    }
+}
+
+// ── Notes plugin: folders vs. the notes inside them ───────────────────────────
+//
+// Categories borrow the file browser's submodule highlight — the same color the
+// user picks in Profile for "a container of other things", so folders read the
+// same way in both panels. The notes filed inside them are shades of the active
+// theme's primary, bright enough to sit clearly on top of the folder bar:
+//
+//   folder header   — the submodule tint (deepened when collapsed)
+//   note (filed)    — theme primary, lightly tinted toward white
+//   note (selected) — theme primary, tinted much further: the brightest row
+//
+// Notes therefore follow the palette like the rest of the app, and never
+// collide with the folder color no matter which palette is active.
+
+/// How far a folder header is pushed toward black, open vs. collapsed.
+const FOLDER_SINK: (f32, f32) = (0.0, 0.35);
+/// How far a note row is tinted toward white, unselected vs. selected.
+const NOTE_TINT:   (f32, f32) = (0.30, 0.72);
+
+/// Category (folder) row in the Notes list. `folder` is the user's submodule
+/// highlight color (see [`SUBMODULE`]); a collapsed folder sinks toward black —
+/// put away, but still recognisably the same color as when open.
+pub fn note_category(folder: Color, collapsed: bool)
+    -> impl Fn(&Theme, button::Status) -> button::Style + Copy
+{
+    move |_theme, status| {
+        let sink = if collapsed { FOLDER_SINK.1 } else { FOLDER_SINK.0 };
+        glass_style(mix_black(folder, sink), status)
+    }
+}
+
+/// A note row in the Notes list — a shade of the theme's primary, kept light so
+/// it reads as content sitting inside the folder rather than another folder;
+/// the selected note goes brighter still so it's the lightest row on screen.
+pub fn note_item(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
+    move |theme, status| {
+        let tint = if selected { NOTE_TINT.1 } else { NOTE_TINT.0 };
+        glass_style(mix_white(theme.extended_palette().primary.base.color, tint), status)
+    }
+}
+
+/// The Notes editor's category dropdown. Once a note is filed the picker wears
+/// the folder color, matching its group header in the list; while it's still
+/// uncategorized it stays neutral, so the color means "in a folder".
+pub fn pick_list_note_category(folder: Option<Color>)
+    -> impl Fn(&Theme, pick_list::Status) -> pick_list::Style + Copy
+{
+    move |theme, status| {
+        let base = folder.unwrap_or_else(|| theme.extended_palette().secondary.base.color);
+        pick_list_glass(base, status)
+    }
 }
 
 /// Warm amber used to flag tabs whose Claude terminal has stopped on a
@@ -168,6 +271,39 @@ pub fn embedded_icon(fg: Color)
     -> impl Fn(&Theme, button::Status) -> button::Style + Copy
 {
     move |_theme, status| {
+        let overlay_alpha = match status {
+            button::Status::Hovered => 0.20,
+            button::Status::Pressed => 0.32,
+            _ => 0.0,
+        };
+        button::Style {
+            background: (overlay_alpha > 0.0).then(|| {
+                Background::Color(Color { a: overlay_alpha, ..fg })
+            }),
+            text_color: fg,
+            border: Border { color: Color::TRANSPARENT, width: 0.0, radius: 4.0.into() },
+            shadow: Shadow::default(),
+        }
+    }
+}
+
+/// Inline icon button that matches a [`toggle`]-styled tab — transparent so it
+/// reads as part of the tab, with its glyph color computed to match the tab's
+/// label (active vs inactive) in any theme. Use for an inline ✕ / control tucked
+/// inside a toggle tab button.
+pub fn toggle_icon(selected: bool)
+    -> impl Fn(&Theme, button::Status) -> button::Style + Copy
+{
+    move |theme, status| {
+        let palette = theme.extended_palette();
+        let base = if selected {
+            palette.primary.base.color
+        } else {
+            palette.secondary.base.color
+        };
+        // Same derivation glass_style uses for a toggle button's text color, so
+        // the glyph sits on the tab as if it were part of the label.
+        let fg = contrast_text(mix_black(base, 0.30));
         let overlay_alpha = match status {
             button::Status::Hovered => 0.20,
             button::Status::Pressed => 0.32,

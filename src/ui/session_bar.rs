@@ -90,10 +90,10 @@ fn session_tab<'a>(
     slot:       Option<SplitSlot>,
     colors:     ThemeColors,
 ) -> Element<'a, Message, Theme, Renderer> {
-    // Any Claude terminal in this session stopped on a question? Turn the
-    // whole session tab amber so the user notices even while working in a
-    // different session.
-    let waiting = session.panes.iter().any(|p| p.waiting_on_user());
+    // Any pane in this session needing the user — a Build terminal stopped on a
+    // question, or a chat whose reply landed off-screen? Turn the whole session
+    // tab amber so it's noticeable while working in a different session.
+    let waiting = session.panes.iter().any(|p| p.needs_attention());
 
     let fg = if waiting {
         buttons::tab_text_color(buttons::ATTENTION, buttons::ATTENTION, is_active)
@@ -143,6 +143,19 @@ fn session_tab<'a>(
     };
 
     let mut inner = row![].spacing(6).align_y(Alignment::Center);
+    // Ctrl+1…9 jumps straight to a session, so label each tab with its digit —
+    // otherwise the user has to count tabs to work out which one they'd land on.
+    // Only the first nine have a shortcut; later tabs get no badge.
+    if idx < 9 {
+        inner = inner.push(
+            text(format!("{}", idx + 1))
+                .font(UI_FONT)
+                .size(buttons::TEXT_SIZE - 1)
+                .style(move |_: &Theme| iced::widget::text::Style {
+                    color: Some(Color { a: 0.55, ..fg }),
+                }),
+        );
+    }
     if waiting {
         // ● badge — a Claude terminal inside is waiting on an answer.
         inner = inner.push(text("●").font(ICON_FONT).size(11));

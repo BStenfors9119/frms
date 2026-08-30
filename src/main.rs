@@ -3,9 +3,11 @@ mod app;
 mod cdp;
 mod chat_api;
 mod clipboard;
+mod cloud_sql;
 mod db;
 mod db_history;
 mod db_panel;
+mod docs;
 mod splash_video;
 mod claude_prompt;
 mod stats;
@@ -27,15 +29,27 @@ mod telemetry;
 mod terminal;
 mod terminals;
 mod theme;
+mod transcript;
 mod ui;
+mod version;
 
 use iced::{Size, window};
 
 fn main() -> iced::Result {
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+
+    // `frms --version` — build identity for bug reports and for packaging
+    // scripts that want to confirm which binary they just built. Same numbers
+    // the Profile tab shows.
+    if matches!(first.as_deref(), Some("--version" | "-V")) {
+        println!("{}", version::full());
+        return Ok(());
+    }
+
     // `frms --export-icon <path>` — render the app icon as a PNG and exit.
     // Used by install.sh to generate the desktop icon from the binary.
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("--export-icon") {
+    if first.as_deref() == Some("--export-icon") {
         let path = args.next().unwrap_or_else(|| "frms.png".into());
         match icon::export_png(std::path::Path::new(&path)) {
             Some(()) => {
@@ -51,11 +65,11 @@ fn main() -> iced::Result {
 
     eprintln!("[frms] starting up");
 
-    // Best-effort crash reporting, gated on the same opt-out as the rest of
-    // telemetry — and only after the first-run notice has been acknowledged, so
-    // nothing is sent before consent.
+    // Best-effort crash reporting. Diagnostics are optional-tier, so this
+    // follows the user's opt-out (unlike the install/launch counts, which the
+    // app records unconditionally in `Frms::new`).
     let prefs = prefs::Prefs::load();
-    telemetry::install_panic_hook(prefs.telemetry_notice_ack && prefs.telemetry);
+    telemetry::install_panic_hook(prefs.telemetry);
 
     let mut window_settings = window::Settings {
         size:     Size::new(1400.0, 900.0),

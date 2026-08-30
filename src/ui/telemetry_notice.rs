@@ -1,9 +1,11 @@
-//! First-run telemetry/diagnostics notice — a full-screen modal shown once,
-//! before any telemetry is sent, so the user knows what's collected and can opt
-//! out up front. Mirrors `_docs/TELEMETRY_NOTICE.md` and the Profile > Privacy
-//! text. Both choices acknowledge the notice (it won't show again); the choice
-//! only sets whether telemetry is on. See `Frms::view` / the `TelemetryNotice*`
-//! handlers.
+//! First-run telemetry/diagnostics notice — a full-screen modal shown once, so
+//! the user knows what's collected and can opt out of the optional tier up
+//! front. Mirrors `_docs/TELEMETRY_NOTICE.md` and the Profile > Privacy text.
+//! Both choices acknowledge the notice (it won't show again); the choice sets
+//! whether the optional tier is on. It must state plainly that the install and
+//! app-open counts are always reported — they are, from `Frms::new`, and this
+//! modal is where that gets disclosed. See `Frms::view` / the
+//! `TelemetryNotice*` handlers.
 
 use iced::{Alignment, Background, Border, Element, Length, Theme};
 use iced::widget::{button, column, container, row, text, Space};
@@ -31,10 +33,19 @@ pub fn view<'a>(colors: ThemeColors) -> Element<'a, Message> {
                   amount of anonymous usage and diagnostic data.")
                 .size(13),
 
-            text("What it collects").size(15),
+            text("Always reported").size(15),
             column![
+                bullet("That frms was installed, and each time the app is opened"),
                 bullet("An anonymous install id — not tied to you or any account"),
                 bullet("App version, operating system, and CPU architecture"),
+            ]
+            .spacing(4),
+            text("That's the licence and adoption count — it can't be turned \
+                  off while you use frms.")
+                .size(12),
+
+            text("Optional — your choice below").size(15),
+            column![
                 bullet("Coarse feature usage — e.g. pane/model types and session starts"),
                 bullet("Error and crash diagnostics (scrubbed) to help fix bugs"),
             ]
@@ -46,13 +57,13 @@ pub fn view<'a>(colors: ThemeColors) -> Element<'a, Message> {
                   Error text is scrubbed and truncated before it's sent.")
                 .size(12),
 
-            text("It's on by default. You can change this any time in \
-                  Profile → Privacy, or set DO_NOT_TRACK=1 before launch.")
+            text("The optional data is on by default. You can change it any time \
+                  in Profile → Privacy, or set DO_NOT_TRACK=1 before launch.")
                 .size(12),
 
             row![
                 Space::with_width(Length::Fill),
-                button(text("Turn it off").size(buttons::TEXT_SIZE))
+                button(text("Turn off optional data").size(buttons::TEXT_SIZE))
                     .on_press(Message::TelemetryNoticeChoice(false))
                     .padding(buttons::PADDING)
                     .style(buttons::secondary),

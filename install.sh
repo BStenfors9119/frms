@@ -175,6 +175,22 @@ check_deps() {
         esac
     fi
 
+    # Google's Cloud SQL Auth Proxy: needed only by users who connect the
+    # Database tool to a GCP Cloud SQL instance, so this one is opt-in (default
+    # N) rather than assumed. Same delegation as above — the bundled helper is
+    # the single source of truth, and ships as `frms-setup-cloud-sql-proxy`.
+    if ! command -v cloud-sql-proxy &>/dev/null; then
+        echo
+        echo "  'cloud-sql-proxy' is not installed — the Database tool needs it"
+        echo "  to reach GCP Cloud SQL instances (not needed for other databases)."
+        read -r -p "  Install the Cloud SQL Auth Proxy now? [y/N] " ans
+        case "${ans:-N}" in
+            [yY]*) "$SCRIPT_DIR/scripts/setup-cloud-sql-proxy.sh" || \
+                       echo "  ⚠ Cloud SQL Proxy setup didn't complete — see the message above." ;;
+            *)     echo "  Skipped — install it later with: frms-setup-cloud-sql-proxy" ;;
+        esac
+    fi
+
     # Research/Chat panes use the Anthropic API directly, not the CLI: enter an
     # API key in frms' Profile tab (get one at console.anthropic.com).
     echo

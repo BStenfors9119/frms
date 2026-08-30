@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use super::Sys;
 use crate::port::api::{Proc, ProcSample};
 
@@ -47,6 +49,12 @@ impl Proc for Sys {
         }
 
         procs
+    }
+
+    fn process_cwd(pid: u32) -> Option<PathBuf> {
+        // Linux exposes the cwd as a symlink at /proc/<pid>/cwd. On unices
+        // without procfs (macOS) this simply fails and returns None.
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
     fn mem_total_kb() -> u64 {

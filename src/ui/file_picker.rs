@@ -1,9 +1,14 @@
-//! Full-screen file picker for choosing a local file to copy to a receiver.
+//! Full-screen file picker for choosing a local file.
 //!
 //! Mirrors the directory chooser in `new_session_dialog`, but lists files as
 //! well as directories: clicking a directory navigates into it, clicking a
-//! file selects it (and triggers the copy). Kept dependency-free — the app
-//! ships no native file-dialog tool, so it reuses the bundled file browser.
+//! file selects it. Kept dependency-free — the app ships no native file-dialog
+//! tool, so it reuses the bundled file browser.
+//!
+//! Shared by every "browse for a file" control in frms (copying to a receiver,
+//! choosing the Cloud SQL service-account key); the caller's
+//! [`crate::app::PickerPurpose`] supplies the wording and decides where the
+//! chosen path is delivered.
 
 use iced::{Alignment, Background, Border, Element, Length, Theme};
 use iced::widget::{button, column, container, row, scrollable, text, Space};
@@ -15,15 +20,16 @@ use crate::theme::ThemeColors;
 use crate::ui::buttons;
 
 pub fn view<'a>(
-    browser:       &'a FileBrowserState,
-    receiver_name: &'a str,
-    colors:        ThemeColors,
+    browser: &'a FileBrowserState,
+    title:   String,
+    hint:    &'a str,
+    colors:  ThemeColors,
 ) -> Element<'a, Message> {
     let header = row![
-        text(format!("Choose a file to copy to “{receiver_name}”")).size(18),
+        text(title).size(18),
         Space::with_width(Length::Fill),
         button(text("Cancel").font(UI_FONT).size(buttons::TEXT_SIZE))
-            .on_press(Message::ReceiverPickerCancel)
+            .on_press(Message::FilePickerCancel)
             .padding(buttons::PADDING)
             .style(buttons::secondary),
     ]
@@ -36,7 +42,7 @@ pub fn view<'a>(
         container(scrollable(listing(browser)).height(Length::Fixed(360.0)))
             .style(container::bordered_box)
             .padding(6),
-        text("Click a folder to open it; click a file to copy it.").size(11),
+        text(hint).size(11),
     ]
     .spacing(12)
     .padding(28);
@@ -72,7 +78,7 @@ fn listing(state: &FileBrowserState) -> iced::widget::Column<'_, Message> {
         let parent_path = parent.to_path_buf();
         list = list.push(
             button(text("..").size(buttons::TEXT_SIZE))
-                .on_press(Message::ReceiverPickerBrowse(parent_path))
+                .on_press(Message::FilePickerBrowse(parent_path))
                 .padding(buttons::PADDING)
                 .style(buttons::primary)
                 .width(Length::Fill),
@@ -83,7 +89,7 @@ fn listing(state: &FileBrowserState) -> iced::widget::Column<'_, Message> {
     for entry in state.entries.iter().filter(|e| e.is_dir) {
         list = list.push(
             button(text(format!("> {}", entry.name)).size(buttons::TEXT_SIZE))
-                .on_press(Message::ReceiverPickerBrowse(entry.path.clone()))
+                .on_press(Message::FilePickerBrowse(entry.path.clone()))
                 .padding(buttons::PADDING)
                 .style(buttons::primary)
                 .width(Length::Fill),
@@ -92,7 +98,7 @@ fn listing(state: &FileBrowserState) -> iced::widget::Column<'_, Message> {
     for entry in state.entries.iter().filter(|e| !e.is_dir) {
         list = list.push(
             button(text(format!("  {}", entry.name)).size(buttons::TEXT_SIZE))
-                .on_press(Message::ReceiverPickerChoose(entry.path.clone()))
+                .on_press(Message::FilePickerChoose(entry.path.clone()))
                 .padding(buttons::PADDING)
                 .style(buttons::secondary)
                 .width(Length::Fill),

@@ -1,7 +1,8 @@
 //! Per-field input history for the database connection form. Persisted as
 //! JSON at `$HOME/.frms/db_history.json` so previously typed hosts, ports,
-//! databases, and users survive across restarts and show up as a dropdown
-//! under each field. Passwords are intentionally not stored.
+//! databases, users, and Cloud SQL instance names survive across restarts and
+//! show up as a dropdown under each field. Passwords are intentionally not
+//! stored.
 
 use std::path::PathBuf;
 
@@ -15,6 +16,9 @@ pub struct DbHistory {
     pub port:     Vec<String>,
     pub database: Vec<String>,
     pub user:     Vec<String>,
+    /// GCP instance connection names (`project:region:instance`) previously
+    /// used to start the Cloud SQL Auth Proxy.
+    pub instance: Vec<String>,
 }
 
 fn history_path() -> Option<PathBuf> {
@@ -32,6 +36,7 @@ impl DbHistory {
             port:     read_list(&v, "port"),
             database: read_list(&v, "database"),
             user:     read_list(&v, "user"),
+            instance: read_list(&v, "instance"),
         }
     }
 
@@ -45,6 +50,7 @@ impl DbHistory {
             "port":     self.port,
             "database": self.database,
             "user":     self.user,
+            "instance": self.instance,
         });
         if let Ok(bytes) = serde_json::to_vec_pretty(&v) {
             let _ = std::fs::write(&path, bytes);
@@ -53,11 +59,12 @@ impl DbHistory {
 
     /// Promote the given values to the front of their respective histories.
     /// Empty values are skipped; duplicates are moved rather than repeated.
-    pub fn commit(&mut self, host: &str, port: &str, database: &str, user: &str) {
+    pub fn commit(&mut self, host: &str, port: &str, database: &str, user: &str, instance: &str) {
         push_front_unique(&mut self.host,     host);
         push_front_unique(&mut self.port,     port);
         push_front_unique(&mut self.database, database);
         push_front_unique(&mut self.user,     user);
+        push_front_unique(&mut self.instance, instance);
     }
 }
 

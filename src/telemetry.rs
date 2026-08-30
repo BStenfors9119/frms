@@ -12,8 +12,13 @@
 //!     a single background thread owns all network I/O (one short-lived `curl`
 //!     per event, reaped so no zombies). A full queue drops events rather than
 //!     ever blocking the app.
-//!   • **On by default, trivially opt-out.** Off the instant the user toggles it
-//!     in the Profile tab, or if `DO_NOT_TRACK` / `FRMS_NO_TELEMETRY` is set.
+//!   • **Two tiers.** *Essential* events — one `install` per install and a
+//!     `launch` per app open — are always sent: they're the licensing/adoption
+//!     count the product needs, and the notice discloses them up front.
+//!     *Optional* events (feature usage, errors, panics) are on by default and
+//!     off the instant the user unchecks the Profile toggle or sets
+//!     `DO_NOT_TRACK` / `FRMS_NO_TELEMETRY`. Both tiers carry the same anonymous
+//!     payload — an install id, version, OS, arch — and never any PII.
 //!
 //! Transport is `curl` — the app deliberately carries no TLS crate (same
 //! shell-out approach as `chat_api`, `stats`, and `clipboard`). The endpoint
@@ -23,7 +28,9 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::Arc;
 
 /// Where events are POSTed unless `FRMS_TELEMETRY_URL` overrides it.
 const DEFAULT_URL: &str = "https://api.thesportsremote.com/api/telemetry";
@@ -37,12 +44,19 @@ const MAX_DETAIL: usize = 500;
 /// A telemetry event. Variants stay coarse on purpose — labels and counters,
 /// never identifying content.
 pub enum Event {
-    /// App started.
+    /// First launch on this install — the anonymous id was just minted.
+    /// Essential tier: always sent (see [`Event::is_essential`]).
+    Install,
+    /// App started. Essential tier: always sent.
     Launch,
     /// An agent pane was created (`kind` = "build" | "research" | "chat").
     AgentCreated { kind: &'static str },
     /// A session was created (`kind` = "terminal" | "browser").
     SessionCreated { kind: &'static str },
+    /// The user retargeted `count` existing agent panes at another model of
+    /// `tool` (= "claude" | "windsurf"). No model id — just the tool and how
+    /// many panes moved at once.
+    AgentModelChanged { tool: &'static str, count: usize },
     /// A chat reply finished successfully against `model`.
     ChatCompleted { model: &'static str },
     /// A non-fatal error surfaced to the user. `detail` is scrubbed + truncated.
@@ -51,37 +65,66 @@ pub enum Event {
     Panic { detail: String },
 }
 
+impl Event {
+    /// Essential events are the install/adoption count: one per install, one per
+    /// app open. They carry no usage detail beyond the shared anonymous context
+    /// and are not covered by the opt-out — everything else is.
+    fn is_essential(&self) -> bool {
+        matches!(self, Event::Install | Event::Launch)
+    }
+}
+
 /// Handle held by the app. Cheap to call; does nothing when disabled.
 pub struct Telemetry {
     tx: Option<SyncSender<Event>>,
+    /// Whether optional (non-essential) events are allowed through. Shared so
+    /// the Profile toggle applies instantly without restarting the sender.
+    optional: Arc<AtomicBool>,
 }
 
 impl Telemetry {
-    /// A no-op handle (telemetry off).
+    /// A no-op handle — sends nothing at all. Used as the pre-init placeholder;
+    /// the running app always holds a [`Telemetry::start`] handle so essential
+    /// events still flow.
     pub fn disabled() -> Self {
-        Self { tx: None }
+        Self { tx: None, optional: Arc::new(AtomicBool::new(false)) }
     }
 
-    /// Start the sender thread when `enabled` (the user's pref) and no env
-    /// opt-out is set; otherwise returns a no-op handle.
-    pub fn start(enabled: bool) -> Self {
-        if !enabled || env_opt_out() {
-            return Self::disabled();
-        }
+    /// Start the sender thread. Essential events (install / launch) are always
+    /// sent; `optional` — the user's pref, further gated by the env opt-out —
+    /// decides whether feature-usage and diagnostic events go too.
+    pub fn start(optional: bool) -> Self {
         let url = endpoint();
-        let ctx = Context::gather();
+        let (ctx, fresh_install) = Context::gather();
         let (tx, rx) = sync_channel::<Event>(QUEUE_CAP);
         let spawned = std::thread::Builder::new()
             .name("frms-telemetry".into())
             .spawn(move || worker(rx, url, ctx))
             .is_ok();
         // If the thread failed to spawn, drop the sender so `record` is a no-op.
-        Self { tx: spawned.then_some(tx) }
+        let this = Self {
+            tx:       spawned.then_some(tx),
+            optional: Arc::new(AtomicBool::new(optional && !env_opt_out())),
+        };
+        // A brand-new anonymous id means this is the first run of a fresh
+        // install — report it once, before anything else in the queue.
+        if fresh_install {
+            this.record(Event::Install);
+        }
+        this
+    }
+
+    /// Apply the Profile toggle. Essential events are unaffected.
+    pub fn set_optional(&self, optional: bool) {
+        self.optional.store(optional && !env_opt_out(), Ordering::Relaxed);
     }
 
     /// Queue an event. Non-blocking: returns immediately, dropping the event if
     /// the queue is backed up. Never touches the network on the calling thread.
     pub fn record(&self, event: Event) {
+        if !event.is_essential() && !self.optional.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(tx) = &self.tx {
             let _ = tx.try_send(event);
         }
@@ -90,7 +133,8 @@ impl Telemetry {
 
 /// True if the user set a standard opt-out env var (`DO_NOT_TRACK` is the
 /// cross-app convention; `FRMS_NO_TELEMETRY` is ours). Any non-empty, non-"0"
-/// value counts.
+/// value counts. Like the Profile toggle, this silences the optional tier —
+/// install/launch counts still go out.
 fn env_opt_out() -> bool {
     ["DO_NOT_TRACK", "FRMS_NO_TELEMETRY"].iter().any(|k| {
         std::env::var(k).map(|v| !v.is_empty() && v != "0").unwrap_or(false)
@@ -113,13 +157,17 @@ struct Context {
 }
 
 impl Context {
-    fn gather() -> Self {
-        Self {
-            id:      anon_id(),
-            version: env!("CARGO_PKG_VERSION"),
+    /// Build the context, reporting whether the anonymous id had to be minted —
+    /// i.e. whether this is the first run of a fresh install.
+    fn gather() -> (Self, bool) {
+        let (id, fresh) = anon_id();
+        let ctx = Self {
+            id,
+            version: crate::version::VERSION,
             os:      std::env::consts::OS,
             arch:    std::env::consts::ARCH,
-        }
+        };
+        (ctx, fresh)
     }
 }
 
@@ -150,9 +198,12 @@ fn encode(ctx: &Context, event: &Event) -> String {
 fn describe(event: &Event) -> (&'static str, serde_json::Value) {
     use serde_json::json;
     match event {
+        Event::Install                 => ("install",        json!({})),
         Event::Launch                  => ("launch",         json!({})),
         Event::AgentCreated { kind }   => ("agent_created",  json!({ "kind":  kind })),
         Event::SessionCreated { kind } => ("session_created",json!({ "kind":  kind })),
+        Event::AgentModelChanged { tool, count } =>
+            ("agent_model_changed", json!({ "tool": tool, "count": count })),
         Event::ChatCompleted { model } => ("chat_completed", json!({ "model": model })),
         Event::Error { kind, detail }  => ("error",          json!({ "kind":  kind, "detail": scrub(detail) })),
         Event::Panic { detail }        => ("panic",          json!({ "detail": scrub(detail) })),
@@ -197,24 +248,31 @@ fn id_path() -> Option<PathBuf> {
 
 /// Persistent random id (UUID-like, 16 bytes hex). Created once, then reused —
 /// it identifies an install, never a person. No network, no hardware ids.
-fn anon_id() -> String {
+///
+/// Returns `(id, fresh)`, where `fresh` means the id was just minted — the
+/// install signal. It's written to disk immediately, so a crash right after
+/// this can lose the install event but never duplicate it. If the config dir
+/// is unwritable the id can't persist, so `fresh` stays `false` after the
+/// first call in that process rather than counting an install on every launch.
+fn anon_id() -> (String, bool) {
     let path = id_path();
     if let Some(p) = &path {
         if let Ok(s) = std::fs::read_to_string(p) {
             let s = s.trim().to_string();
             if !s.is_empty() {
-                return s;
+                return (s, false);
             }
         }
     }
     let id = random_hex16();
+    let mut stored = false;
     if let Some(p) = &path {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(p, &id);
+        stored = std::fs::write(p, &id).is_ok();
     }
-    id
+    (id, stored)
 }
 
 fn random_hex16() -> String {
@@ -276,11 +334,35 @@ fn redact_tokens(s: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The opt-out covers usage + diagnostics; install/launch counts are
+    /// outside it. Guards the tier split itself — `record` can't be exercised
+    /// here without starting the sender thread (which would POST for real).
+    #[test]
+    fn only_install_and_launch_are_essential() {
+        assert!(Event::Install.is_essential());
+        assert!(Event::Launch.is_essential());
+        for e in [
+            Event::AgentCreated { kind: "build" },
+            Event::SessionCreated { kind: "terminal" },
+            Event::ChatCompleted { model: "m" },
+            Event::Error { kind: "chat", detail: String::new() },
+            Event::Panic { detail: String::new() },
+        ] {
+            assert!(!e.is_essential());
+        }
+    }
+}
+
 // ── panic reporting ─────────────────────────────────────────────────────────
 
 /// Install a panic hook that best-effort reports a (scrubbed) panic event, then
-/// chains the previous hook. Reads the pref fresh so an opted-out user reports
-/// nothing. Runs synchronously (the app is already dying) but is bounded by the
+/// chains the previous hook. Crash reports are optional-tier, so this is gated
+/// on the user's pref (and the env opt-out) — an opted-out user reports nothing
+/// here. Runs synchronously (the app is already dying) but is bounded by the
 /// `curl` timeout, and never itself panics.
 pub fn install_panic_hook(enabled: bool) {
     if !enabled || env_opt_out() {
@@ -296,7 +378,7 @@ pub fn install_panic_hook(enabled: bool) {
             .map(|s| (*s).to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_default();
-        let ctx = Context::gather();
+        let (ctx, _) = Context::gather();
         let body = encode(&ctx, &Event::Panic { detail: format!("{where_} {msg}") });
         post(&endpoint(), &body);
         previous(info);

@@ -70,7 +70,8 @@ Every event is the same envelope with an event-specific `props` object:
 
 | `event`           | `props`                              | Meaning |
 |-------------------|--------------------------------------|---------|
-| `launch`          | `{}`                                 | App started. |
+| `install`         | `{}`                                 | First run of a fresh install — sent once, when the `id` is minted. Essential tier. |
+| `launch`          | `{}`                                 | App started. Essential tier. |
 | `agent_created`   | `{ "kind": "build"\|"research"\|"chat" }` | An agent pane was created. |
 | `session_created` | `{ "kind": "terminal"\|"browser" }`  | A session was created. |
 | `chat_completed`  | `{ "model": "<model id>" }`          | A Research/Chat reply finished OK (e.g. `claude-opus-4-8`, `claude-sonnet-4-6`). |
@@ -165,6 +166,14 @@ The endpoint is **unauthenticated and public**, so it can be spammed/spoofed:
   thread, 5 s timeout. Low and bursty (a launch + a few usage events per
   session). The client drops events if its local queue backs up, so the server
   is never a bottleneck for the app.
-- **Opt-out:** users can disable telemetry (Profile tab) or set
-  `DO_NOT_TRACK=1` / `FRMS_NO_TELEMETRY=1`; those installs send nothing — expect
-  under-counting, not full coverage.
+- **Opt-out (optional tier only):** users can disable telemetry (Profile tab) or
+  set `DO_NOT_TRACK=1` / `FRMS_NO_TELEMETRY=1`. Those installs still send
+  `install` and `launch` — the essential tier isn't covered by the opt-out (and
+  the first-run notice says so) — but no `agent_created` / `session_created` /
+  `chat_completed` / `error` / `panic`. So install and active-install counts are
+  complete; feature-usage counts under-report.
+- **`install` is best-effort-once:** it fires when `~/.frms/telemetry_id` is
+  created. Deleting that file (or wiping `~/.frms`) mints a new `id` and counts
+  a new install; a crash or offline first run can lose it while `launch` still
+  arrives. Derive install counts from `distinct id` (with `install` as a hint),
+  not from `install` rows alone.

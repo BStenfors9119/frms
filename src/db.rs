@@ -111,6 +111,11 @@ pub struct DbConfig {
     pub user:     String,
     pub password: String,
     pub database: String,
+    /// GCP instance connection name — `project:region:instance`. Only used
+    /// when `provider` is [`DbProvider::GcpCloudSql`], where it identifies the
+    /// instance for the Cloud SQL Auth Proxy ([`crate::cloud_sql`]). Never part
+    /// of the wire connection itself, which always dials `host:port`.
+    pub cloud_sql_instance: String,
 }
 
 impl Default for DbConfig {
@@ -123,6 +128,7 @@ impl Default for DbConfig {
             user:     String::from("postgres"),
             password: String::new(),
             database: String::from("postgres"),
+            cloud_sql_instance: String::new(),
         }
     }
 }
@@ -224,6 +230,141 @@ impl RoutineRef {
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub rows:    Vec<Vec<String>>,
+}
+
+/// Text format used when the results table — or a single record from it — is
+/// copied to the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyFormat {
+    /// Comma-separated with RFC 4180 quoting — pastes into a spreadsheet.
+    #[default]
+    Csv,
+    /// Tab-separated — what most spreadsheets and editors paste cleanest.
+    Tsv,
+    /// Pipe table, for pasting into markdown docs, issues and PRs.
+    Markdown,
+    /// One JSON object per record, keyed by column name.
+    Json,
+}
+
+impl CopyFormat {
+    pub const ALL: [CopyFormat; 4] = [
+        CopyFormat::Csv,
+        CopyFormat::Tsv,
+        CopyFormat::Markdown,
+        CopyFormat::Json,
+    ];
+}
+
+impl std::fmt::Display for CopyFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CopyFormat::Csv      => "CSV",
+            CopyFormat::Tsv      => "TSV",
+            CopyFormat::Markdown => "Markdown",
+            CopyFormat::Json     => "JSON",
+        })
+    }
+}
+
+impl QueryResult {
+    /// The whole result set rendered for the clipboard, header row included.
+    /// Values are the same strings the grid shows, so a SQL NULL comes through
+    /// as the literal text `NULL`.
+    pub fn to_clipboard(&self, format: CopyFormat) -> String {
+        self.render(&self.rows, format)
+    }
+
+    /// A single record rendered for the clipboard. The tabular formats keep the
+    /// header row so the values stay labelled; JSON emits a bare object rather
+    /// than a one-element array. `None` when `idx` is out of range.
+    pub fn row_to_clipboard(&self, idx: usize, format: CopyFormat) -> Option<String> {
+        let row = self.rows.get(idx)?;
+        Some(match format {
+            CopyFormat::Json => self.json_object(row),
+            _ => self.render(std::slice::from_ref(row), format),
+        })
+    }
+
+    /// Render `rows` (a subset of `self.rows`) in `format`, with the column
+    /// names as the header.
+    fn render(&self, rows: &[Vec<String>], format: CopyFormat) -> String {
+        match format {
+            CopyFormat::Csv      => self.delimited(rows, ','),
+            CopyFormat::Tsv      => self.delimited(rows, '\t'),
+            CopyFormat::Markdown => self.markdown(rows),
+            CopyFormat::Json     => {
+                let objs: Vec<String> = rows.iter().map(|r| format!("  {}", self.json_object(r))).collect();
+                format!("[\n{}\n]", objs.join(",\n"))
+            }
+        }
+    }
+
+    /// CSV/TSV body. Commas use RFC 4180 quoting; tabs can't be escaped, so a
+    /// TSV cell's own tabs and newlines collapse to spaces to keep the columns
+    /// aligned with the header.
+    fn delimited(&self, rows: &[Vec<String>], sep: char) -> String {
+        let cell = |v: &str| -> String {
+            if sep == ',' {
+                if v.contains([',', '"', '\n', '\r']) {
+                    format!("\"{}\"", v.replace('"', "\"\""))
+                } else {
+                    v.to_string()
+                }
+            } else {
+                v.replace(['\t', '\n', '\r'], " ")
+            }
+        };
+
+        let sep = sep.to_string();
+        let mut out = String::new();
+        out.push_str(&self.columns.iter().map(|c| cell(c)).collect::<Vec<_>>().join(&sep));
+        out.push('\n');
+        for r in rows {
+            out.push_str(&r.iter().map(|v| cell(v)).collect::<Vec<_>>().join(&sep));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Pipe table with a separator rule under the header. Cell pipes are
+    /// escaped and newlines flattened so the table stays one row per record.
+    fn markdown(&self, rows: &[Vec<String>]) -> String {
+        let cell = |v: &str| v.replace('|', "\\|").replace(['\n', '\r'], " ");
+        let mut out = format!(
+            "| {} |\n",
+            self.columns.iter().map(|c| cell(c)).collect::<Vec<_>>().join(" | ")
+        );
+        out.push_str(&format!(
+            "| {} |\n",
+            self.columns.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")
+        ));
+        for r in rows {
+            out.push_str(&format!(
+                "| {} |\n",
+                r.iter().map(|v| cell(v)).collect::<Vec<_>>().join(" | ")
+            ));
+        }
+        out
+    }
+
+    /// One record as a JSON object keyed by column name. Assembled by hand
+    /// (serde_json's `Map` sorts its keys) so the fields keep the result set's
+    /// column order. Values stay strings — the panel only ever holds their
+    /// display text, so typing them here would be guesswork.
+    fn json_object(&self, row: &[String]) -> String {
+        let quote = |s: &str| serde_json::Value::String(s.to_string()).to_string();
+        let fields: Vec<String> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let v = row.get(i).map(String::as_str).unwrap_or_default();
+                format!("{}: {}", quote(c), quote(v))
+            })
+            .collect();
+        format!("{{{}}}", fields.join(", "))
+    }
 }
 
 /// The result of a free-hand statement run from the raw SQL pane. Row-returning
@@ -745,4 +886,65 @@ fn escape_mysql_string(s: &str) -> String {
 /// schema/name rather than binding them.
 fn escape_mysql_ident(s: &str) -> String {
     s.replace('`', "``")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> QueryResult {
+        QueryResult {
+            columns: vec!["id".into(), "note".into()],
+            rows: vec![
+                vec!["1".into(), "plain".into()],
+                vec!["2".into(), "has, comma \"and\" quote".into()],
+            ],
+        }
+    }
+
+    #[test]
+    fn csv_quotes_only_where_needed() {
+        assert_eq!(
+            sample().to_clipboard(CopyFormat::Csv),
+            "id,note\n1,plain\n2,\"has, comma \"\"and\"\" quote\"\n",
+        );
+    }
+
+    #[test]
+    fn tsv_flattens_embedded_tabs_and_newlines() {
+        let r = QueryResult {
+            columns: vec!["c".into()],
+            rows:    vec![vec!["a\tb\nc".into()]],
+        };
+        assert_eq!(r.to_clipboard(CopyFormat::Tsv), "c\na b c\n");
+    }
+
+    #[test]
+    fn markdown_escapes_pipes() {
+        let r = QueryResult {
+            columns: vec!["c".into()],
+            rows:    vec![vec!["a|b".into()]],
+        };
+        assert_eq!(r.to_clipboard(CopyFormat::Markdown), "| c |\n| --- |\n| a\\|b |\n");
+    }
+
+    #[test]
+    fn json_keeps_column_order() {
+        let r = QueryResult {
+            columns: vec!["z".into(), "a".into()],
+            rows:    vec![vec!["1".into(), "2".into()]],
+        };
+        assert_eq!(r.to_clipboard(CopyFormat::Json), "[\n  {\"z\": \"1\", \"a\": \"2\"}\n]");
+    }
+
+    #[test]
+    fn single_record_keeps_header_but_json_is_a_bare_object() {
+        let r = sample();
+        assert_eq!(r.row_to_clipboard(0, CopyFormat::Csv).unwrap(), "id,note\n1,plain\n");
+        assert_eq!(
+            r.row_to_clipboard(0, CopyFormat::Json).unwrap(),
+            "{\"id\": \"1\", \"note\": \"plain\"}",
+        );
+        assert!(r.row_to_clipboard(9, CopyFormat::Csv).is_none());
+    }
 }

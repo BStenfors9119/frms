@@ -22,6 +22,23 @@ impl Shell for Sys {
         ("/bin/sh".to_string(), vec!["-c".to_string(), script])
     }
 
+    fn install_shell(command: &str) -> (String, Vec<String>) {
+        // Single-quote a string for safe inclusion in a `sh -c` script.
+        fn sq(s: &str) -> String {
+            format!("'{}'", s.replace('\'', "'\\''"))
+        }
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        // Run the install command, print a divider, then hand off to an
+        // interactive login shell so the user lands ready to sign in. The
+        // command itself is *not* quoted — it's meant to be interpreted by the
+        // shell (pipes, redirects); only the trailing `exec <shell>` is quoted.
+        let script = format!(
+            "{command}; printf '\\n%s\\n' '--- install finished; you can sign in now ---'; exec {}",
+            sq(&shell),
+        );
+        ("/bin/sh".to_string(), vec!["-c".to_string(), script])
+    }
+
     fn terminal_env() -> Vec<(String, String)> {
         // CommandBuilder inherits the parent env verbatim and sets no TERM of
         // its own. When the IDE is launched from a desktop entry (rather than a

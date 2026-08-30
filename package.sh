@@ -54,18 +54,22 @@ case "$FMT" in
     *) echo "usage: ./package.sh rpm|exe|all [--bump=major|minor|patch] [--skip-build] [--publish]"; exit 1 ;;
 esac
 
-# The version lives in the same control file _release.sh reads/bumps, keeping the
-# .rpm/.exe in lock-step with the .deb.
+# Cargo.toml is the single source of truth for the version — it's what the built
+# binary reports (`frms --version` / Profile tab, via src/version.rs), so reading
+# it here keeps the artifact names honest about what's inside them. The deb
+# control file is a mirror, rewritten on every bump so the .deb stays in
+# lock-step with the .rpm/.exe (_package/_release.sh reads Cargo.toml too).
+CARGO_TOML="$SCRIPT_DIR/Cargo.toml"
 CONTROL="$SCRIPT_DIR/_package/frms/DEBIAN/control"
-[ -f "$CONTROL" ] || { echo "version source not found: $CONTROL (same file _release.sh uses)."; exit 1; }
+[ -f "$CARGO_TOML" ] || { echo "version source not found: $CARGO_TOML."; exit 1; }
 
-# Optionally bump the semver in the control file *before* reading it, so the
-# build, artifact names, and GitHub tag all use the new version. Mirrors
-# _package/_release.sh's bump (file edit only — no git commit/tag here).
+# Optionally bump the semver *before* reading it, so the build, artifact names,
+# and GitHub tag all use the new version. Mirrors _package/_release.sh's bump
+# (file edit only — no git commit/tag here).
 if [ -n "$BUMP" ]; then
-    cur="$(grep -m1 '^Version:' "$CONTROL" | awk '{print $2}')"
+    cur="$(grep -m1 '^version' "$CARGO_TOML" | sed -E 's/.*"([^"]+)".*/\1/')"
     echo "$cur" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' \
-        || { echo "current version '$cur' in $CONTROL is not semver (major.minor.patch)."; exit 1; }
+        || { echo "current version '$cur' in $CARGO_TOML is not semver (major.minor.patch)."; exit 1; }
     IFS=. read -r MA MI PA <<< "$cur"
     case "$BUMP" in
         major) MA=$((MA + 1)); MI=0; PA=0 ;;
@@ -74,12 +78,20 @@ if [ -n "$BUMP" ]; then
         *) echo "--bump must be major, minor, or patch (got '$BUMP')."; exit 1 ;;
     esac
     NEW="$MA.$MI.$PA"
-    sed -i "s/^Version: .*/Version: $NEW/" "$CONTROL"
-    echo "Bumped version: $cur → $NEW  ($CONTROL; commit + tag when ready)"
+    # Only the [package] version: it's the first `^version` line in the file.
+    sed -i "0,/^version = /s/^version = .*/version = \"$NEW\"/" "$CARGO_TOML"
+    (cd "$SCRIPT_DIR" && cargo update --workspace --offline >/dev/null 2>&1) || true
+    echo "Bumped version: $cur → $NEW  ($CARGO_TOML; commit + tag when ready)"
 fi
 
-VERSION="$(grep -m1 '^Version:' "$CONTROL" | awk '{print $2}')"
-[ -n "$VERSION" ] || { echo "could not read Version: from $CONTROL."; exit 1; }
+VERSION="$(grep -m1 '^version' "$CARGO_TOML" | sed -E 's/.*"([^"]+)".*/\1/')"
+[ -n "$VERSION" ] || { echo "could not read version from $CARGO_TOML."; exit 1; }
+# Mirror into the deb control file so a later _release.sh / build-deb.sh run
+# can't ship a .deb stamped with a version the binary doesn't report.
+if [ -f "$CONTROL" ] && [ "$(grep -m1 '^Version:' "$CONTROL" | awk '{print $2}')" != "$VERSION" ]; then
+    sed -i "s/^Version: .*/Version: $VERSION/" "$CONTROL"
+    echo "Synced $CONTROL to version $VERSION"
+fi
 DIST="$SCRIPT_DIR/dist"
 WIN_TARGET="x86_64-pc-windows-msvc"
 STAGE="$(mktemp -d)"
@@ -176,6 +188,14 @@ EOF
 # need the npm-distributed `claude` CLI, which a distro package can't pull in;
 # this one-shot command installs Node.js/npm + Claude Code and offers sign-in.
 install -Dm755 "$SCRIPT_DIR/scripts/setup-claude.sh" "$STAGE/usr/bin/frms-setup-claude"
+
+# Ship the Cloud SQL Proxy setup helper as `frms-setup-cloud-sql-proxy`. The
+# Database tool's GCP Cloud SQL section starts Google's proxy, which is a
+# single binary published to a Google bucket rather than a distro package; this
+# command downloads it, verifies its published checksum, and puts it on PATH
+# where frms finds it with nothing to configure.
+install -Dm755 "$SCRIPT_DIR/scripts/setup-cloud-sql-proxy.sh" \
+    "$STAGE/usr/bin/frms-setup-cloud-sql-proxy"
 fi  # ── end rpm staging ──
 
 mkdir -p "$DIST"
@@ -236,6 +256,7 @@ cp -a %{stageroot}/usr %{buildroot}/
 %files
 /usr/bin/frms
 /usr/bin/frms-setup-claude
+/usr/bin/frms-setup-cloud-sql-proxy
 /usr/share/applications/frms.desktop
 /usr/share/icons/hicolor/256x256/apps/frms.png
 
@@ -247,6 +268,10 @@ command -v gtk-update-icon-cache >/dev/null 2>&1 && \
 if ! command -v claude >/dev/null 2>&1; then
     echo "frms: Build/agent panes need the Claude Code CLI (not a distro package)."
     echo "      Run once to install it:  frms-setup-claude"
+fi
+if ! command -v cloud-sql-proxy >/dev/null 2>&1; then
+    echo "frms: GCP Cloud SQL connections need Google's Cloud SQL Auth Proxy."
+    echo "      Run once to install it:  frms-setup-cloud-sql-proxy"
 fi
 
 %postun

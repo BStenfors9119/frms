@@ -32,6 +32,27 @@ pub struct Container {
     pub parent: Option<u64>,
 }
 
+/// One entry in a "move to …" pick-list: a container (or the top level, when
+/// `id` is `None`) shown by its full path. `PartialEq` ignores the label so a
+/// rename mid-frame can't unselect the current pick.
+#[derive(Debug, Clone, Eq)]
+pub struct ContainerChoice {
+    pub id:    Option<u64>,
+    pub label: String,
+}
+
+impl PartialEq for ContainerChoice {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl std::fmt::Display for ContainerChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
 /// A single TSR receiver reachable over SSH. `container` names the owning
 /// container.
 #[derive(Debug, Clone)]
@@ -269,6 +290,9 @@ pub struct ReceiversState {
     pub ssh:     Vec<SshTerminal>,
     /// Last copy/import outcome line shown in the panel.
     pub status:  Option<Result<String, String>>,
+    /// Collapse the credential form + connect actions so a live SSH terminal
+    /// can use the full panel height. Toggled from the detail view header.
+    pub connection_collapsed: bool,
     next_id:     u64,
     /// File this inventory persists to, captured once at `load()`. `None`
     /// disables saving entirely — tests construct state with `None` (or a temp
@@ -305,6 +329,7 @@ impl ReceiversState {
             import:  None,
             ssh:     Vec::new(),
             status:  None,
+            connection_collapsed: false,
             next_id,
             persist_path: receivers_path(),
         }
@@ -344,6 +369,18 @@ impl ReceiversState {
         self.receivers.iter().filter(|r| r.container == container).collect()
     }
 
+    /// Every receiver held by `container` *or any sub-location beneath it*, in
+    /// the tree's own order. Backs the bulk connect/disconnect actions, where
+    /// "this client" means the whole branch, not just its top level.
+    pub fn receivers_under(&self, container: u64) -> Vec<&Receiver> {
+        let branch = self.subtree(container);
+        let mut out: Vec<&Receiver> = self.receivers.iter()
+            .filter(|r| branch.contains(&r.container))
+            .collect();
+        out.sort_by_key(|r| node_sort_key(&r.name));
+        out
+    }
+
     pub fn container_by_id(&self, id: u64) -> Option<&Container> {
         self.containers.iter().find(|c| c.id == id)
     }
@@ -363,6 +400,78 @@ impl ReceiversState {
     pub fn toggle_expanded(&mut self, id: u64) {
         if !self.expanded.remove(&id) {
             self.expanded.insert(id);
+        }
+    }
+
+    /// `id` plus every container transitively beneath it. Used both to delete a
+    /// subtree and to keep a move from parenting a container to its own
+    /// descendant (which would orphan the whole branch into a cycle).
+    pub fn subtree(&self, id: u64) -> Vec<u64> {
+        let mut out = vec![id];
+        let mut i = 0;
+        while i < out.len() {
+            let parent = out[i];
+            for c in &self.containers {
+                if c.parent == Some(parent) {
+                    out.push(c.id);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Full path to a container, root-first (`"HQ / Blue Skinny"`). Disambiguates
+    /// same-named locations under different clients in the move pick-lists.
+    pub fn container_path(&self, id: u64) -> String {
+        let mut parts = Vec::new();
+        let mut cur = Some(id);
+        // Bounded by the container count so a corrupt parent cycle can't hang us.
+        while let Some(c) = cur.and_then(|c| self.container_by_id(c)) {
+            parts.push(c.name.as_str());
+            cur = c.parent;
+            if parts.len() > self.containers.len() {
+                break;
+            }
+        }
+        parts.reverse();
+        parts.join(" / ")
+    }
+
+    /// Every container as a "move to …" choice, in the same depth-first order
+    /// the tree renders. `exclude` drops a container and its descendants (an
+    /// illegal destination for that container); `include_root` prepends the
+    /// top-level choice, which only containers may be moved to.
+    pub fn container_choices(&self, exclude: Option<u64>, include_root: bool) -> Vec<ContainerChoice> {
+        let banned: Vec<u64> = exclude.map(|id| self.subtree(id)).unwrap_or_default();
+        let mut out = Vec::new();
+        if include_root {
+            out.push(ContainerChoice { id: None, label: "(top level)".to_string() });
+        }
+        let mut roots = self.root_containers();
+        roots.sort_by_key(|c| node_sort_key(&c.name));
+        let mut stack: Vec<u64> = roots.iter().rev().map(|c| c.id).collect();
+        while let Some(id) = stack.pop() {
+            if !banned.contains(&id) {
+                out.push(ContainerChoice { id: Some(id), label: self.container_path(id) });
+            }
+            let mut kids = self.child_containers(id);
+            kids.sort_by_key(|c| node_sort_key(&c.name));
+            // Reversed: the stack pops last-in first, so this keeps the visual
+            // order and puts a container's children directly beneath it.
+            for kid in kids.into_iter().rev() {
+                stack.push(kid.id);
+            }
+        }
+        out
+    }
+
+    /// The choice matching `id`, so a pick-list can show the current location
+    /// even when the list was built with an exclusion.
+    pub fn choice_for(&self, id: Option<u64>) -> ContainerChoice {
+        match id.and_then(|c| self.container_by_id(c)).map(|c| c.id) {
+            Some(c) => ContainerChoice { id: Some(c), label: self.container_path(c) },
+            None    => ContainerChoice { id: None, label: "(top level)".to_string() },
         }
     }
 
@@ -405,18 +514,7 @@ impl ReceiversState {
     /// Delete a container and everything beneath it (descendant containers and
     /// their receivers).
     pub fn delete_container(&mut self, id: u64) {
-        // Gather the subtree of container ids (id plus all transitive children).
-        let mut doomed = vec![id];
-        let mut i = 0;
-        while i < doomed.len() {
-            let parent = doomed[i];
-            for c in &self.containers {
-                if c.parent == Some(parent) {
-                    doomed.push(c.id);
-                }
-            }
-            i += 1;
-        }
+        let doomed = self.subtree(id);
         self.receivers.retain(|r| !doomed.contains(&r.container));
         self.containers.retain(|c| !doomed.contains(&c.id));
         for d in &doomed { self.expanded.remove(d); }
@@ -435,6 +533,89 @@ impl ReceiversState {
             self.clear_receiver_selection();
         }
         self.save();
+    }
+
+    /// Reparent a receiver into `to`. Any live SSH session follows it — sessions
+    /// are keyed by receiver id, not by container.
+    pub fn move_receiver(&mut self, id: u64, to: u64) {
+        if self.container_by_id(to).is_none() {
+            return;
+        }
+        let Some(r) = self.receivers.iter_mut().find(|r| r.id == id) else { return; };
+        if r.container == to {
+            return;
+        }
+        r.container = to;
+        self.reveal(to);
+        if self.selected_receiver == Some(id) {
+            self.selected_container = Some(to);
+        }
+        self.save();
+    }
+
+    /// Move every receiver held *directly* by `from` into `to`, leaving child
+    /// containers where they are. Returns how many moved — this is the bulk
+    /// case: receivers parked at a location's root that belong in a sub-location.
+    pub fn move_receivers_in(&mut self, from: u64, to: u64) -> usize {
+        if from == to || self.container_by_id(to).is_none() {
+            return 0;
+        }
+        let mut moved = 0;
+        for r in &mut self.receivers {
+            if r.container == from {
+                r.container = to;
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.reveal(to);
+            if let Some(sel) = self.selected_receiver() {
+                self.selected_container = Some(sel.container);
+            }
+            self.save();
+        }
+        moved
+    }
+
+    /// Reparent a container under `to` (`None` = top level). Refuses to move a
+    /// container into itself or one of its own descendants, which would detach
+    /// that whole branch from the tree. Returns whether the move happened.
+    pub fn move_container(&mut self, id: u64, to: Option<u64>) -> bool {
+        if to == Some(id) || self.container_by_id(id).is_none() {
+            return false;
+        }
+        if let Some(dest) = to {
+            if self.container_by_id(dest).is_none() || self.subtree(id).contains(&dest) {
+                return false;
+            }
+        }
+        let Some(c) = self.containers.iter_mut().find(|c| c.id == id) else { return false; };
+        if c.parent == to {
+            return false;
+        }
+        c.parent = to;
+        if let Some(dest) = to {
+            self.reveal(dest);
+        }
+        self.expanded.insert(id);
+        self.save();
+        true
+    }
+
+    /// Expand `id` and every container above it so a just-moved node is visible
+    /// in the tree rather than hidden inside a collapsed branch.
+    fn reveal(&mut self, id: u64) {
+        let mut cur = Some(id);
+        let mut hops = 0;
+        while let Some(c) = cur.and_then(|c| self.container_by_id(c)) {
+            let (cid, parent) = (c.id, c.parent);
+            self.expanded.insert(cid);
+            cur = parent;
+            hops += 1;
+            if hops > self.containers.len() {
+                break;
+            }
+        }
     }
 
     pub fn select_container(&mut self, id: u64) {
@@ -534,6 +715,20 @@ impl ReceiversState {
     /// other clients' sessions untouched.
     pub fn remove_ssh_for(&mut self, receiver: u64) {
         self.ssh.retain(|t| t.receiver != receiver);
+    }
+
+    /// True when `receiver` has a session whose ssh process is still running.
+    /// An exited pane doesn't count — bulk connect should retry those.
+    pub fn is_connected(&self, receiver: u64) -> bool {
+        self.ssh.iter().any(|t| t.receiver == receiver && !t.exited)
+    }
+
+    /// Drop every session belonging to `receivers`, returning how many went
+    /// away. Backs "Disconnect All" over a container's branch.
+    pub fn remove_ssh_many(&mut self, receivers: &[u64]) -> usize {
+        let before = self.ssh.len();
+        self.ssh.retain(|t| !receivers.contains(&t.receiver));
+        before - self.ssh.len()
     }
 
     // ── import flow ─────────────────────────────────────────────────────────
@@ -691,6 +886,24 @@ impl ReceiversState {
     }
 }
 
+/// Ordering key for a tree node name (client, location, or receiver):
+/// digit-prefixed names sort ahead of alphabetical ones, and any leading number
+/// is zero-padded to a fixed width so single digits stay in numeric order
+/// (e.g. "2" before "10"). Shared by the tree rows and the move pick-lists so
+/// both present the inventory in the same order.
+pub fn node_sort_key(name: &str) -> String {
+    let trimmed = name.trim_start();
+    let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        // Group 1: alpha (or anything non-numeric), compared case-insensitively.
+        format!("1{}", trimmed.to_lowercase())
+    } else {
+        // Group 0: leading number zero-padded so "2" sorts before "10".
+        let rest = &trimmed[digits.len()..];
+        format!("0{:0>12}{}", digits, rest.to_lowercase())
+    }
+}
+
 /// Guess a field mapping from column names so an obvious schema needs no manual
 /// mapping. Case-insensitive substring matches; the host match is intentionally
 /// strict so a `username` column isn't mistaken for `host`.
@@ -809,6 +1022,7 @@ mod tests {
             import:  None,
             ssh:     Vec::new(),
             status:  None,
+            connection_collapsed: false,
             next_id: 1,
             // No persistence: keeps mutating tests from clobbering the real
             // ~/.frms/receivers.json. The disk path is exercised separately by
@@ -845,6 +1059,88 @@ mod tests {
         assert!(s.receiver_by_id(r1).is_none());
         // An unrelated root container survives.
         assert!(s.container_by_id(other).is_some());
+    }
+
+    #[test]
+    fn move_receiver_reparents_and_reveals_destination() {
+        let mut s = empty_state();
+        let hq   = s.add_container(None);
+        let blue = s.add_container(Some(hq));
+        let r    = s.add_receiver(hq);          // parked at HQ's root
+        s.expanded.remove(&blue);               // destination starts collapsed
+        s.select_receiver(r);
+        s.move_receiver(r, blue);
+        assert_eq!(s.receiver_by_id(r).unwrap().container, blue);
+        assert!(s.receivers_in(hq).is_empty());
+        // The destination (and its ancestors) are expanded so the row is visible.
+        assert!(s.is_expanded(blue) && s.is_expanded(hq));
+        assert_eq!(s.selected_container, Some(blue));
+        // An unknown destination is a no-op rather than a lost receiver.
+        s.move_receiver(r, 9999);
+        assert_eq!(s.receiver_by_id(r).unwrap().container, blue);
+    }
+
+    #[test]
+    fn move_receivers_in_moves_only_direct_children() {
+        let mut s = empty_state();
+        let hq   = s.add_container(None);
+        let blue = s.add_container(Some(hq));
+        let r1   = s.add_receiver(hq);
+        let r2   = s.add_receiver(hq);
+        let deep = s.add_receiver(blue);        // already nested; must not double-move
+        assert_eq!(s.move_receivers_in(hq, blue), 2);
+        assert!(s.receivers_in(hq).is_empty());
+        assert_eq!(s.receivers_in(blue).len(), 3);
+        for id in [r1, r2, deep] {
+            assert_eq!(s.receiver_by_id(id).unwrap().container, blue);
+        }
+        // Nothing left to move, and self-moves are refused.
+        assert_eq!(s.move_receivers_in(hq, blue), 0);
+        assert_eq!(s.move_receivers_in(blue, blue), 0);
+    }
+
+    #[test]
+    fn move_container_refuses_self_and_descendants() {
+        let mut s = empty_state();
+        let hq    = s.add_container(None);
+        let blue  = s.add_container(Some(hq));
+        let inner = s.add_container(Some(blue));
+        let other = s.add_container(None);
+
+        // Into itself or its own subtree: refused, tree unchanged.
+        assert!(!s.move_container(hq, Some(hq)));
+        assert!(!s.move_container(hq, Some(inner)));
+        assert_eq!(s.container_by_id(hq).unwrap().parent, None);
+
+        // A legal reparent, then promotion back to the top level.
+        assert!(s.move_container(blue, Some(other)));
+        assert_eq!(s.container_by_id(blue).unwrap().parent, Some(other));
+        assert_eq!(s.container_by_id(inner).unwrap().parent, Some(blue)); // follows along
+        assert!(s.move_container(blue, None));
+        assert_eq!(s.container_by_id(blue).unwrap().parent, None);
+        // Already there → no change reported.
+        assert!(!s.move_container(blue, None));
+    }
+
+    #[test]
+    fn container_path_and_choices_walk_the_tree() {
+        let mut s = empty_state();
+        let hq   = s.add_container(None);
+        let blue = s.add_container(Some(hq));
+        s.rename_container(hq, "HQ".into());
+        s.rename_container(blue, "Blue Skinny".into());
+        assert_eq!(s.container_path(blue), "HQ / Blue Skinny");
+
+        // Depth-first: a parent is immediately followed by its children.
+        let all = s.container_choices(None, false);
+        assert_eq!(
+            all.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(),
+            vec!["HQ", "HQ / Blue Skinny"],
+        );
+        // Excluding HQ drops its whole subtree; the root option leads the list.
+        let limited = s.container_choices(Some(hq), true);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, None);
     }
 
     #[test]
@@ -1051,6 +1347,38 @@ mod tests {
         s.remove_ssh_for(100);
         assert!(!s.has_ssh(1));
         assert!(s.has_ssh(2));
+    }
+
+    #[test]
+    fn receivers_under_walks_the_whole_branch() {
+        let mut s = empty_state();
+        let client = s.add_container(None);
+        let site   = s.add_container(Some(client));
+        let other  = s.add_container(None);
+        let a = s.add_receiver(client);
+        let b = s.add_receiver(site);
+        let c = s.add_receiver(other);
+
+        let ids: Vec<u64> = s.receivers_under(client).iter().map(|r| r.id).collect();
+        assert!(ids.contains(&a) && ids.contains(&b), "sub-locations are included");
+        assert!(!ids.contains(&c), "a sibling client is not");
+        // The direct-children query stays narrow.
+        assert_eq!(s.receivers_in(client).len(), 1);
+    }
+
+    #[test]
+    fn bulk_ssh_targets_only_the_branch() {
+        let mut s = empty_state();
+        s.set_ssh(fake_ssh(1, 100, true));
+        s.set_ssh(fake_ssh(2, 200, false));
+        assert!(s.is_connected(100));
+        // An exited pane is not "connected" — Connect All retries it.
+        s.ssh.iter_mut().find(|t| t.receiver == 100).unwrap().exited = true;
+        assert!(!s.is_connected(100));
+
+        assert_eq!(s.remove_ssh_many(&[100, 999]), 1);
+        assert!(!s.has_ssh(1));
+        assert!(s.has_ssh(2), "a receiver outside the branch keeps its session");
     }
 
     #[test]

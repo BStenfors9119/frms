@@ -4,7 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 use iced::widget::{combo_box, text_editor};
 
-use crate::db::{DbClient, DbConfig, DbEngine, ForeignKey, QueryResult, RoutineRef, TableRef};
+use crate::cloud_sql::{ProxySpec, ProxyState, PROXY_ADDRESS};
+use crate::db::{
+    CopyFormat, DbClient, DbConfig, DbEngine, ForeignKey, QueryResult, RoutineRef, TableRef,
+};
 use crate::db_history::DbHistory;
 
 #[derive(Debug, Clone)]
@@ -156,6 +159,12 @@ pub struct DbPanel {
     pub config:            DbConfig,
     /// Current connection state.
     pub conn_state:        ConnState,
+    /// Generation counter for the live connection, bumped by every connect and
+    /// every teardown. Async results carry the epoch they were issued under and
+    /// are dropped when it no longer matches — so a request left hanging by a
+    /// dead connection can't land on (and un-stick or re-stick) a panel the user
+    /// has since reset.
+    pub epoch:             u64,
     /// Live client handle once connected.
     pub client:            Option<DbClient>,
     /// All tables visible to the connected user.
@@ -209,6 +218,12 @@ pub struct DbPanel {
     pub query_error:       Option<String>,
     /// True while a query is in flight.
     pub query_running:     bool,
+    /// Format used when the results table or one of its records is copied to
+    /// the clipboard. Chosen in the Results header; applies to both.
+    pub copy_format:       CopyFormat,
+    /// Confirmation of the last copy (e.g. "Copied 42 rows as CSV"), shown in
+    /// the Results header. Cleared whenever a new result set arrives.
+    pub copy_notice:       Option<String>,
     /// Status line for a statement that returned no rows (e.g. "3 rows
     /// affected"), set when a raw-SQL command completes. Shown in the results
     /// row in place of a table; cleared whenever a row-returning query runs.
@@ -239,6 +254,15 @@ pub struct DbPanel {
     pub port_combo:        combo_box::State<String>,
     pub database_combo:    combo_box::State<String>,
     pub user_combo:        combo_box::State<String>,
+    pub instance_combo:    combo_box::State<String>,
+    /// The Cloud SQL Auth Proxy this panel manages, if any. Only reachable
+    /// while the provider is GCP Cloud SQL, but kept across a provider change
+    /// so a running proxy is never silently orphaned.
+    pub proxy:             ProxyState,
+    /// Collapsed state of the Cloud SQL section inside the connection form.
+    /// Starts expanded so the proxy controls are visible the first time the
+    /// provider is switched to Cloud SQL.
+    pub proxy_collapsed:   bool,
 }
 
 impl Default for DbPanel {
@@ -253,8 +277,12 @@ impl Default for DbPanel {
             port_combo:       combo_box::State::new(history.port.clone()),
             database_combo:   combo_box::State::new(history.database.clone()),
             user_combo:       combo_box::State::new(history.user.clone()),
+            instance_combo:   combo_box::State::new(history.instance.clone()),
+            proxy:            ProxyState::default(),
+            proxy_collapsed:  false,
             config,
             conn_state:       ConnState::Disconnected,
+            epoch:            0,
             client:           None,
             tables:           Vec::new(),
             foreign_keys:     Vec::new(),
@@ -276,6 +304,8 @@ impl Default for DbPanel {
             query_result:     None,
             query_error:      None,
             query_running:    false,
+            copy_format:      CopyFormat::default(),
+            copy_notice:      None,
             statement_status: None,
             sql_mode:         false,
             sql_input:        text_editor::Content::new(),
@@ -289,6 +319,55 @@ impl Default for DbPanel {
 }
 
 impl DbPanel {
+    /// Invalidate every request currently in flight. Returns the new epoch,
+    /// which the caller stamps onto any request it issues next.
+    pub fn bump_epoch(&mut self) -> u64 {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch
+    }
+
+    /// True when `epoch` was issued by the current connection — i.e. an arriving
+    /// async result still belongs to the state the panel is in.
+    pub fn is_current(&self, epoch: u64) -> bool {
+        self.epoch == epoch
+    }
+
+    /// Drop the connection and everything derived from it, leaving the panel in
+    /// a clean disconnected state with the form still filled in so the user can
+    /// reconnect in one click.
+    ///
+    /// This is the recovery path when the connection dies underneath us: it
+    /// clears the in-flight flags (`query_running`, `routine_loading`,
+    /// `loading_columns`) that would otherwise leave the tool wedged waiting on
+    /// replies that will never come, and bumps the epoch so those replies are
+    /// ignored if they do eventually arrive. Query-builder choices that don't
+    /// depend on a live schema (filters, grouping, limit, the raw SQL buffer)
+    /// are deliberately kept.
+    pub fn reset_connection(&mut self) {
+        self.bump_epoch();
+        self.client     = None;
+        self.conn_state = ConnState::Disconnected;
+        self.tables.clear();
+        self.foreign_keys.clear();
+        self.routines.clear();
+        self.selected_routine = None;
+        self.routine_code     = None;
+        self.routine_loading  = false;
+        self.selected_tables.clear();
+        self.columns_by_table.clear();
+        self.loading_columns.clear();
+        self.selected_cols.clear();
+        self.joins.clear();
+        self.dragging_field   = None;
+        self.query_result     = None;
+        self.query_error      = None;
+        self.query_running    = false;
+        self.statement_status = None;
+        self.copy_notice      = None;
+        // Reopen the form so the user can reconnect.
+        self.form_collapsed = false;
+    }
+
     /// Promote the current form values into the persisted per-field history
     /// and rebuild the combo-box option lists so newly-added entries appear
     /// at the top of each dropdown on the next click.
@@ -299,12 +378,57 @@ impl DbPanel {
             &port_s,
             &self.config.database,
             &self.config.user,
+            &self.config.cloud_sql_instance,
         );
         self.history.save();
         self.host_combo     = combo_box::State::new(self.history.host.clone());
         self.port_combo     = combo_box::State::new(self.history.port.clone());
         self.database_combo = combo_box::State::new(self.history.database.clone());
         self.user_combo     = combo_box::State::new(self.history.user.clone());
+        self.instance_combo = combo_box::State::new(self.history.instance.clone());
+    }
+
+    /// The launch spec for this connection's proxy: the credentials file comes
+    /// from prefs, the instance and local port from the form, and the binary
+    /// resolves itself at spawn time. The proxy always listens on loopback —
+    /// exposing a Cloud SQL instance on a routable address is not something the
+    /// panel should be able to do by accident.
+    pub fn proxy_spec(&self, credentials: &str) -> ProxySpec {
+        ProxySpec {
+            binary:      String::new(),
+            credentials: credentials.trim().to_string(),
+            instance:    self.config.cloud_sql_instance.trim().to_string(),
+            address:     String::from(PROXY_ADDRESS),
+            // A blank port field parses to 0; fall back to the engine default
+            // so Start doesn't fail on a technicality.
+            port:        match self.config.port {
+                0 => self.config.engine.default_port(),
+                n => n,
+            },
+        }
+    }
+
+    /// Whether the Cloud SQL section applies — the proxy only makes sense for
+    /// a managed GCP instance.
+    pub fn cloud_sql(&self) -> bool {
+        self.config.provider == crate::db::DbProvider::GcpCloudSql
+    }
+
+    /// Whether the Cloud SQL section should be rendered. Normally that's just
+    /// "the provider is GCP", but a proxy that is up (or coming up) keeps the
+    /// section on screen whatever the provider now says — switching the picker
+    /// must never strand a running child with no Stop button.
+    pub fn show_cloud_sql(&self) -> bool {
+        self.cloud_sql() || self.proxy.running().is_some() || self.proxy.is_starting()
+    }
+
+    /// Kill the managed proxy, if one is running, and reset the section to
+    /// Stopped. Called by the Stop button, by session close, and at shutdown.
+    pub fn stop_proxy(&mut self) {
+        if let Some(p) = self.proxy.running() {
+            p.kill();
+        }
+        self.proxy = ProxyState::Stopped;
     }
 
     /// Engine of the live connection, falling back to the form's configured
@@ -529,5 +653,72 @@ impl DbPanel {
             }
         }
         clause
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reset must clear every "waiting on the server" flag — those are what
+    /// leave the tool wedged when the connection dies mid-request.
+    #[test]
+    fn reset_unsticks_a_panel_waiting_on_a_dead_connection() {
+        let mut p = DbPanel::default();
+        p.conn_state = ConnState::Connecting;
+        p.query_running   = true;
+        p.routine_loading = true;
+        p.loading_columns.insert("public.orders".to_string());
+        p.selected_tables.push("public.orders".to_string());
+        p.form_collapsed = true;
+
+        p.reset_connection();
+
+        assert!(matches!(p.conn_state, ConnState::Disconnected));
+        assert!(!p.query_running);
+        assert!(!p.routine_loading);
+        assert!(p.loading_columns.is_empty());
+        assert!(p.selected_tables.is_empty());
+        assert!(p.client.is_none());
+        // Form is reopened so reconnecting is one click away.
+        assert!(!p.form_collapsed);
+    }
+
+    /// Replies issued before a reset must be ignored afterwards, or a hung
+    /// request landing late would revive a connection the user tore down.
+    #[test]
+    fn reset_invalidates_requests_already_in_flight() {
+        let mut p = DbPanel::default();
+        let in_flight = p.epoch;
+        assert!(p.is_current(in_flight));
+
+        p.reset_connection();
+
+        assert!(!p.is_current(in_flight));
+        assert!(p.is_current(p.epoch));
+    }
+
+    /// The connection form keeps its values across a reset — the point is to
+    /// recover the connection, not to retype it.
+    #[test]
+    fn reset_keeps_form_values_and_schema_independent_builder_state() {
+        let mut p = DbPanel::default();
+        p.config.host     = "db.internal".to_string();
+        p.config.database = "sales".to_string();
+        p.limit_input     = "50".to_string();
+        p.filters.push(Filter {
+            table:  "public.orders".to_string(),
+            column: "id".to_string(),
+            op:     FilterOp::Eq,
+            value:  "7".to_string(),
+            conj:   Conj::And,
+        });
+
+        p.reset_connection();
+
+        assert_eq!(p.config.host, "db.internal");
+        assert_eq!(p.config.database, "sales");
+        assert_eq!(p.limit_input, "50");
+        assert_eq!(p.filters.len(), 1);
     }
 }

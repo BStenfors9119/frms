@@ -1,21 +1,24 @@
 //! Right-side plugin panel UI — tab control hosting DB / Profile / Notes.
 
-use iced::{Alignment, Background, Border, Color, Element, Font, Length, Theme};
+use iced::{padding, Alignment, Background, Border, Color, Element, Font, Length, Theme};
 use iced::widget::{
-    button, column, container, mouse_area, pick_list, row, scrollable, text, text_editor,
+    button, column, container, mouse_area, pick_list, row, scrollable, stack, text, text_editor,
     text_input, Column, Space,
 };
 
+use crate::agent::AiTool;
 use crate::app::Message;
 use crate::db::TableRef;
+use crate::docs::DocsState;
 use crate::fonts::{ICON_FONT, UI_FONT};
-use crate::notes::{NoteFormat, NoteViewMode, NotesState};
+use crate::notes::{CategoryChoice, Note, NoteFormat, NoteViewMode, NotesState, UNCATEGORIZED_LABEL};
 use crate::plugin_panel::{DockSide, PluginPanel, PluginSlot, PluginTab};
 use crate::prefs::Prefs;
 use crate::receivers::ReceiversState;
 use crate::terminals::TerminalsState;
 use crate::theme::{FontScale, Mode, Palette, TerminalFontScale};
 use crate::ui::{buttons, with_tip};
+use crate::ui::docs_panel;
 use crate::ui::preview;
 use crate::ui::receivers_panel;
 use crate::ui::terminal as terminal_ui;
@@ -29,10 +32,10 @@ pub struct ReceiverCtx<'a> {
     pub font_scale:   TerminalFontScale,
 }
 
-/// What the Profile tab needs from the app beyond `Prefs`: whether the `claude`
-/// CLI is installed (Claude Code status) and whether usage telemetry is on.
+/// What the Profile tab needs from the app beyond `Prefs`: whether usage
+/// telemetry is on. Per-tool install status is probed live in the tools
+/// section ([`AiTool::on_path`]) since the tab only renders while open.
 pub struct ProfileCtx {
-    pub claude_installed:  bool,
     pub telemetry_enabled: bool,
 }
 
@@ -44,18 +47,26 @@ pub const TERMINAL_NAME_INPUT: &str = "terminal-plugin-name";
 /// `+ New` so the user can title the note, then Tab/Enter into the body.
 pub const NOTES_TITLE_INPUT: &str = "notes-title-input";
 
+/// Widget id for the Notes-plugin search field, so the Ctrl+Shift+G chord can
+/// open the tab with the caret already in it.
+pub const NOTES_SEARCH_INPUT: &str = "notes-search-input";
+
+/// Widget id for the "+ New category…" name field — focused when the user picks
+/// that entry from the category dropdown so they can type straight away.
+pub const NOTES_CATEGORY_INPUT: &str = "notes-category-input";
+
 const HANDLE_WIDTH: f32 = 5.0;
 
 pub fn view<'a>(
     panel:     &'a PluginPanel,
     prefs:     &'a Prefs,
     notes:     &'a NotesState,
+    docs:      &'a DocsState,
     project:   Option<&'a str>,
     terminals: &'a TerminalsState,
     receivers: &'a ReceiversState,
     db_connected: bool,
     db_tables: &'a [TableRef],
-    claude_installed: bool,
     telemetry_enabled: bool,
 ) -> Element<'a, Message> {
     let rctx = ReceiverCtx {
@@ -64,10 +75,10 @@ pub fn view<'a>(
         db_tables,
         font_scale:   prefs.terminal_font_scale,
     };
-    let pctx = ProfileCtx { claude_installed, telemetry_enabled };
+    let pctx = ProfileCtx { telemetry_enabled };
     let content: Element<'_, Message> = if panel.split {
-        let top    = slot_view(panel, PluginSlot::Top,    prefs, notes, project, terminals, &rctx, &pctx);
-        let bottom = slot_view(panel, PluginSlot::Bottom, prefs, notes, project, terminals, &rctx, &pctx);
+        let top    = slot_view(panel, PluginSlot::Top,    prefs, notes, docs, project, terminals, &rctx, &pctx);
+        let bottom = slot_view(panel, PluginSlot::Bottom, prefs, notes, docs, project, terminals, &rctx, &pctx);
         let divider = mouse_area(
             container(Space::new(Length::Fill, Length::Fixed(HANDLE_WIDTH)))
                 .width(Length::Fill)
@@ -86,31 +97,53 @@ pub fn view<'a>(
         .height(Length::Fill)
         .into()
     } else {
-        slot_view(panel, PluginSlot::Top, prefs, notes, project, terminals, &rctx, &pctx)
+        slot_view(panel, PluginSlot::Top, prefs, notes, docs, project, terminals, &rctx, &pctx)
     };
 
     let panel_body = container(content).width(Length::Fill).height(Length::Fill);
 
-    let handle = mouse_area(
-        container(Space::new(Length::Fixed(HANDLE_WIDTH), Length::Fill))
+    // Expanded to full width: there's no neighbouring pane to resize against, so
+    // drop the drag handle and let the body fill the window.
+    let base: Element<'a, Message> = if panel.expanded {
+        container(panel_body)
+            .width(Length::Fill)
             .height(Length::Fill)
-            .style(handle_bg),
-    )
-    .interaction(iced::mouse::Interaction::ResizingHorizontally)
-    .on_press(Message::PluginPanelResizeStart);
+            .style(panel_bg)
+            .into()
+    } else {
+        let handle = mouse_area(
+            container(Space::new(Length::Fixed(HANDLE_WIDTH), Length::Fill))
+                .height(Length::Fill)
+                .style(handle_bg),
+        )
+        .interaction(iced::mouse::Interaction::ResizingHorizontally)
+        .on_press(Message::PluginPanelResizeStart);
 
-    // The drag handle lives on the panel's *inner* edge: right of the body when
-    // docked left, left of the body when docked right.
-    let inner = match panel.dock {
-        DockSide::Left  => row![panel_body, handle],
-        DockSide::Right => row![handle, panel_body],
+        // The drag handle lives on the panel's *inner* edge: right of the body
+        // when docked left, left of the body when docked right.
+        let inner = match panel.dock {
+            DockSide::Left  => row![panel_body, handle],
+            DockSide::Right => row![handle, panel_body],
+        };
+
+        container(inner.spacing(0).width(Length::Fill).height(Length::Fill))
+            .width(Length::Fixed(panel.width))
+            .height(Length::Fill)
+            .style(panel_bg)
+            .into()
     };
 
-    container(inner.spacing(0).width(Length::Fill).height(Length::Fill))
-        .width(Length::Fixed(panel.width))
-        .height(Length::Fill)
-        .style(panel_bg)
-        .into()
+    // `⋯` overflow menu floats over the panel; a transparent backdrop catches
+    // clicks outside it to dismiss.
+    if !panel.controls_menu {
+        return base;
+    }
+    let backdrop = mouse_area(
+        container(text("")).width(Length::Fill).height(Length::Fill),
+    )
+    .on_press(Message::PluginPanelControlsToggled);
+
+    stack![base, backdrop, controls_menu(panel)].into()
 }
 
 /// One slot of the panel — its tab bar plus the active plugin body. The top
@@ -120,6 +153,7 @@ fn slot_view<'a>(
     slot:      PluginSlot,
     prefs:     &'a Prefs,
     notes:     &'a NotesState,
+    docs:      &'a DocsState,
     project:   Option<&'a str>,
     terminals: &'a TerminalsState,
     rctx:      &ReceiverCtx<'a>,
@@ -128,8 +162,11 @@ fn slot_view<'a>(
     let tab = panel.tab(slot);
     let body: Element<'_, Message> = match tab {
         PluginTab::Profile   => profile_body(prefs, pctx),
-        PluginTab::Notes     => notes_body(notes, project),
-        PluginTab::Terminals => terminals_body(terminals, prefs.terminal_font_scale),
+        PluginTab::Notes     => notes_body(notes, project, prefs.submodule_color),
+        PluginTab::Docs      => docs_panel::view(docs, prefs.submodule_color),
+        PluginTab::Terminals => terminals_body(
+            terminals, prefs.terminal_font_scale, prefs.immutable_system,
+        ),
         PluginTab::Receivers => receivers_panel::view(rctx),
     };
 
@@ -154,25 +191,30 @@ fn tab_bar(panel: &PluginPanel, slot: PluginSlot) -> Element<'static, Message> {
 
     let mut r = row![].spacing(4).align_y(Alignment::Center);
     for t in panel.shown_tabs() {
-        let select = button(text(t.label().to_string()).font(UI_FONT).size(buttons::TEXT_SIZE))
-            .on_press(Message::PluginTabClicked(slot, t))
-            .padding(buttons::PADDING)
-            .style(buttons::toggle(active == t));
-        let entry: Element<'static, Message> = if closable {
-            row![
-                select,
-                button(text("\u{2715}").font(ICON_FONT).size(9))
-                    .on_press(Message::PluginTabHidden(t))
-                    .padding([7, 6])
-                    .style(buttons::secondary),
-            ]
-            .spacing(2)
-            .align_y(Alignment::Center)
-            .into()
+        let selected = active == t;
+        let label = text(t.label().to_string()).font(UI_FONT).size(buttons::TEXT_SIZE);
+        // The ✕ lives inside the tab button, tucked into its top-right corner, so
+        // a tab reads as one clean control rather than a button-plus-button pair.
+        // Nested buttons work because the inner ✕ captures clicks within its own
+        // bounds while the rest of the tab still selects the plugin.
+        let inner: Element<'static, Message> = if closable {
+            let close = button(text("\u{2715}").font(ICON_FONT).size(9))
+                .on_press(Message::PluginTabHidden(t))
+                .padding([0, 3])
+                .style(buttons::toggle_icon(selected));
+            row![label, close]
+                .spacing(6)
+                .align_y(Alignment::Start)
+                .into()
         } else {
-            select.into()
+            label.into()
         };
-        r = r.push(entry);
+        r = r.push(
+            button(inner)
+                .on_press(Message::PluginTabClicked(slot, t))
+                .padding(buttons::PADDING)
+                .style(buttons::toggle(selected)),
+        );
     }
 
     // `+` reveals a picker of the hidden plugins; clicking one re-adds it. Only
@@ -199,18 +241,23 @@ fn tab_bar(panel: &PluginPanel, slot: PluginSlot) -> Element<'static, Message> {
     r = r.push(iced::widget::Space::with_width(Length::Fill));
 
     // Only the top slot carries the panel-wide controls so they aren't doubled.
+    // The layout controls live behind a single `☰` menu button (opening the
+    // overflow menu below) so they never squish as the panel narrows; closing
+    // the toolbox is common enough to earn its own `✕` button beside it.
     if slot == PluginSlot::Top {
-        // Dock arrow points to the edge the panel would move to.
-        let dock_icon = match panel.dock {
-            DockSide::Right => "\u{25C0}", // ◀ move to the left edge
-            DockSide::Left  => "\u{25B6}", // ▶ move to the right edge
-        };
-        r = r.push(icon_ctrl(dock_icon, Message::PluginPanelDockToggled));
-        // ▤ divided box = split into two slots; ▢ single box = collapse to one.
-        let split_icon = if panel.split { "\u{25A2}" } else { "\u{25A4}" };
-        r = r.push(icon_ctrl(split_icon, Message::PluginPanelSplitToggled));
-        // ✕ hides the panel entirely.
-        r = r.push(icon_ctrl("\u{2715}", Message::PluginPanelHide));
+        r = r.push(
+            button(text("\u{2630}").font(ICON_FONT).size(16)) // ☰ menu
+                .on_press(Message::PluginPanelControlsToggled)
+                .padding(buttons::PADDING)
+                .style(buttons::toggle(panel.controls_menu)),
+        );
+        r = r.push(with_tip(
+            button(text("\u{2715}").font(ICON_FONT).size(14)) // ✕ close
+                .on_press(Message::PluginPanelHide)
+                .padding(buttons::PADDING)
+                .style(buttons::secondary),
+            "Close toolbox",
+        ));
     }
 
     container(r)
@@ -220,13 +267,58 @@ fn tab_bar(panel: &PluginPanel, slot: PluginSlot) -> Element<'static, Message> {
         .into()
 }
 
-/// A panel-wide control rendered as an icon glyph (Dock / Split / Hide).
-fn icon_ctrl(glyph: &'static str, msg: Message) -> Element<'static, Message> {
-    button(text(glyph).font(ICON_FONT).size(14))
-        .on_press(msg)
-        .padding(buttons::PADDING)
-        .style(buttons::secondary)
+/// The `⋯` overflow menu of panel-wide controls, floated over the panel body
+/// and anchored top-right under the `⋯` button. Labels reflect the current
+/// state (e.g. "Merge to one" while split) so one entry toggles each action.
+fn controls_menu<'a>(panel: &PluginPanel) -> Element<'a, Message> {
+    let dock_label = match panel.dock {
+        DockSide::Right => "Dock left",
+        DockSide::Left  => "Dock right",
+    };
+    let split_label  = if panel.split { "Merge to one" } else { "Split in two" };
+    // The expand entry carries its chord, the one control here that has one.
+    let expand_label = if panel.expanded {
+        "Restore main area (Ctrl+Shift+F)"
+    } else {
+        "Expand full width (Ctrl+Shift+F)"
+    };
+
+    let item = |label: &str, msg: Message| {
+        button(text(label.to_string()).font(UI_FONT).size(buttons::TEXT_SIZE))
+            .on_press(msg)
+            .width(Length::Fill)
+            .padding(buttons::PADDING)
+            .style(buttons::menu_item)
+    };
+
+    let items = column![
+        item(dock_label,   Message::PluginPanelDockToggled),
+        item(split_label,  Message::PluginPanelSplitToggled),
+        item(expand_label, Message::PluginPanelExpandToggled),
+    ]
+    .spacing(2);
+
+    // Wide enough for the longest entry — the expand toggle with its chord.
+    let card = container(items)
+        .padding(4)
+        .width(Length::Fixed(230.0))
+        .style(menu_card_bg);
+
+    // Anchored just under the tab bar on the right, where the `⋯` button lives.
+    container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::End)
+        .padding(iced::Padding::ZERO.top(42.0).right(8.0))
         .into()
+}
+
+fn menu_card_bg(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(Color::from_rgb8(34, 34, 44))),
+        border:     Border { color: Color::from_rgb8(70, 70, 86), width: 1.0, radius: 6.0.into() },
+        ..Default::default()
+    }
 }
 
 // ── Profile plugin ────────────────────────────────────────────────────────────
@@ -261,57 +353,323 @@ fn profile_body<'a>(prefs: &'a Prefs, pctx: &ProfileCtx) -> Element<'a, Message>
         .into(),
     );
 
-    column![
+    let submodule_picker = labeled_row(
+        "Folder tint:",
+        submodule_color_picker(prefs.submodule_color),
+    );
+
+    let content = column![
+        about_section(),
+        Space::new(Length::Shrink, Length::Fixed(4.0)),
         text("Appearance").size(15),
         palette_picker,
         mode_picker,
         font_picker,
         term_font_picker,
+        submodule_picker,
         Space::new(Length::Shrink, Length::Fixed(8.0)),
-        claude_status_section(pctx),
+        shell_section(prefs),
+        Space::new(Length::Shrink, Length::Fixed(8.0)),
+        tools_section(prefs.default_tool, prefs.filter_tools_to_installed, prefs.chat_access),
         Space::new(Length::Shrink, Length::Fixed(8.0)),
         keyboard_shortcuts_section(),
         Space::new(Length::Shrink, Length::Fixed(8.0)),
         privacy_section(pctx),
     ]
-    .spacing(8)
-    .into()
+    .spacing(8);
+
+    // Scroll the whole tab: at larger font sizes the callout sections outgrow the
+    // panel, so without this the lower sections (keyboard shortcuts) get clipped.
+    // Pad the right so the scrollbar doesn't sit on top of the content.
+    scrollable(content.width(Length::Fill).padding(iced::Padding::ZERO.right(8.0)))
+        .height(Length::Fill)
+        .into()
 }
 
-/// Reference list of the app's keyboard shortcuts. Purely informational — the
-/// bindings themselves live in `app::handle_key`; keep the two in sync.
+/// Which build this is. Sits at the top of the Profile tab because "what
+/// version am I on?" is the first thing a user needs when reporting something,
+/// and the bottom of a scrollable tab is where that question goes to die.
+///
+/// The build stamp line (commit, date, target) is what makes the version
+/// actionable — two builds of `0.1.2` from different commits look identical
+/// without it. Everything here comes from [`crate::version`]; `frms --version`
+/// prints the same values.
+fn about_section() -> Element<'static, Message> {
+    let name = text(format!("frms {}", crate::version::VERSION))
+        .font(UI_FONT)
+        .size(15);
+
+    let stamp = container(
+        text(crate::version::build_details())
+            .font(Font::MONOSPACE)
+            .size(10),
+    )
+    .style(|theme: &Theme| {
+        let p = theme.extended_palette();
+        container::Style {
+            // Muted against the panel: present when looked for, quiet otherwise.
+            text_color: Some(mix(p.background.base.text, p.background.base.color, 0.45)),
+            ..Default::default()
+        }
+    });
+
+    column![name, stamp].spacing(2).into()
+}
+
+/// Curated highlight colors for submodules and note categories. The first is the
+/// built-in default; the rest span the hue wheel so there's a distinct,
+/// legible option whatever the user's theme.
+const SUBMODULE_SWATCHES: &[Color] = &[
+    buttons::SUBMODULE,                  // violet (default)
+    Color { r: 0.31, g: 0.62, b: 0.91, a: 1.0 }, // blue
+    Color { r: 0.18, g: 0.77, b: 0.72, a: 1.0 }, // teal
+    Color { r: 0.30, g: 0.72, b: 0.44, a: 1.0 }, // green
+    Color { r: 0.88, g: 0.58, b: 0.18, a: 1.0 }, // amber
+    Color { r: 0.90, g: 0.42, b: 0.44, a: 1.0 }, // rose
+    Color { r: 0.80, g: 0.48, b: 0.91, a: 1.0 }, // orchid
+    Color { r: 0.60, g: 0.63, b: 0.67, a: 1.0 }, // slate
+];
+
+/// Row of clickable color swatches for the folder/submodule highlight. The swatch
+/// matching the current choice gets a bright ring; picking another emits
+/// [`Message::PrefsSubmoduleColorChanged`].
+fn submodule_color_picker(current: Color) -> Element<'static, Message> {
+    let mut swatches = row![].spacing(6).align_y(Alignment::Center);
+    for &c in SUBMODULE_SWATCHES {
+        swatches = swatches.push(color_swatch(c, color_eq(c, current)));
+    }
+    swatches.into()
+}
+
+/// One 22×22 swatch button filled with `color`; `selected` draws the ring.
+fn color_swatch(color: Color, selected: bool) -> Element<'static, Message> {
+    button(Space::new(Length::Fixed(16.0), Length::Fixed(16.0)))
+        .padding(0)
+        .on_press(Message::PrefsSubmoduleColorChanged(color))
+        .style(move |_theme, status| {
+            // Brighten slightly on hover so the swatch feels live.
+            let bg = match status {
+                button::Status::Hovered => Color {
+                    r: (color.r + 0.08).min(1.0),
+                    g: (color.g + 0.08).min(1.0),
+                    b: (color.b + 0.08).min(1.0),
+                    a: 1.0,
+                },
+                _ => color,
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                border: Border {
+                    color: if selected {
+                        Color::WHITE
+                    } else {
+                        Color { r: 1.0, g: 1.0, b: 1.0, a: 0.25 }
+                    },
+                    width: if selected { 2.0 } else { 1.0 },
+                    radius: 4.0.into(),
+                },
+                ..button::Style::default()
+            }
+        })
+        .into()
+}
+
+/// Linearly blend `a` toward `b` by `t` (0.0 = all `a`, 1.0 = all `b`), keeping
+/// full opacity. Used to derive theme-aware callout tints and readable headings.
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: 1.0,
+    }
+}
+
+/// Compare two colors at 8-bit precision, so a swatch matches a stored choice
+/// that round-tripped through the `#RRGGBB` prefs encoding.
+fn color_eq(a: Color, b: Color) -> bool {
+    let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+    q(a.r) == q(b.r) && q(a.g) == q(b.g) && q(a.b) == q(b.b)
+}
+
+/// Accent hues for the profile callouts. Warm coral for Claude Code, teal for
+/// Windsurf, cool blue for the keyboard reference — each gets a tinted box +
+/// accent bar via [`callout`].
+const CLAUDE_ACCENT:   Color = Color { r: 0.85, g: 0.47, b: 0.34, a: 1.0 };
+const WINDSURF_ACCENT: Color = Color { r: 0.18, g: 0.72, b: 0.66, a: 1.0 };
+const KEYS_ACCENT:     Color = Color { r: 0.36, g: 0.55, b: 0.94, a: 1.0 };
+
+/// The callout accent for a given AI tool.
+fn tool_accent(tool: AiTool) -> Color {
+    match tool {
+        AiTool::Claude   => CLAUDE_ACCENT,
+        AiTool::Windsurf => WINDSURF_ACCENT,
+    }
+}
+
+/// An accent tinted for legibility against the current theme — brightened on
+/// dark themes, darkened on light ones — so it never washes out against the
+/// panel behind it.
+fn readable_accent(accent: Color, theme: &Theme) -> Color {
+    if theme.extended_palette().is_dark {
+        mix(accent, Color::WHITE, 0.20)
+    } else {
+        mix(accent, Color::BLACK, 0.35)
+    }
+}
+
+/// Wrap a section in a highlighted "callout" box: a tinted panel with a colored
+/// bar down the left edge and an accent-colored heading, so it reads as a
+/// pulled-out note instead of blending into the surrounding body text.
+fn callout<'a>(
+    accent:  Color,
+    heading: &'a str,
+    body:    Element<'a, Message>,
+) -> Element<'a, Message> {
+    let heading = container(text(heading).size(14))
+        .style(move |theme: &Theme| container::Style {
+            text_color: Some(readable_accent(accent, theme)),
+            ..Default::default()
+        });
+
+    let inner = column![heading, body].spacing(6);
+
+    // Tinted panel; square left corners so it butts flush against the accent bar.
+    // The tint and outline are derived from the theme so the panel reads as a
+    // dark accent wash in dark mode and a light one in light mode, and the body
+    // text inherits the theme's legible foreground color.
+    let panel = container(inner)
+        .padding([10, 12])
+        .width(Length::Fill)
+        .style(move |theme: &Theme| {
+            let p = theme.extended_palette();
+            let bg = mix(p.background.base.color, accent, if p.is_dark { 0.16 } else { 0.12 });
+            container::Style {
+                background: Some(Background::Color(bg)),
+                text_color: Some(p.background.base.text),
+                border: Border {
+                    color:  Color { a: 0.55, ..accent },
+                    width:  1.5,
+                    radius: iced::border::Radius {
+                        top_left: 0.0, bottom_left: 0.0, top_right: 8.0, bottom_right: 8.0,
+                    },
+                },
+                ..Default::default()
+            }
+        });
+
+    // The accent bar is the outer container's background, revealed as a 3px
+    // stripe by the left padding. Height stays Shrink, so the callout is exactly
+    // as tall as its content instead of a `Fill` bar stretching it to the
+    // scrollable's full viewport height.
+    container(panel)
+        .width(Length::Fill)
+        .padding(iced::Padding::ZERO.left(3.0))
+        .style(move |_theme: &Theme| container::Style {
+            background: Some(Background::Color(accent)),
+            border:     Border { radius: 8.0.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Reference list of the app's keyboard shortcuts, grouped by the part of the
+/// UI each one drives so a user hunting for "the toolbox one" can scan straight
+/// to it. Purely informational — the bindings themselves live in
+/// `app::app_chord` / `app::handle_key`; keep the two in sync.
 fn keyboard_shortcuts_section() -> Element<'static, Message> {
-    // (keys, what it does). Grouped: navigation, then actions.
-    let shortcuts: &[(&str, &str)] = &[
-        ("Ctrl+Tab  /  Ctrl+Shift+Tab", "Cycle panes (includes the toolbox)"),
-        ("Ctrl+Shift+↓  /  ↑",          "Next / previous pane needing attention"),
-        ("Ctrl+Shift+]  /  [",          "Next / previous project session"),
-        ("Ctrl+1 … 9",                  "Jump to project session N"),
-        ("Ctrl+Shift+B",                "Toggle the toolbox panel"),
-        ("Ctrl+Shift+T",                "New agent pane"),
-        ("Ctrl+Shift+W",                "Close the focused agent pane"),
-        ("Ctrl+Shift+Enter  /  R",      "Answer the surfaced prompt (Accept / Reject)"),
-        ("Ctrl+Shift+C  /  V",          "Copy / paste in the terminal"),
-        ("Ctrl+Shift+N",                "New note from the selection"),
+    // (area, [(keys, what it does)]).
+    let groups: &[(&str, &[(&str, &str)])] = &[
+        ("Projects", &[
+            ("Ctrl+Shift+]  /  [",       "Next / previous project session"),
+            ("Ctrl+1 … 9",               "Jump to project session N (number row or keypad)"),
+            ("Ctrl+Shift+E",             "Show / hide the file explorer"),
+        ]),
+        ("Agent panes", &[
+            ("Ctrl+Shift+→  /  ←",       "Cycle panes (includes the toolbox)"),
+            ("Ctrl+Shift+A",             "Cycle agent panes only (skips the toolbox)"),
+            ("Ctrl+Shift+1 … 9",         "Jump straight to agent pane N — the panes it skips are not started"),
+            ("Ctrl+Shift+↓  /  ↑",       "Next / previous pane needing attention"),
+            ("Ctrl+Shift+T",             "New agent pane"),
+            ("Ctrl+Shift+W",             "Close the focused agent pane"),
+            ("Ctrl+Shift+M",             "Change the model on one or many agents"),
+            ("Ctrl+Shift+L",             "Find in the agent conversation (Enter walks the hits)"),
+            ("Ctrl+Shift+Enter  /  R",   "Answer the surfaced prompt (Accept / Reject)"),
+        ]),
+        ("Database", &[
+            ("Ctrl+Shift+D",             "Open this project's Database tool"),
+        ]),
+        ("Toolbox", &[
+            ("Ctrl+Shift+B",             "Toggle the toolbox panel"),
+            ("Ctrl+Shift+F",             "Expand to full width / restore the main area"),
+            ("Ctrl+Shift+PgDn  /  PgUp", "Cycle the toolbox's tools"),
+            ("Ctrl+Shift+S",             "Search this project's _specs / _docs"),
+            ("Ctrl+Shift+G",             "Search notes"),
+        ]),
+        ("Terminal", &[
+            ("Ctrl+Shift+C  /  V",       "Copy / paste in the terminal"),
+            ("Ctrl+Shift+N",             "New note from the selection"),
+        ]),
+        ("App", &[
+            ("Ctrl+Shift+Q",             "Quit frms"),
+        ]),
     ];
 
-    let mut col = column![text("Keyboard shortcuts").size(15)].spacing(5);
-    for (keys, desc) in shortcuts {
-        col = col.push(
-            row![
-                container(text(*keys).font(Font::MONOSPACE).size(11))
-                    .width(Length::Fixed(215.0)),
-                text(*desc).font(UI_FONT).size(11),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
+    let mut col = column![].spacing(4);
+    for (i, (area, shortcuts)) in groups.iter().enumerate() {
+        // Breathing room above every group but the first, which sits directly
+        // under the callout's own heading.
+        if i > 0 {
+            col = col.push(Space::new(Length::Shrink, Length::Fixed(6.0)));
+        }
+        col = col.push(shortcut_group_header(area));
+        for (keys, desc) in shortcuts.iter() {
+            col = col.push(
+                row![
+                    container(text(*keys).font(Font::MONOSPACE).size(11))
+                        .width(Length::Fixed(215.0)),
+                    text(*desc).font(UI_FONT).size(11),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            );
+        }
     }
-    col.into()
+    callout(KEYS_ACCENT, "Keyboard shortcuts", col.into())
 }
 
-/// Privacy / telemetry controls. Telemetry is on by default; this is the opt-out
-/// and the disclosure of exactly what's collected (anonymous, no PII).
+/// One group label inside the shortcut reference: an accent-tinted, upper-case
+/// name with a hairline running out to the right edge, so the groups read as
+/// section dividers rather than just more rows of text.
+fn shortcut_group_header(area: &str) -> Element<'static, Message> {
+    let label = container(text(area.to_uppercase()).font(UI_FONT).size(10))
+        .style(|theme: &Theme| container::Style {
+            text_color: Some(readable_accent(KEYS_ACCENT, theme)),
+            ..Default::default()
+        });
+
+    // A 1px container background rather than `horizontal_rule`, which takes its
+    // color from the theme's rule style and so can't carry the accent.
+    let rule = container(Space::new(Length::Fill, Length::Fixed(1.0)))
+        .width(Length::Fill)
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(Color {
+                a: 0.35,
+                ..readable_accent(KEYS_ACCENT, theme)
+            })),
+            ..Default::default()
+        });
+
+    row![label, rule]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// Privacy / telemetry controls. The optional tier is on by default and this is
+/// its opt-out; the install/app-open count always reports and is stated here so
+/// the toggle isn't read as covering more than it does. Disclosure of exactly
+/// what's collected (anonymous, no PII) either way.
 fn privacy_section(pctx: &ProfileCtx) -> Element<'static, Message> {
     let toggle = iced::widget::checkbox("Share anonymous usage data", pctx.telemetry_enabled)
         .on_toggle(Message::PrefsTelemetryToggled)
@@ -320,45 +678,177 @@ fn privacy_section(pctx: &ProfileCtx) -> Element<'static, Message> {
     column![
         text("Privacy").size(15),
         toggle,
-        text("Helps improve frms. Sends an anonymous id, app version, OS, coarse \
-              feature usage, and crash reports — never file names, project \
-              paths, prompts, keys, or any personal data. Off any time here.")
+        text("Helps improve frms. Sends coarse feature usage and crash reports — \
+              never file names, project paths, prompts, keys, or any personal \
+              data. Off any time here.")
+            .size(11),
+        text("frms always reports that it was installed and each time it's \
+              opened, with an anonymous install id, app version, and OS. That \
+              part isn't covered by the toggle.")
             .size(11),
     ]
     .spacing(6)
     .into()
 }
 
-/// Claude Code status. Every agent pane — Build (PTY) and the Research / Chat
-/// chats — drives the `claude` CLI, which authenticates through its own login
-/// (a Claude Pro/Max subscription, no API key). This section reflects whether
-/// the CLI is installed and points the user at the one-shot setup helper.
-fn claude_status_section(pctx: &ProfileCtx) -> Element<'static, Message> {
-    let status = if pctx.claude_installed {
-        text("\u{2713} Claude Code is installed.").size(12)
-    } else {
-        text("\u{2717} Claude Code (the 'claude' CLI) was not found.").size(12)
-    };
+/// Everything about the shells the Terminals tab spawns: the immutable-system
+/// toggle that makes them remember their toolbox, and the `ls` flags they alias
+/// `ls` to. Both only ever affect *new* shells — pushing either into a terminal
+/// that's already open would type into whatever program is running there.
+fn shell_section(prefs: &Prefs) -> Element<'static, Message> {
+    let immutable = iced::widget::checkbox(
+        "Immutable system (toolbox / distrobox)", prefs.immutable_system,
+    )
+    .on_toggle(Message::PrefsImmutableSystemToggled)
+    .text_size(12);
 
-    // Build the guidance line. When installed we only need the sign-in reminder;
-    // when missing we point at the bundled installer (frms-setup-claude).
-    let guidance = if pctx.claude_installed {
-        "Agent panes sign in through Claude Code. If you haven't yet, run \
-         'claude' once in a terminal to log in (a Claude Pro/Max subscription \
-         — no API key needed)."
-    } else {
-        "Agent panes need it. Install and sign in with one command in a \
-         terminal:  frms-setup-claude  — it installs Node.js/npm + Claude Code, \
-         then logs you in (a Claude Pro/Max subscription, no API key needed)."
+    let immutable_detail = text(
+        "For atomic distros like Fedora Silverblue, where the work happens \
+         inside a container. A pinned terminal remembers the toolbox it was \
+         left in and re-enters it on the next launch, and the Terminals tab \
+         shows which one each shell is in. Leave off on a conventional distro."
+    ).size(11);
+
+    // One checkbox per flag, stacked. The panel is a narrow dock, so a row of
+    // bare `-l`/`-h` boxes would either wrap badly or hide what each one does.
+    let mut flags = Column::new().spacing(2);
+    for (flag, label) in crate::prefs::LS_FLAGS {
+        flags = flags.push(
+            iced::widget::checkbox(format!("-{flag}   {label}"), prefs.ls_flag(flag))
+                .on_toggle(move |on| Message::PrefsLsFlagToggled(flag, on))
+                .text_size(12),
+        );
+    }
+
+    // Show the exact command the shells will run, so the flag combination isn't
+    // something the user has to assemble in their head.
+    let preview = match prefs.ls_command() {
+        Some(cmd) => text(format!("ls  →  {cmd}")).font(Font::MONOSPACE).size(11),
+        None      => text("No flags added — `ls` is left exactly as your shell has it.").size(11),
     };
 
     column![
-        text("Claude Code").size(15),
-        status,
-        text(guidance).size(11),
+        text("Shell").size(15),
+        immutable,
+        immutable_detail,
+        Space::new(Length::Shrink, Length::Fixed(4.0)),
+        text("Automatic `ls` flags").size(13),
+        flags,
+        preview,
+        text("Applied by aliasing `ls` in each new Terminals-tab shell — \
+              including inside a toolbox. Terminals already open keep the \
+              flags they started with.")
+            .size(11),
     ]
     .spacing(6)
     .into()
+}
+
+/// AI tools status. Each agentic Build pane runs one of these CLIs in a PTY;
+/// every tool owns its own login (a subscription, no API key). Leads with the
+/// default-tool picker (which CLI new Build panes launch) and the opt-in
+/// "installed only" filter for the "+ Agent" picker, then one callout per tool
+/// in [`AiTool::ALL`] showing install state, sign-in, and — when missing — an
+/// Install button that runs the tool's install command in a visible terminal.
+fn tools_section(
+    default_tool:    AiTool,
+    filter_installed: bool,
+    chat_access:     crate::chat_api::ChatAccess,
+) -> Element<'static, Message> {
+    let default_picker = labeled_row(
+        "Default tool:",
+        pick_list(AiTool::ALL, Some(default_tool), Message::PrefsDefaultToolChanged)
+            .text_size(13)
+            .into(),
+    );
+    let filter_toggle = iced::widget::checkbox(
+        "Only show installed tools in the + Agent picker", filter_installed,
+    )
+    .on_toggle(Message::PrefsFilterToolsToggled)
+    .text_size(12);
+
+    // Research/Chat panes run the same Claude Code harness as a Build pane, in
+    // the session's project directory — this is the ceiling on what it's handed.
+    let access_picker = labeled_row(
+        "Chat pane access:",
+        pick_list(
+            crate::chat_api::ChatAccess::ALL,
+            Some(chat_access),
+            Message::PrefsChatAccessChanged,
+        )
+        .text_size(13)
+        .into(),
+    );
+    let access_detail = text(chat_access.detail()).font(UI_FONT).size(11);
+
+    let mut col = column![
+        text("AI tools").size(15),
+        default_picker,
+        filter_toggle,
+        access_picker,
+        access_detail,
+    ]
+    .spacing(8);
+    for &tool in AiTool::ALL {
+        col = col.push(tool_callout(tool));
+    }
+    col.into()
+}
+
+/// One tool's status callout: install state, sign-in hint, and an Install
+/// button when the CLI isn't on `PATH`.
+fn tool_callout(tool: AiTool) -> Element<'static, Message> {
+    let installed = tool.on_path();
+    let label     = tool.label();
+
+    let status = if installed {
+        text(format!("\u{2713} {label} is installed.")).size(12)
+    } else {
+        text(format!("\u{2717} {label} (the '{}' CLI) was not found.", tool.binary())).size(12)
+    };
+
+    let mut body = column![status].spacing(6);
+
+    if installed {
+        // Just the sign-in reminder — the tool handles its own auth.
+        body = body.push(
+            text(format!("Agent panes sign in through {label}. If you haven't yet, {}",
+                         tool.login_hint()))
+                .size(11),
+        );
+    } else {
+        // Point at the install command and offer to run it in a terminal.
+        body = body.push(
+            text(format!("Agent panes need it. Install runs:  {}  — then {}",
+                         tool.install_command(), tool.login_hint()))
+                .size(11),
+        );
+        body = body.push(install_button(tool));
+    }
+
+    callout(tool_accent(tool), label, body.into())
+}
+
+/// "Install <tool>" button — emits [`Message::InstallTool`], which opens a
+/// Terminals-plugin shell running the tool's install command.
+fn install_button(tool: AiTool) -> Element<'static, Message> {
+    let accent = tool_accent(tool);
+    button(text(format!("Install {}", tool.label())).size(12).font(UI_FONT))
+        .padding([5, 12])
+        .on_press(Message::InstallTool(tool))
+        .style(move |_theme, status| {
+            let bg = match status {
+                button::Status::Hovered => mix(accent, Color::WHITE, 0.12),
+                _                       => accent,
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: Color::WHITE,
+                border: Border { radius: 5.0.into(), ..Default::default() },
+                ..button::Style::default()
+            }
+        })
+        .into()
 }
 
 fn labeled_row<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
@@ -373,9 +863,13 @@ fn labeled_row<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a,
 
 // ── Notes plugin ──────────────────────────────────────────────────────────────
 
-fn notes_body<'a>(notes: &'a NotesState, project: Option<&'a str>) -> Element<'a, Message> {
-    let list = notes_list(notes, project);
-    let editor = notes_editor(notes, project);
+fn notes_body<'a>(
+    notes:   &'a NotesState,
+    project: Option<&'a str>,
+    folder:  Color,
+) -> Element<'a, Message> {
+    let list = notes_list(notes, project, folder);
+    let editor = notes_editor(notes, project, folder);
 
     row![
         container(list)
@@ -391,53 +885,97 @@ fn notes_body<'a>(notes: &'a NotesState, project: Option<&'a str>) -> Element<'a
     .into()
 }
 
-fn notes_list<'a>(notes: &'a NotesState, project: Option<&'a str>) -> Element<'a, Message> {
+fn notes_list<'a>(
+    notes:   &'a NotesState,
+    project: Option<&'a str>,
+    folder:  Color,
+) -> Element<'a, Message> {
     let new_btn = button(text("+ New").font(UI_FONT).size(buttons::TEXT_SIZE))
         .on_press(Message::NotesNew)
         .padding(buttons::PADDING)
         .style(buttons::primary)
         .width(Length::Fill);
 
+    // Searches title, body, and category — see `NotesState::matches_search`.
+    // ✕ clears it, and only appears while there's something to clear.
+    let search = text_input("Search notes…", &notes.search)
+        .id(text_input::Id::new(NOTES_SEARCH_INPUT))
+        .on_input(Message::NotesSearchChanged)
+        .size(12)
+        .width(Length::Fill);
+    let search_row: Element<'_, Message> = if notes.is_searching() {
+        row![
+            search,
+            button(text("\u{2715}").font(ICON_FONT).size(10))
+                .on_press(Message::NotesSearchCleared)
+                .padding([4, 6])
+                .style(buttons::secondary),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        search.into()
+    };
+
     // Only this project's notes plus global ones — a note pinned to another
-    // project stays out of the way.
-    let visible: Vec<_> = notes.notes.iter()
-        .filter(|n| n.visible_in(project))
-        .collect();
+    // project stays out of the way — and only those matching the search.
+    let visible: Vec<&Note> = notes.visible_notes(project);
 
     let mut list = Column::new().spacing(2).width(Length::Fill);
     if visible.is_empty() {
-        list = list.push(text("(no notes)").size(11));
+        // Distinguish "you have no notes" from "your search hid them all" —
+        // otherwise a stale filter reads as data loss.
+        let msg = if notes.is_searching() { "(no matches)" } else { "(no notes)" };
+        list = list.push(text(msg).size(11));
     } else {
-        for n in visible {
-            let selected = notes.selected == Some(n.id);
-            let label = if n.title.is_empty() { "Untitled".to_string() } else { n.title.clone() };
-            let name_text = text(label).font(UI_FONT).size(buttons::TEXT_SIZE);
-            // Project-pinned notes carry a pushpin (same idiom as pinned
-            // terminals); global notes are unmarked. Pin glyph needs the
-            // icon font.
-            let content: Element<'_, Message> = if n.project.is_some() {
-                row![
-                    text("\u{1F588}").font(ICON_FONT).size(buttons::TEXT_SIZE),
-                    name_text,
-                ]
-                .spacing(4)
-                .align_y(Alignment::Center)
-                .into()
-            } else {
-                name_text.into()
-            };
-            list = list.push(
-                button(content)
-                    .on_press(Message::NotesSelected(n.id))
-                    .padding(buttons::PADDING)
-                    .style(buttons::toggle(selected))
-                    .width(Length::Fill),
-            );
+        // A search forces every group open: the user asked to see matches, and
+        // hiding some behind a fold they collapsed days ago would read as the
+        // search having missed them. Collapse state is left untouched, so the
+        // list folds back the way they left it once the search is cleared.
+        let searching = notes.is_searching();
+        let categories = notes.categories_in(project);
+        if categories.is_empty() {
+            // No categories in use — keep the list flat and uncluttered.
+            for n in &visible {
+                list = list.push(note_row(n, notes.selected == Some(n.id), None));
+            }
+        } else {
+            // Grouped: each named category (sorted), then the uncategorized
+            // "General" group last. Empty groups are skipped.
+            for cat in &categories {
+                let members: Vec<&&Note> = visible.iter()
+                    .filter(|n| n.category.as_deref() == Some(cat.as_str()))
+                    .collect();
+                if members.is_empty() { continue; }
+                let collapsed = !searching && notes.is_category_collapsed(cat);
+                list = list.push(category_header(cat, cat, collapsed, members.len(), folder));
+                if !collapsed {
+                    for n in members {
+                        list = list.push(note_row(n, notes.selected == Some(n.id), Some(folder)));
+                    }
+                }
+            }
+            let uncategorized: Vec<&&Note> = visible.iter()
+                .filter(|n| n.category.is_none())
+                .collect();
+            if !uncategorized.is_empty() {
+                let collapsed = !searching && notes.is_category_collapsed("");
+                list = list.push(
+                    category_header(UNCATEGORIZED_LABEL, "", collapsed, uncategorized.len(), folder),
+                );
+                if !collapsed {
+                    for n in uncategorized {
+                        list = list.push(note_row(n, notes.selected == Some(n.id), Some(folder)));
+                    }
+                }
+            }
         }
     }
 
     column![
         new_btn,
+        search_row,
         scrollable(list).height(Length::Fill),
     ]
     .spacing(6)
@@ -445,7 +983,92 @@ fn notes_list<'a>(notes: &'a NotesState, project: Option<&'a str>) -> Element<'a
     .into()
 }
 
-fn notes_editor<'a>(notes: &'a NotesState, project: Option<&'a str>) -> Element<'a, Message> {
+/// Height of the folder-colored rule drawn beside notes filed in a category.
+/// Fixed rather than `Fill` — a `Fill` child inside a shrink-height row would
+/// stretch to the whole scrollable — and roughly the height of one note row.
+const NOTE_RULE_HEIGHT: f32 = 28.0;
+
+/// How far a note filed under a category is indented from the folder header.
+const NOTE_INDENT: f32 = 10.0;
+
+/// One selectable note button in the list. Every note leads with a 🗎 document
+/// glyph so it never reads as a folder; project-pinned notes add a pushpin
+/// (same idiom as pinned terminals). `folder` — `Some` for a note filed under a
+/// category — indents the row behind a rule in that folder's color, tying it to
+/// the header above it.
+fn note_row<'a>(n: &Note, selected: bool, folder: Option<Color>) -> Element<'a, Message> {
+    let label = if n.title.is_empty() { "Untitled".to_string() } else { n.title.clone() };
+    let mut content = row![
+        text("\u{1F5CE}").font(ICON_FONT).size(buttons::TEXT_SIZE), // 🗎 — a note, not a folder
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+    if n.project.is_some() {
+        content = content.push(text("\u{1F588}").font(ICON_FONT).size(buttons::TEXT_SIZE));
+    }
+    content = content.push(text(label).font(UI_FONT).size(buttons::TEXT_SIZE));
+
+    let btn = button(content)
+        .on_press(Message::NotesSelected(n.id))
+        .padding(buttons::PADDING)
+        .style(buttons::note_item(selected))
+        .width(Length::Fill);
+
+    let Some(folder) = folder else {
+        return btn.into();
+    };
+
+    row![
+        container(Space::new(Length::Fixed(2.0), Length::Fixed(NOTE_RULE_HEIGHT)))
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(Background::Color(Color { a: 0.85, ..folder })),
+                border: Border { radius: 1.0.into(), ..Border::default() },
+                ..container::Style::default()
+            }),
+        btn,
+    ]
+    .spacing(NOTE_INDENT - 2.0)
+    .padding(padding::left(NOTE_INDENT))
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// A collapsible category section header in the notes list. `key` is the value
+/// passed back to toggle collapse (the category name, or "" for uncategorized).
+/// Folders wear the submodule highlight color (the user's Profile pick, shared
+/// with the file browser) plus a 🗁/🗀 folder glyph, so a group header never
+/// reads as one of the theme-colored note rows filed under it.
+fn category_header<'a>(
+    label:     &str,
+    key:       &str,
+    collapsed: bool,
+    count:     usize,
+    folder:    Color,
+) -> Element<'a, Message> {
+    let caret = if collapsed { "\u{25B8}" } else { "\u{25BE}" };   // ▸ / ▾
+    let glyph = if collapsed { "\u{1F5C0}" } else { "\u{1F5C1}" }; // 🗀 / 🗁
+    let header = row![
+        text(caret.to_string()).font(ICON_FONT).size(10),
+        text(glyph.to_string()).font(ICON_FONT).size(12),
+        text(label.to_string()).font(UI_FONT).size(11),
+        Space::new(Length::Fill, Length::Shrink),
+        text(count.to_string()).font(UI_FONT).size(10),
+    ]
+    .spacing(5)
+    .align_y(Alignment::Center);
+    button(header)
+        .on_press(Message::NotesCategoryToggleCollapsed(key.to_string()))
+        .padding([5, 7])
+        .style(buttons::note_category(folder, collapsed))
+        .width(Length::Fill)
+        .into()
+}
+
+fn notes_editor<'a>(
+    notes:   &'a NotesState,
+    project: Option<&'a str>,
+    folder:  Color,
+) -> Element<'a, Message> {
     // A note left selected from another project isn't in the visible list —
     // treat it the same as no selection so it can't be edited blind.
     let selected = notes.selected
@@ -473,13 +1096,12 @@ fn notes_editor<'a>(notes: &'a NotesState, project: Option<&'a str>) -> Element<
         "Global note — click to pin to this project"
     };
 
-    let header = row![
-        text_input("Title", &notes.title_input)
-            .id(text_input::Id::new(NOTES_TITLE_INPUT))
-            .on_input(Message::NotesTitleEdited)
-            .on_submit(Message::NotesFocusBody)
-            .size(14)
-            .width(Length::Fill),
+    // Actions sit on their own row above the title so the name field can span
+    // the full width of the pane below them. The category picker rides on the
+    // left of this row; the note actions sit on the right.
+    let actions = row![
+        notes_category_row(notes, note, project, folder),
+        Space::new(Length::Fill, Length::Shrink),
         with_tip(
             button(text("\u{1F588}").font(ICON_FONT).size(14))
                 .on_press(Message::NotesPinToggled(id))
@@ -498,6 +1120,17 @@ fn notes_editor<'a>(notes: &'a NotesState, project: Option<&'a str>) -> Element<
     ]
     .spacing(6)
     .align_y(Alignment::Center);
+
+    let header = column![
+        actions,
+        text_input("Title", &notes.title_input)
+            .id(text_input::Id::new(NOTES_TITLE_INPUT))
+            .on_input(Message::NotesTitleEdited)
+            .on_submit(Message::NotesFocusBody)
+            .size(14)
+            .width(Length::Fill),
+    ]
+    .spacing(8);
 
     let editor = || {
         text_editor(&notes.body_content)
@@ -525,9 +1158,66 @@ fn notes_editor<'a>(notes: &'a NotesState, project: Option<&'a str>) -> Element<
         .into(),
     };
 
-    column![header, notes_format_bar(notes.view_mode), body]
-        .spacing(8)
-        .height(Length::Fill)
+    column![
+        header,
+        notes_format_bar(notes.view_mode),
+        body,
+    ]
+    .spacing(8)
+    .height(Length::Fill)
+    .into()
+}
+
+/// Category picker for the selected note. Normally a dropdown of existing
+/// categories plus "General" (uncategorized) and "+ New category…"; while the
+/// user is naming a new category it becomes a small text field with Add/Cancel.
+fn notes_category_row<'a>(
+    notes:   &'a NotesState,
+    note:    &Note,
+    project: Option<&'a str>,
+    folder:  Color,
+) -> Element<'a, Message> {
+    let label = text("Category").font(UI_FONT).size(11);
+
+    if notes.adding_category {
+        let input = text_input("New category", &notes.category_input)
+            .id(text_input::Id::new(NOTES_CATEGORY_INPUT))
+            .on_input(Message::NotesCategoryInput)
+            .on_submit(Message::NotesCategoryCommit)
+            .size(13)
+            .width(Length::Fixed(150.0));
+        return row![
+            label,
+            input,
+            button(text("Add").font(UI_FONT).size(buttons::TEXT_SIZE))
+                .on_press(Message::NotesCategoryCommit)
+                .padding([4, 8])
+                .style(buttons::primary),
+            button(text("Cancel").font(UI_FONT).size(buttons::TEXT_SIZE))
+                .on_press(Message::NotesCategoryCancel)
+                .padding([4, 8])
+                .style(buttons::secondary),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into();
+    }
+
+    // No standing category → leave the pick_list unselected so it shows its
+    // "Categorize" placeholder as the button label; a chosen category shows its
+    // own name instead.
+    let selected = note.category.as_ref().map(|c| CategoryChoice::Named(c.clone()));
+    // General (uncategorized) first, existing categories, then the new-category
+    // action last — matching the grouped order in the list.
+    let mut options = vec![CategoryChoice::Uncategorized];
+    options.extend(notes.categories_in(project).into_iter().map(CategoryChoice::Named));
+    options.push(CategoryChoice::NewCategory);
+
+    pick_list(options, selected, Message::NotesCategorySelected)
+        .placeholder("Categorize")
+        .text_size(buttons::TEXT_SIZE)
+        .padding(buttons::PADDING)
+        .style(buttons::pick_list_note_category(note.category.is_some().then_some(folder)))
         .into()
 }
 
@@ -554,9 +1244,13 @@ fn notes_format_bar<'a>(mode: NoteViewMode) -> Element<'a, Message> {
         )
     };
 
-    let mut bar = row![].spacing(3).align_y(Alignment::Center);
+    // The formatting buttons live in a horizontally-scrollable strip: when the
+    // pane is narrower than their combined width they scroll rather than squish
+    // or push the view-mode toggle off-screen. The mode toggle stays pinned to
+    // the right, always visible.
+    let mut fmt = row![].spacing(3).align_y(Alignment::Center);
     if mode != NoteViewMode::Preview {
-        bar = bar
+        fmt = fmt
             .push(btn("B",   "Bold (Ctrl+B)",        NoteFormat::Bold))
             .push(btn("I",   "Italic (Ctrl+I)",      NoteFormat::Italic))
             .push(btn("S",   "Strikethrough",        NoteFormat::Strikethrough))
@@ -570,21 +1264,47 @@ fn notes_format_bar<'a>(mode: NoteViewMode) -> Element<'a, Message> {
             .push(btn("```", "Code block",           NoteFormat::CodeBlock))
             .push(btn("[↗]", "Link (Ctrl+K)",        NoteFormat::Link));
     }
-    bar = bar
-        .push(Space::new(Length::Fill, Length::Shrink))
-        .push(mode_btn("Edit",    "Markdown source only",         NoteViewMode::Edit))
-        .push(mode_btn("Split",   "Source and preview side by side", NoteViewMode::Split))
-        .push(mode_btn("Preview", "Rendered preview only",        NoteViewMode::Preview));
-    bar.into()
+    let fmt_strip = scrollable(fmt)
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new().width(4).scroller_width(4),
+        ))
+        .width(Length::Fill);
+
+    row![
+        fmt_strip,
+        mode_btn("Edit",    "Markdown source only",            NoteViewMode::Edit),
+        mode_btn("Split",   "Source and preview side by side", NoteViewMode::Split),
+        mode_btn("Preview", "Rendered preview only",           NoteViewMode::Preview),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 /// Keyboard shortcuts for the note body editor — Ctrl+B/I/E/K apply markdown
-/// formatting; everything else falls through to the default bindings.
+/// formatting, Tab/Shift+Tab indent and outdent; everything else falls through
+/// to the default bindings.
 fn notes_key_binding(
     kp: text_editor::KeyPress,
 ) -> Option<text_editor::Binding<Message>> {
-    use iced::keyboard::Key;
+    use iced::keyboard::{key, Key};
     use text_editor::{Binding, Status};
+
+    // Tab indents rather than moving focus. The default binding drops it (it
+    // arrives as the control character \t), so it would otherwise fall through
+    // to the app-level Tab handler and reach a terminal.
+    // Ctrl+Tab stays a pane-cycle chord, so only plain Tab / Shift+Tab indent.
+    if kp.status == Status::Focused
+        && matches!(kp.key, Key::Named(key::Named::Tab))
+        && !kp.modifiers.command()
+        && !kp.modifiers.alt()
+    {
+        return Some(Binding::Custom(if kp.modifiers.shift() {
+            Message::NotesOutdent
+        } else {
+            Message::NotesIndent
+        }));
+    }
 
     if kp.status == Status::Focused && kp.modifiers.command() {
         if let Key::Character(c) = &kp.key {
@@ -608,12 +1328,13 @@ fn notes_key_binding(
 fn terminals_body(
     terms: &TerminalsState,
     font_scale: TerminalFontScale,
+    show_containers: bool,
 ) -> Element<'_, Message> {
     row![
         container(terminals_list(terms))
             .width(Length::Fixed(160.0))
             .height(Length::Fill),
-        container(terminal_body(terms, font_scale))
+        container(terminal_body(terms, font_scale, show_containers))
             .width(Length::Fill)
             .height(Length::Fill)
             .padding([0, 8]),
@@ -674,7 +1395,27 @@ fn terminals_list(terms: &TerminalsState) -> Element<'_, Message> {
     .into()
 }
 
-fn terminal_body(terms: &TerminalsState, font_scale: TerminalFontScale) -> Element<'_, Message> {
+/// The `⬢ bottle` badge showing which toolbox a shell is currently inside —
+/// the same hexagon toolbox itself puts in the container's prompt. Empty when
+/// the shell is on the host, or when the user isn't on an immutable system.
+fn container_badge(t: &crate::terminals::PluginTerminal, show: bool) -> Element<'static, Message> {
+    let Some(c) = show.then(|| t.pane.container()).flatten() else {
+        return Space::new(Length::Shrink, Length::Shrink).into();
+    };
+    row![
+        text("\u{2B22}").font(ICON_FONT).size(11),
+        text(c.name).font(UI_FONT).size(11),
+    ]
+    .spacing(3)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn terminal_body(
+    terms: &TerminalsState,
+    font_scale: TerminalFontScale,
+    show_containers: bool,
+) -> Element<'_, Message> {
     let Some(id) = terms.selected else {
         return container(
             text("Click + New to start a shell terminal in this session's working directory.")
@@ -701,6 +1442,7 @@ fn terminal_body(terms: &TerminalsState, font_scale: TerminalFontScale) -> Eleme
             .on_submit(Message::TerminalPluginFocusTerminal)
             .size(14)
             .width(Length::Fill),
+        container_badge(t, show_containers),
         button(text(pin_glyph).font(ICON_FONT).size(14))
             .on_press(Message::TerminalPluginPinToggled(id))
             .padding(buttons::PADDING)
@@ -713,15 +1455,17 @@ fn terminal_body(terms: &TerminalsState, font_scale: TerminalFontScale) -> Eleme
     .spacing(6)
     .align_y(Alignment::Center);
 
-    let body = terminal_ui::view(
-        t.id,
-        t.pane.grid.clone(),
-        t.pane.master(),
-        terms.focused,
-        true,
+    let body = terminal_ui::view(terminal_ui::View {
+        id:         t.id,
+        grid:       t.pane.grid.clone(),
+        master:     t.pane.master(),
+        focused:    terms.focused,
+        is_shell:   true,
         font_scale,
-        t.pane.selection,
-    );
+        selection:  t.pane.selection,
+        transcript: false,
+        find:       None,
+    });
 
     column![header, body]
         .spacing(8)

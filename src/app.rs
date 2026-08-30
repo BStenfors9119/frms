@@ -1,26 +1,27 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use iced::widget::{column, container, pane_grid, text_editor, text_input};
+use iced::widget::{column, container, image, pane_grid, scrollable, text_editor, text_input};
 use iced::widget::pane_grid::Configuration;
 use iced::{Element, Length, Subscription, Task, Theme, window};
 use iced::keyboard::{self, key};
 
-use crate::agent::{AgentKind, AgentPane, ChatMessage, ChatPane, ChatRole};
+use crate::agent::{AgentKind, AgentPane, ChatPane, ChatRole};
 use crate::cdp;
 use crate::chat_api;
 use crate::claude_prompt;
+use crate::cloud_sql;
 use crate::db::{self, DbClient, DbEngine, DbProvider, ForeignKey, QueryResult, RoutineRef, StatementOutcome, TableRef};
 use crate::db_panel::{ColRef, Conj, ConnState, Filter, FilterOp};
 use crate::file_browser::{DirEdit, FileBrowserState};
-use crate::notes::{NoteFormat, NoteViewMode, NotesState};
+use crate::notes::{CategoryChoice, NoteFormat, NoteViewMode, NotesState};
 use crate::plugin_panel::{PluginSlot, PluginTab};
 use crate::prefs::Prefs;
 use crate::stats::{self, ClaudeStats, ProcStats, RefreshInterval};
 use crate::theme::{self as theme_mod, FontScale, Mode, Palette, TerminalFontScale, ThemeColors};
 use crate::pane::PaneKind;
 use crate::session::{Session, SessionKind};
-use crate::terminal::{self, TerminalId};
+use crate::terminal::{self, TerminalId, TerminalPane};
 use crate::ui;
 
 /// How long the surfaced permission prompt must stay undetected before the
@@ -29,10 +30,20 @@ use crate::ui;
 /// enough that the pane disappears promptly once the prompt is truly answered.
 const PROMPT_CLEAR_DELAY: Duration = Duration::from_millis(400);
 
-/// Text-input widget id for a chat pane's message box, so the app can move
-/// keyboard focus into it when the pane is created or selected.
-pub fn chat_input_id(id: TerminalId) -> text_input::Id {
-    text_input::Id::new(format!("chat-input-{id}"))
+/// The same debounce, but for the case where the terminal still shows *a*
+/// question menu and only our parse of it came up empty. That's a half-drawn
+/// repaint, not an answered question, so the panel holds — bounded, so a
+/// question we genuinely can't parse can't strand the previous one's diff.
+const PROMPT_STALE_MAX: Duration = Duration::from_secs(4);
+
+/// How long a *different* reading of the prompt must hold still before the
+/// panel adopts it. Keeps the diff from redrawing on every mid-repaint frame.
+const PROMPT_SWAP_SETTLE: Duration = Duration::from_millis(250);
+
+/// Scrollable widget id for a chat pane's transcript, so the app can snap it
+/// to the bottom as replies stream in (auto-scroll to the latest answer).
+pub fn chat_scroll_id(id: TerminalId) -> scrollable::Id {
+    scrollable::Id::new(format!("chat-scroll-{id}"))
 }
 
 // ── splash animation state ────────────────────────────────────────────────────
@@ -85,12 +96,120 @@ pub enum PendingClose {
     Claude(TerminalId),
 }
 
-/// Full-screen file picker for choosing a local file to copy to a receiver.
-/// Carries its own directory browser plus the receiver the chosen file is
-/// destined for (captured at open time so it can't drift).
+/// Full-screen file picker for choosing a local file. Carries its own
+/// directory browser plus what the choice is for — captured at open time so it
+/// can't drift while the overlay is up.
 pub struct FilePicker {
-    pub browser:  FileBrowserState,
-    pub receiver: u64,
+    pub browser: FileBrowserState,
+    pub purpose: PickerPurpose,
+}
+
+/// Which flow a picked file belongs to. One overlay serves them all; this is
+/// what tells `FilePickerChoose` where to send the path.
+#[derive(Debug, Clone, Copy)]
+pub enum PickerPurpose {
+    /// Copy the chosen file to this receiver.
+    ReceiverCopy(u64),
+    /// Use the chosen file as the Cloud SQL Proxy's service-account key.
+    CloudSqlCredentials,
+}
+
+impl PickerPurpose {
+    /// Heading shown at the top of the picker overlay.
+    fn title(self, receiver_name: &str) -> String {
+        match self {
+            PickerPurpose::ReceiverCopy(_) =>
+                format!("Choose a file to copy to “{receiver_name}”"),
+            PickerPurpose::CloudSqlCredentials =>
+                String::from("Choose the Cloud SQL service-account key"),
+        }
+    }
+
+    /// One-line explanation under the listing.
+    fn hint(self) -> &'static str {
+        match self {
+            PickerPurpose::ReceiverCopy(_) =>
+                "Click a folder to open it; click a file to copy it.",
+            PickerPurpose::CloudSqlCredentials =>
+                "Click a folder to open it; click your auth.json to use it.",
+        }
+    }
+}
+
+/// State of the per-model usage breakdown card, opened by clicking one of the
+/// header usage bars. The window is captured at open time so a stats refresh
+/// behind the card can't repoint it at the other bar.
+pub struct UsageBreakdown {
+    pub window: crate::stats::UsageWindow,
+    /// Whether the scan follows the limit window (matching the bar) or a plain
+    /// trailing span. Early in a weekly window the two differ enormously, so
+    /// the card lets the reader switch.
+    pub scope:  crate::stats::UsageScope,
+    /// Unix-second start of the span that was scanned — shown so the user can
+    /// see exactly what the card covers.
+    pub since:  i64,
+    /// `None` while the transcript scan is still running.
+    pub data:   Option<crate::stats::ModelBreakdown>,
+}
+
+/// State of the "Change model" dialog — retarget one or many of a project's
+/// running AI sessions at a different model without closing and recreating
+/// them. Opened from the agent strip's "Model" button (or Ctrl+Shift+M).
+pub struct AgentsDialog {
+    /// Session whose agent panes are being retargeted, captured when the
+    /// dialog opened so switching projects behind it can't move the goalposts.
+    pub session_id: usize,
+    /// Agent panes ticked for the change, by terminal id. Panes that have gone
+    /// away since are ignored on apply.
+    pub selected:   Vec<TerminalId>,
+    /// The model the user picked, with the tool whose list it came from.
+    /// `None` until they choose one — Apply stays disabled meanwhile.
+    pub choice:     Option<(crate::agent::AiTool, crate::agent::ToolModel)>,
+    /// Result of the last Apply, shown in the dialog: how many panes switched
+    /// in place, how many were restarted, and how many were skipped.
+    pub outcome:    Option<ModelChangeOutcome>,
+    /// The pane whose ✕ has been pressed and is awaiting confirmation. Closing
+    /// ends a running CLI, so it asks first — inline in the row rather than as
+    /// a second overlay stacked on this one.
+    pub confirming: Option<TerminalId>,
+}
+
+/// Tally of what an Apply actually did, per delivery method.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelChangeOutcome {
+    /// Panes switched without losing their session (`/model` into a live CLI,
+    /// or a chat pane's next-turn override).
+    pub in_place:  usize,
+    /// Build panes whose CLI had to be relaunched with a new `--model`.
+    pub respawned: usize,
+    /// Selected panes the chosen model doesn't apply to (a different tool).
+    pub skipped:   usize,
+}
+
+impl ModelChangeOutcome {
+    pub fn changed(&self) -> usize {
+        self.in_place + self.respawned
+    }
+
+    /// One-line summary for the dialog's status row.
+    pub fn summary(&self) -> String {
+        let plural = |n: usize| if n == 1 { "agent" } else { "agents" };
+        let mut parts = Vec::new();
+        if self.in_place > 0 {
+            parts.push(format!("{} {} switched", self.in_place, plural(self.in_place)));
+        }
+        if self.respawned > 0 {
+            parts.push(format!("{} restarted", self.respawned));
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} skipped (different tool)", self.skipped));
+        }
+        if parts.is_empty() {
+            "Nothing to change.".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
 }
 
 pub struct Frms {
@@ -112,12 +231,33 @@ pub struct Frms {
     /// Inline rename for a Claude terminal tab — `(terminal_id, draft)`.
     pub renaming_claude:         Option<(TerminalId, String)>,
     /// `true` while the "+ Agent" button's dropdown menu is open.
-    pub agent_menu_open:         bool,
+    /// `true` while the agent-tab strip is wider than the space it has, i.e.
+    /// while a horizontal scrollbar is actually drawn over it. The strip only
+    /// reserves the blank gutter that keeps the bar off the tabs when this is
+    /// set — see `ui::editor::AGENT_SCROLLBAR_GUTTER`. Measured by the strip
+    /// itself (`Message::AgentStripViewport`); cleared optimistically whenever
+    /// the strip's contents or the layout change, so it shrinks back.
+    pub agent_strip_overflow:    bool,
+    /// Fingerprint of what the strip last rendered, so `update` can tell when
+    /// the tabs changed and the overflow measurement needs redoing.
+    agent_strip_sig:             u64,
+    /// `Some` while the "Change model" dialog is on screen.
+    pub agents_dialog:            Option<AgentsDialog>,
     next_terminal_id:            u64,
     next_session_id:             usize,
     pub claude_stats:            ClaudeStats,
+    /// True when the most recent usage fetch failed (rate limit, offline,
+    /// expired token) and `claude_stats` is therefore an older reading — or no
+    /// reading at all. The header says so rather than letting a stale or empty
+    /// bar be read as "0% used".
+    pub stats_stale:             bool,
     pub claude_procs:            ProcStats,
     pub stats_refresh_interval:  RefreshInterval,
+    /// `Some` while the per-model usage breakdown is on screen — opened by
+    /// clicking either header usage bar. `data` is `None` until the transcript
+    /// scan finishes, so the card can show a "reading…" line instead of
+    /// blocking the UI thread on a few hundred MB of JSONL.
+    pub usage_breakdown:         Option<UsageBreakdown>,
     // Preferences
     pub prefs:                   Prefs,
     pub showing_prefs:           bool,
@@ -246,6 +386,8 @@ pub enum Message {
     DirEditCancel,
     // Editor (active session)
     EditorAction(text_editor::Action),
+    /// Write the active editor buffer back to its file (Ctrl+S / Save button).
+    EditorSave,
     EditorTogglePreview,
     EditorRefreshPreview,
     EditorPreviewReady(usize, PathBuf, Result<Vec<u8>, String>),
@@ -256,6 +398,11 @@ pub enum Message {
     TerminalExited(TerminalId),
     TerminalInput(String),
     TerminalScroll(TerminalId, f32),
+    /// Scrolled while a drag-selection is in progress: scroll by the given
+    /// lines *and* move the selection head to the viewport cell the mouse is
+    /// over afterwards, so the highlight extends into the newly revealed rows
+    /// instead of being capped at one screenful.
+    TerminalScrollDrag(TerminalId, f32, usize, usize),
     /// Left mouse pressed on a terminal canvas at the given viewport cell —
     /// focuses the terminal and starts a drag-selection anchored on the cell.
     TerminalMouseDown(TerminalId, usize, usize),
@@ -288,19 +435,90 @@ pub enum Message {
     ClipboardWritten,
     TabPressed { shift: bool },
     /// Add a new agent pane of the given kind to the active session and select
-    /// its tab (Build = Claude Code PTY, Research/Chat = native chat).
-    AgentAdded(AgentKind),
+    /// its tab (Build = an AI CLI in a PTY, Research/Chat = native Claude chat).
+    /// The `AiTool` chooses which CLI a `Build` pane runs; the `ToolModel` picks
+    /// its model (`--model`). Chat panes are Claude-only, so they ignore the
+    /// tool and take the model as an override on their kind's default.
+    AgentAdded(AgentKind, crate::agent::AiTool, crate::agent::ToolModel),
+    /// Add a Build pane using the user's default tool at its default model
+    /// (the Ctrl+Shift+T quick shortcut). Resolved to [`Message::AgentAdded`] in
+    /// `update`, where the prefs are reachable.
+    NewDefaultAgent,
     /// Toggle the "+ Agent" dropdown menu open/closed.
-    AgentMenuToggled,
+    /// Nudge the agent-tab strip one tab's worth left/right — the ❮ ❯ buttons
+    /// beside it, for reaching tabs that have scrolled out of the strip.
+    AgentTabsNudged { forward: bool },
+    /// The agent-tab strip reporting its own geometry. Iced only publishes this
+    /// while the strip overflows (see `notify_viewport` in `iced_widget`), which
+    /// is exactly the question `agent_strip_overflow` answers.
+    AgentStripViewport(iced::widget::scrollable::Viewport),
+    /// The window changed size — panes (and so the agent-tab strip) got
+    /// re-laid-out. Nothing to update beyond re-measuring what now fits.
+    WindowResized,
+    /// Toggle the find bar on whichever agent pane is in front (Ctrl+Shift+L).
+    /// Resolved to [`Message::FindOpened`] in `update`, where the active
+    /// session's front tab is known.
+    FindToggled,
+    /// Toggle the find bar on an agent pane, focusing its input when it opens.
+    /// Re-opening keeps the last query, so the search resumes where it left off.
+    FindOpened(TerminalId),
+    /// The find query changed — re-run the search and jump to its newest hit.
+    FindQueryChanged(TerminalId, String),
+    /// Step to the next (`forward`) or previous hit, wrapping at the ends.
+    FindStepped(TerminalId, bool),
+    /// Close the find bar and drop its highlights.
+    FindClosed(TerminalId),
+    /// Open the "Change model" dialog for the active session, pre-ticking the
+    /// agent pane that's currently in front.
+    AgentsDialogOpened,
+    /// Dismiss the "Change model" dialog without applying anything.
+    AgentsDialogClosed,
+    /// Tick / untick one agent pane in the "Change model" dialog.
+    AgentsDialogPaneToggled(TerminalId),
+    /// Tick every eligible pane (`true`) or none (`false`).
+    AgentsDialogSelectAll(bool),
+    /// Pick the model to switch the ticked panes to, from `AiTool`'s list.
+    AgentsDialogModelPicked(crate::agent::AiTool, crate::agent::ToolModel),
+    /// Apply the picked model to every ticked pane.
+    AgentsDialogApplied,
+    /// ✕ on an agent row — arm the inline "close this one?" confirmation.
+    AgentsDialogPaneCloseRequested(TerminalId),
+    /// Back out of that confirmation.
+    AgentsDialogPaneCloseCancelled,
+    /// Confirmed — close the pane and stop its CLI.
+    AgentsDialogPaneClosed(TerminalId),
     /// Edited the draft input of a chat (Research/Chat) pane.
-    ChatInputEdited(TerminalId, String),
+    ChatInputAction(TerminalId, text_editor::Action),
+    /// Interaction with a completed transcript bubble (the `usize` indexes
+    /// `ChatPane::transcript`). The bubble editors are read-only, so only
+    /// cursor/selection actions are applied — edits are dropped — letting the
+    /// user highlight a span of a past reply.
+    ChatBubbleAction(TerminalId, usize, text_editor::Action),
+    /// Ctrl/Cmd+C over a transcript bubble — copy that bubble's selection.
+    ChatBubbleCopy(TerminalId, usize),
+    /// "+ Note" on a transcript bubble — turn the highlighted span into a note.
+    ChatSendToNote(TerminalId, usize),
     /// Submitted the draft of a chat pane — sends the transcript to the API.
     ChatSubmitted(TerminalId),
+    /// A chat pane's reply reached for a tool ("Read  src/app.rs"). Shown while
+    /// the reply streams so a turn spent working the project shows progress.
+    ChatActivity(TerminalId, String),
+    /// Ctrl/Cmd+C in a chat pane's input — copy the selection to the clipboard.
+    ChatCopy(TerminalId),
+    /// Ctrl/Cmd+X in a chat pane's input — cut the selection to the clipboard.
+    ChatCut(TerminalId),
+    /// Ctrl/Cmd+V in a chat pane's input — kicks off an async clipboard read.
+    ChatPaste(TerminalId),
+    /// The clipboard read for a chat-pane paste finished; insert its contents.
+    ChatPasteReady(TerminalId, Option<String>),
     /// A streamed text fragment arrived for a chat pane's in-flight reply.
     ChatDelta(TerminalId, String),
     /// A chat pane's reply stream finished — `Ok(session_id)` (to resume on the
     /// next turn) or `Err(message)` on failure.
     ChatEnded(TerminalId, Result<String, String>),
+    /// The user scrolled a chat transcript. Tracks whether the view is still at
+    /// the bottom, which decides if streaming text keeps auto-scrolling.
+    ChatScrolled(TerminalId, scrollable::Viewport),
     /// Close a Claude terminal tab from a session (only when more than one exists).
     ClaudeSessionClosed(TerminalId),
     /// Begin inline rename of the named Claude terminal tab.
@@ -334,11 +552,16 @@ pub enum Message {
     // Keyboard navigation (see `handle_key` and the Profile shortcuts callout)
     /// Cycle keyboard focus across the active project's panes (and the toolbox).
     CyclePane { forward: bool },
+    /// Cycle keyboard focus through only the active project's agent panes,
+    /// skipping the toolbox (Ctrl+Shift+A).
+    CycleAgentPane { forward: bool },
     /// Jump to the next/previous pane that's waiting on the user (a surfaced
     /// question or a review), across all sessions.
     CycleAttention { forward: bool },
     /// Switch to the next/previous project session (the top tabs).
     CycleSession { forward: bool },
+    /// Cycle the toolbox (plugin panel) to the next/previous tool tab.
+    CyclePluginTab { forward: bool },
     /// Close the currently focused agent pane (same confirm flow as its ✕).
     CloseActiveAgent,
     // Claude-Code-required startup prompt
@@ -348,14 +571,28 @@ pub enum Message {
     ClaudeRecheck,
     // Stats
     StatsRefresh,
-    StatsLoaded(ClaudeStats),
+    /// A usage fetch finished. `None` means it failed — the handler keeps the
+    /// previous reading rather than clobbering it with zeros.
+    StatsLoaded(Option<ClaudeStats>),
     ProcsLoaded(ProcStats),
     StatsRefreshIntervalChanged(RefreshInterval),
+    /// A usage bar was clicked — open the per-model breakdown for its window.
+    UsageBreakdownOpened(crate::stats::UsageWindow),
+    /// The transcript scan finished; fill in the open card.
+    UsageBreakdownLoaded(crate::stats::ModelBreakdown),
+    /// Re-run the scan for the window the card is already showing.
+    UsageBreakdownRefreshed,
+    /// Switch the open card between the limit window and a trailing span.
+    UsageBreakdownScopeChanged(crate::stats::UsageScope),
+    UsageBreakdownClosed,
     // Plugin panel (DB / Profile / Notes / Terminals)
     /// A tab was clicked in the given slot — switch that slot to the tab.
     PluginTabClicked(PluginSlot, PluginTab),
     /// Hide a plugin from the tab bar via its per-tab `✕`.
     PluginTabHidden(PluginTab),
+    /// Ctrl+Shift+1…9 — focus agent pane N of the active session directly,
+    /// without starting the panes in between (see the update arm).
+    AgentPaneSelected(usize),
     /// Re-show a hidden plugin (and make it active) from the `+` picker.
     PluginTabShown(PluginTab),
     /// Toggle the `+` add-plugin picker that lists hidden plugins.
@@ -368,6 +605,12 @@ pub enum Message {
     PluginPanelDockToggled,
     /// Split the panel into two stacked slots, or merge back to one.
     PluginPanelSplitToggled,
+    /// Expand the panel to full width (hiding the main working area), or
+    /// restore the main area. The mirror of hiding the panel entirely.
+    PluginPanelExpandToggled,
+    /// Open/close the `⋯` overflow menu holding the panel-wide controls
+    /// (dock / split / expand / close) so they stay usable at any panel width.
+    PluginPanelControlsToggled,
     /// User pressed the drag handle on the inner edge of the plugin panel.
     PluginPanelResizeStart,
     /// Latest cursor x while a width-resize drag is active (logical px from window left).
@@ -380,9 +623,28 @@ pub enum Message {
     PluginSplitResizeMove(f32),
     /// Mouse released — end the split drag.
     PluginSplitResizeEnd,
+    // Docs (search over the project's `_specs` / `_docs` folders)
+    /// Search text changed — filters the index by name / relative path.
+    DocsQueryChanged(String),
+    /// Narrow the list to documents modified within a given window.
+    DocsDateChanged(crate::docs::DateFilter),
+    /// Reorder results by name or by most-recently-modified.
+    DocsSortChanged(crate::docs::SortBy),
+    /// Re-read `_specs` / `_docs` from disk (the ↻ button).
+    DocsRefresh,
+    /// Reset the search text and date filter, keeping the sort order.
+    DocsClearFilters,
+    /// Ctrl+Shift+S — surface the Docs tab, rescan, and focus its search box.
+    DocsOpen,
     // Notes
     NotesNew,
     NotesSelected(u64),
+    /// Filter the notes list by title / body / category text.
+    NotesSearchChanged(String),
+    /// Clear the notes-list search filter (the ✕ beside the field).
+    NotesSearchCleared,
+    /// Ctrl+Shift+G — surface the Notes tab and focus its search box.
+    NotesSearchOpen,
     NotesDelete(u64),
     NotesTitleEdited(String),
     NotesContentAction(text_editor::Action),
@@ -391,6 +653,11 @@ pub enum Message {
     NotesFormat(NoteFormat),
     /// Switch the note body between Edit / Split / Preview display.
     NotesViewMode(NoteViewMode),
+    /// Tab in the note body editor — indent the selected lines, or insert one
+    /// indent step at the cursor.
+    NotesIndent,
+    /// Shift+Tab in the note body editor — strip one indent step.
+    NotesOutdent,
     /// Send the highlighted selection (or the whole note if nothing is
     /// highlighted) to the active session's active Claude terminal.
     NotesSendToClaude,
@@ -399,6 +666,22 @@ pub enum Message {
     /// Move keyboard focus from the note Title field into the body editor —
     /// emitted by Tab or Enter while naming.
     NotesFocusBody,
+    /// A category was picked for the selected note from the dropdown — an
+    /// existing one, "General" (uncategorized), or "+ New category…".
+    NotesCategorySelected(CategoryChoice),
+    /// Keystroke in the new-category name field.
+    NotesCategoryInput(String),
+    /// Commit the typed new-category name to the selected note (Enter / Add).
+    NotesCategoryCommit,
+    /// Abandon the new-category name field without changing the category.
+    NotesCategoryCancel,
+    /// Collapse/expand a category group in the notes list. Empty string is the
+    /// uncategorized ("General") group.
+    NotesCategoryToggleCollapsed(String),
+    /// Install an AI CLI tool from the Profile tab: opens a Terminals-plugin
+    /// shell running the tool's one-shot install command, then drops the user
+    /// into a shell to sign in.
+    InstallTool(crate::agent::AiTool),
     // Terminals plugin (per-session shell terminals)
     TerminalPluginNew,
     TerminalPluginSelected(TerminalId),
@@ -419,10 +702,16 @@ pub enum Message {
     ReceiverContainerDelete(u64),
     /// Expand/collapse a container row in the tree.
     ReceiverContainerToggle(u64),
+    /// Reparent a container under another (`None` = top level).
+    ReceiverContainerMoveTo(u64, Option<u64>),
+    /// Move every receiver held directly by the first container into the second.
+    ReceiverMoveAll(u64, u64),
     /// Add a receiver under the given container.
     ReceiverAdd(u64),
     ReceiverSelect(u64),
     ReceiverDelete(u64),
+    /// Move a single receiver into another container.
+    ReceiverMoveTo(u64, u64),
     // Edit form for the selected receiver.
     ReceiverNameEdited(String),
     ReceiverHostEdited(String),
@@ -433,14 +722,20 @@ pub enum Message {
     ReceiverConnect(u64),
     /// Tear down the live SSH session for the given receiver.
     ReceiverSshDisconnect(u64),
+    /// Open an SSH session to every receiver under the given container.
+    ReceiverConnectAll(u64),
+    /// Tear down every SSH session under the given container.
+    ReceiverDisconnectAll(u64),
+    /// Collapse/expand the credential form so the SSH terminal can grow.
+    ReceiverToggleConnectionForm,
     /// Open the file picker to choose a local file to copy to the selected receiver.
     ReceiverCopyPick,
     /// Navigate the file picker to a directory.
-    ReceiverPickerBrowse(std::path::PathBuf),
-    /// A file was chosen in the picker — copy it to the picker's receiver.
-    ReceiverPickerChoose(std::path::PathBuf),
-    /// Dismiss the file picker without copying.
-    ReceiverPickerCancel,
+    FilePickerBrowse(std::path::PathBuf),
+    /// A file was chosen — routed by the picker's `PickerPurpose`.
+    FilePickerChoose(std::path::PathBuf),
+    /// Dismiss the file picker without choosing.
+    FilePickerCancel,
     /// Copy a specific file (e.g. a file-browser row action) to the selected receiver.
     ReceiverCopyFile(std::path::PathBuf),
     /// Result of an scp copy.
@@ -480,17 +775,41 @@ pub enum Message {
     DbPasswordEdited(String),
     DbDatabaseEdited(String),
     DbFieldSubmitted(&'static str),
+    // ── Cloud SQL Auth Proxy (GCP provider only) ──────────────────────────
+    /// Instance connection name (`project:region:instance`) edited.
+    DbInstanceEdited(String),
+    /// Open the file picker to choose the proxy's service-account key.
+    DbProxyCredentialsPick,
+    /// Forget the chosen key — the proxy falls back to gcloud ADC.
+    DbProxyCredentialsCleared,
+    /// Collapse/expand the Cloud SQL section of the connection form.
+    DbProxyToggleCollapsed,
+    /// Start the proxy. `then_connect` is set when this was triggered by
+    /// Connect, so a successful start chains straight into the connection.
+    DbProxyStart { then_connect: bool },
+    /// Outcome of a start attempt, tagged with the session it belongs to.
+    DbProxyStarted(usize, bool, Result<crate::cloud_sql::Proxy, String>),
+    /// Stop the managed proxy.
+    DbProxyStop,
+    /// Install the Cloud SQL Proxy — runs the packaged setup helper in a
+    /// Terminals-plugin pane, like the Profile tab's tool installs.
+    DbProxyInstall,
     DbConnect,
-    DbConnected(usize, Result<(DbClient, Vec<TableRef>, Vec<ForeignKey>, Vec<RoutineRef>), String>),
+    /// Outcome of a connect attempt, tagged with the session and the panel epoch
+    /// it was issued under (see `DbPanel::epoch`).
+    DbConnected(usize, u64, Result<(DbClient, Vec<TableRef>, Vec<ForeignKey>, Vec<RoutineRef>), String>),
     DbDisconnect,
+    /// Force the panel back to a clean disconnected state — the way out when the
+    /// connection has died and the tool is wedged waiting on it.
+    DbReset,
     DbTableToggled(String),
     /// Open a stored procedure/function's source for viewing (Objects list).
     DbRoutineSelected(RoutineRef),
     /// The fetched source of the selected routine (or an error).
-    DbRoutineLoaded(usize, Result<String, String>),
+    DbRoutineLoaded(usize, u64, Result<String, String>),
     /// Dismiss the routine source view and return to query results.
     DbRoutineClosed,
-    DbColumnsLoaded(usize, String, Result<Vec<String>, String>),
+    DbColumnsLoaded(usize, u64, String, Result<Vec<String>, String>),
     DbColumnToggled(String, String),
     /// Check/uncheck "All fields" — select or clear every available column.
     DbFieldsSelectAll(bool),
@@ -522,17 +841,25 @@ pub enum Message {
     DbRunQuery,
     /// Re-run the last query so the results list reflects current data.
     DbRefreshResults,
-    DbQueryResult(usize, Result<QueryResult, String>),
+    DbQueryResult(usize, u64, Result<QueryResult, String>),
     DbResetTables,
     /// Switch the builder row between the visual builder and the free-hand SQL
     /// editor (false = builder, true = raw SQL).
     DbSetSqlMode(bool),
     /// Edit the free-hand SQL buffer.
     DbSqlAction(text_editor::Action),
+    /// Ctrl/Cmd+C in the SQL editor — copy the selection to the clipboard.
+    DbSqlCopy,
+    /// Ctrl/Cmd+X in the SQL editor — cut the selection to the clipboard.
+    DbSqlCut,
+    /// Ctrl/Cmd+V in the SQL editor — kicks off an async clipboard read.
+    DbSqlPaste,
+    /// The clipboard read for a SQL-editor paste finished; insert its contents.
+    DbSqlPasteReady(Option<String>),
     /// Execute the free-hand SQL verbatim against the connection.
     DbRunSql,
     /// Outcome of a free-hand statement — a result set or an affected-row count.
-    DbStatementResult(usize, Result<StatementOutcome, String>),
+    DbStatementResult(usize, u64, Result<StatementOutcome, String>),
     /// Filter the Tables/Objects list in Col 1 by name.
     DbObjectFilterChanged(String),
     /// Collapse/expand the Tables and Objects groups in Col 1.
@@ -542,6 +869,14 @@ pub enum Message {
     DbRow1ToggleCollapsed,
     /// Copy a single results-table cell value (e.g. an ID) to the clipboard.
     DbCopyValue(String),
+    /// Pick the text format used when copying results (CSV/TSV/Markdown/JSON).
+    DbCopyFormatChanged(crate::db::CopyFormat),
+    /// Copy the whole result set — header row and all rows — to the clipboard.
+    DbCopyResults,
+    /// Copy one record (row index) from the result set to the clipboard.
+    DbCopyRow(usize),
+    /// The results body scrolled — keep the frozen header aligned horizontally.
+    DbResultsScrolled(scrollable::Viewport),
     // Center-pane tab switcher
     CenterTabSelected(crate::session::CenterTab),
     // Preferences
@@ -554,8 +889,21 @@ pub enum Message {
     PrefsModeChanged(Mode),
     PrefsFontScaleChanged(FontScale),
     PrefsTerminalFontScaleChanged(TerminalFontScale),
+    /// Profile-tab picker for the file-browser submodule highlight color.
+    PrefsSubmoduleColorChanged(iced::Color),
     /// Profile-tab toggle for anonymous usage telemetry.
     PrefsTelemetryToggled(bool),
+    /// Profile-tab picker for the default AI tool new Build panes launch.
+    PrefsDefaultToolChanged(crate::agent::AiTool),
+    /// Profile-tab toggle: hide tools not on `PATH` from the "+ Agent" picker.
+    PrefsFilterToolsToggled(bool),
+    /// Profile tab: how much of the project the native chat panes may touch.
+    PrefsChatAccessChanged(crate::chat_api::ChatAccess),
+    /// Profile tab: switch one `ls` short option on/off for new shell terminals.
+    PrefsLsFlagToggled(char, bool),
+    /// Profile tab: this machine runs an immutable OS, so shell terminals track
+    /// and re-enter the toolbox/distrobox they were left in.
+    PrefsImmutableSystemToggled(bool),
     /// First-run telemetry notice dismissed — `true` keeps telemetry on, `false`
     /// turns it off. Either way the notice is acknowledged and won't reappear.
     TelemetryNoticeChoice(bool),
@@ -579,7 +927,23 @@ pub fn title(state: &Frms) -> String {
 }
 
 pub fn update(state: &mut Frms, message: Message) -> Task<Message> {
-    state.update(message)
+    // A message that rearranges the layout invalidates the agent strip's
+    // overflow measurement the same way a changed set of tabs does — the strip
+    // keeps the same tabs but gets a different width to fit them in.
+    let relaid_out = matches!(
+        message,
+        Message::PaneResized(..)
+            | Message::SplitResized(..)
+            | Message::WindowResized
+            | Message::PluginPanelResizeMove(_)
+            | Message::PluginPanelToggled,
+    );
+    let task = state.update(message);
+    // Agent panes spawn lazily; whatever this message did to the layout, start
+    // the CLI for any pane it just brought on screen (see `spawn_visible_panes`).
+    state.spawn_visible_panes();
+    state.refresh_agent_strip_overflow(relaid_out);
+    task
 }
 
 pub fn view(state: &Frms) -> Element<'_, Message> {
@@ -628,10 +992,14 @@ impl Frms {
             new_session_file_browser: new_session_browser,
             renaming_session:         None,
             renaming_claude:          None,
-            agent_menu_open:          false,
+            agent_strip_overflow:     false,
+            agent_strip_sig:          0,
+            agents_dialog:             None,
+            usage_breakdown:          None,
             next_terminal_id:         0,
             next_session_id:          1,
             claude_stats:             ClaudeStats::default(),
+            stats_stale:              false,
             claude_procs:             ProcStats::default(),
             stats_refresh_interval:   RefreshInterval::default(),
             prefs,
@@ -660,18 +1028,18 @@ impl Frms {
             splash_audio_children:    Vec::new(),
         };
         app.restore_persisted();
-        // Telemetry only starts after the user has seen the first-run notice —
-        // no events (not even launch) are sent before consent. Once acked, it
-        // honors the on/off pref. The first post-consent launch is recorded by
-        // the notice handler.
-        if app.prefs.telemetry_notice_ack {
-            app.telemetry = crate::telemetry::Telemetry::start(app.prefs.telemetry);
-            app.telemetry.record(crate::telemetry::Event::Launch);
-        }
-        let init_stats = Task::perform(
-            stats::load(),
-            |s| Message::StatsLoaded(s.unwrap_or_default()),
-        );
+        // Telemetry starts here, every launch. The essential tier (one `install`
+        // per install, one `launch` per open) is always reported — the first-run
+        // notice discloses it and the Profile toggle doesn't cover it. The
+        // toggle governs the optional tier only, and applies from this point:
+        // no feature-usage or diagnostic event can fire before `new` returns.
+        // A restored session parked on an agent tab is displayed as soon as the
+        // window paints, so start that one pane before the first frame rather
+        // than waiting for whatever message happens to arrive next.
+        app.spawn_visible_panes();
+        app.telemetry = crate::telemetry::Telemetry::start(app.prefs.telemetry);
+        app.telemetry.record(crate::telemetry::Event::Launch);
+        let init_stats = Task::perform(stats::load(), Message::StatsLoaded);
         let init_procs = Task::perform(stats::load_procs(), Message::ProcsLoaded);
         // Start maximized: grab the freshly-opened window and maximize it.
         let maximize = window::get_latest()
@@ -698,28 +1066,52 @@ impl Frms {
             let mut session = Session::new(
                 ps.id, Some(ps.name.clone()), ps.kind,
                 first_term, ps.working_dir.clone(),
+                // Restore respawns pane[0] from the persisted tool below, so the
+                // baseline here is the default (Claude) that logic compares to.
+                crate::agent::AiTool::default(),
             );
             // Restored sessions were only written because they were pinned,
             // so keep them pinned (otherwise they'd vanish on next save).
             session.pinned = ps.pinned;
-            // `Session::new` always makes pane[0] a Build/Claude PTY. If this
-            // session's first tab was actually a chat pane, swap it (killing the
-            // just-spawned `claude` child so it doesn't linger orphaned).
+            // Resolve the persisted (tool, model) for tab `i`. Missing entries
+            // default to Claude at its default model — matching how pre-tool
+            // save files (which only ran `claude`) should come back.
+            let resolve_tool_model = |i: usize| -> (crate::agent::AiTool, crate::agent::ToolModel) {
+                let tool = ps.claude_tools.get(i).copied().unwrap_or_default();
+                let model = ps.claude_models.get(i)
+                    .and_then(|tok| tool.model_by_token(tok))
+                    .copied()
+                    .unwrap_or_else(|| *tool.default_model());
+                (tool, model)
+            };
+
+            // `Session::new` always makes pane[0] a pending Build/Claude pane at
+            // the default model. If this session's first tab was actually a chat
+            // pane, swap it; if it was a different tool or a pinned model, point
+            // it at those instead. Nothing has been spawned yet, so both cases
+            // are a plain replacement — no child to kill.
             if let Some(k0) = ps.claude_kinds.first().copied() {
+                let (tool, model) = resolve_tool_model(0);
                 if !k0.is_agentic() {
-                    if let Some(t) = session.panes[0].as_terminal() {
-                        let _ = t.child.lock().map(|mut c| c.kill());
-                    }
-                    session.panes[0] = AgentPane::Chat(ChatPane::new(first_term, k0));
+                    let mut chat = ChatPane::new(first_term, k0);
+                    // Carry over a model the user picked for this chat pane.
+                    chat.model = model;
+                    session.panes[0] = AgentPane::Chat(chat);
+                } else {
+                    session.panes[0] = AgentPane::Pending(crate::agent::PendingPane {
+                        id: first_term, tool, model, name: None,
+                    });
                 }
             }
             // Recreate any additional tabs the session had open, each with its
-            // persisted kind (defaulting to Build for pre-kinds save files).
+            // persisted kind/tool/model (defaulting to Build/Claude for pre-kinds
+            // save files).
             for i in 1..ps.claude_count.max(1) {
                 let tid = self.next_terminal_id;
                 self.next_terminal_id += 1;
-                let kind = ps.claude_kinds.get(i).copied().unwrap_or_default();
-                session.add_agent(tid, kind);
+                let kind  = ps.claude_kinds.get(i).copied().unwrap_or_default();
+                let (tool, model) = resolve_tool_model(i);
+                session.add_agent(tid, kind, tool, model);
             }
             // Restore per-tab user-assigned names.
             for (i, p) in session.panes.iter_mut().enumerate() {
@@ -746,13 +1138,29 @@ impl Frms {
             if let Some(panel) = &ps.plugin_panel {
                 session.plugin_panel = panel.clone();
             }
+            session.file_browser_collapsed = ps.file_browser_collapsed;
             // Respawn the session's pinned plugin shell terminals as fresh
-            // shells, preserving the names the user gave them.
-            for name in &ps.plugin_terminals {
+            // shells, preserving the names the user gave them and reopening each
+            // in the directory it was last left in (falling back to the session
+            // root if that directory is gone or was never captured) and back
+            // inside the toolbox it was in.
+            for pt in &ps.plugin_terminals {
                 let tid = self.next_terminal_id;
                 self.next_terminal_id += 1;
+                let start_dir = pt.cwd.as_deref()
+                    .filter(|d| d.is_dir())
+                    .unwrap_or(&ps.working_dir);
+                let init = crate::terminals::ShellInit {
+                    // Only re-enter containers when the user runs an immutable
+                    // system; off, a saved container is remembered but ignored,
+                    // so turning the toggle back on restores the behaviour.
+                    container: self.prefs.immutable_system
+                        .then(|| pt.container.clone())
+                        .flatten(),
+                    ls_flags:  self.prefs.ls_flags.clone(),
+                };
                 session.terminals_plugin.create_with_name(
-                    tid, &ps.working_dir, name.clone(), true,
+                    tid, start_dir, pt.name.clone(), true, &init,
                 );
             }
             // `create_with_name` drops each respawned terminal into naming mode;
@@ -834,12 +1242,21 @@ impl Frms {
                 claude_count: s.panes.len(),
                 claude_names: s.panes.iter().map(|p| p.name().map(str::to_owned)).collect(),
                 claude_kinds: s.panes.iter().map(|p| p.kind()).collect(),
+                claude_tools: s.panes.iter().map(|p| p.tool()).collect(),
+                claude_models: s.panes.iter().map(|p| p.model_choice().token.to_string()).collect(),
                 plugin_terminals: s.terminals_plugin.terminals.iter()
                     .filter(|t| t.pinned)
-                    .map(|t| t.name.clone())
+                    .map(|t| crate::persisted::PersistedTerminal {
+                        name: t.name.clone(),
+                        // Capture where the shell is now so it reopens there.
+                        cwd:  t.pane.cwd(),
+                        // …and which toolbox it's in, so it reopens inside it.
+                        container: t.pane.container(),
+                    })
                     .collect(),
                 pinned:       s.pinned,
                 plugin_panel: Some(s.plugin_panel.clone()),
+                file_browser_collapsed: s.file_browser_collapsed,
             }
         }).collect();
 
@@ -858,6 +1275,91 @@ impl Frms {
             sessions, active_session_id, split_view,
         };
         state.save();
+    }
+
+    /// Point the agent panes in `targets` (of session `session_id`) at `model`
+    /// from `tool`'s list, and report what that took.
+    ///
+    /// Each pane is switched the least disruptive way it supports:
+    ///   - chat panes just record the override — the next turn resumes the same
+    ///     conversation on the new model;
+    ///   - a Build pane whose CLI takes an in-session command gets it typed into
+    ///     its PTY (`/model …` for Claude Code), so the session keeps running;
+    ///   - any other Build pane is relaunched with a new `--model`.
+    ///
+    /// Panes the model doesn't apply to — a `devin` pane when a Claude model
+    /// was picked, say — are left alone and counted as skipped.
+    ///
+    /// A relaunched pane comes back under a new terminal id, so `targets` is
+    /// rewritten in place: the caller's selection keeps following the same
+    /// agents rather than pointing at ids that no longer exist.
+    fn apply_model_change(
+        &mut self,
+        session_id: usize,
+        targets:    &mut [TerminalId],
+        tool:       crate::agent::AiTool,
+        model:      crate::agent::ToolModel,
+    ) -> ModelChangeOutcome {
+        let mut outcome = ModelChangeOutcome::default();
+        let Some(idx) = self.sessions.iter().position(|s| s.id == session_id) else {
+            return outcome;
+        };
+
+        // Panes that need a relaunch are collected first: each one needs a
+        // fresh terminal id, and handing those out borrows `self`.
+        let mut respawn: Vec<usize> = Vec::new();
+        {
+            let session = &mut self.sessions[idx];
+            for (slot, &tid) in targets.iter().enumerate() {
+                let Some(pane) = session.panes.iter_mut().find(|p| p.id() == tid) else {
+                    continue;
+                };
+                if !pane.accepts_models_from(tool) {
+                    outcome.skipped += 1;
+                    continue;
+                }
+                match pane {
+                    AgentPane::Chat(c) => {
+                        c.model = model;
+                        outcome.in_place += 1;
+                    }
+                    // Nothing has launched yet, so the choice just replaces the
+                    // model the pane will spawn with — no relaunch needed.
+                    AgentPane::Pending(p) => {
+                        p.model = model;
+                        outcome.in_place += 1;
+                    }
+                    // A pane still sitting in the install-guidance shell has no
+                    // CLI to type into, so it respawns — which also picks the
+                    // CLI up if it has been installed in the meantime.
+                    AgentPane::Terminal(t) => match tool.model_command(model)
+                        .filter(|_| t.agent_cli_ready)
+                    {
+                        Some(cmd) => {
+                            // Typed at the CLI exactly as the user would, so a
+                            // busy session queues it like any other input.
+                            t.write_input(format!("{cmd}\r").as_bytes());
+                            t.agent_model = model;
+                            outcome.in_place += 1;
+                        }
+                        None => respawn.push(slot),
+                    },
+                }
+            }
+        }
+
+        for slot in respawn {
+            let new_id = self.next_terminal_id;
+            self.next_terminal_id += 1;
+            if self.sessions[idx].respawn_agent(targets[slot], new_id, tool, model) {
+                targets[slot] = new_id;
+                outcome.respawned += 1;
+            } else {
+                // The pane vanished between the two passes — give the id back.
+                self.next_terminal_id -= 1;
+            }
+        }
+        outcome
     }
 
     pub fn title(&self) -> String {
@@ -934,6 +1436,19 @@ impl Frms {
                 if idx < self.sessions.len() {
                     self.active_session = idx;
                     self.save_persisted();
+                    return self.reveal_chat_panes();
+                }
+            }
+            Message::AgentPaneSelected(index) => {
+                // Straight to pane N. This matters beyond convenience: a Build
+                // pane starts its CLI the first time it comes on screen, so
+                // *cycling* from pane 1 to pane 9 launches all nine. Jumping
+                // puts only the target on screen, and only the target spawns.
+                let idx = self.active_session;
+                if let Some(tid) = self.sessions[idx].panes.get(index).map(|p| p.id()) {
+                    self.focus_pane(idx, tid);
+                    self.save_persisted();
+                    return self.reveal_chat_panes();
                 }
             }
             Message::NewSessionRequested => {
@@ -985,6 +1500,9 @@ impl Frms {
             }
             Message::ClosePendingConfirmed => {
                 self.confirm_pending_close();
+                // Closing a tab/session hands the center area to a neighbour,
+                // which may be a chat pane.
+                return self.reveal_chat_panes();
             }
             Message::ClosePendingCancelled => {
                 self.pending_close = None;
@@ -1036,6 +1554,8 @@ impl Frms {
                     });
                 }
                 self.save_persisted();
+                // Splitting/unsplitting changes which sessions are rendered.
+                return self.reveal_chat_panes();
             }
 
             Message::SessionPinToggled(target_id) => {
@@ -1064,6 +1584,7 @@ impl Frms {
                             }
                             self.active_session = idx;
                             self.save_persisted();
+                            return self.reveal_chat_panes();
                         }
                     }
                 }
@@ -1096,7 +1617,14 @@ impl Frms {
             }
             Message::FileBrowserToggleCollapsed => {
                 let s = &mut self.sessions[self.active_session];
-                s.file_browser_collapsed = !s.file_browser_collapsed;
+                // Browser sessions have no file-browser pane, so the chord is a
+                // no-op there rather than flipping a flag the user can't see —
+                // which would otherwise surprise them on the next Terminal
+                // session they switch to.
+                if matches!(s.kind, crate::session::SessionKind::Terminal) {
+                    s.file_browser_collapsed = !s.file_browser_collapsed;
+                    self.save_persisted();
+                }
             }
             Message::CopyPath(path) => {
                 return Task::perform(crate::clipboard::write(path), |_| Message::ClipboardWritten);
@@ -1124,7 +1652,14 @@ impl Frms {
 
             // ── editor ────────────────────────────────────────────────────────
             Message::EditorAction(action) => {
-                self.sessions[self.active_session].editor.content.perform(action);
+                let e = &mut self.sessions[self.active_session].editor;
+                if action.is_edit() {
+                    e.dirty = true;
+                }
+                e.content.perform(action);
+            }
+            Message::EditorSave => {
+                self.sessions[self.active_session].editor.save();
             }
             Message::EditorTogglePreview => {
                 let s = &mut self.sessions[self.active_session];
@@ -1133,7 +1668,7 @@ impl Frms {
                 e.preview_active = !e.preview_active;
                 if e.preview_active && e.preview_kind() == Some(crate::editor::PreviewKind::Html) {
                     if let Some(path) = e.path.clone() {
-                        let needs_render = e.preview_image.is_none()
+                        let needs_render = e.preview_handle.is_none()
                             || e.preview_image_path.as_deref() != Some(path.as_path());
                         if needs_render {
                             e.preview_loading = true;
@@ -1171,7 +1706,8 @@ impl Frms {
                     e.preview_loading = false;
                     match result {
                         Ok(bytes) => {
-                            e.preview_image      = Some(bytes);
+                            // Built here, once, rather than per-frame in view().
+                            e.preview_handle     = Some(image::Handle::from_bytes(bytes));
                             e.preview_image_path = Some(path);
                             e.preview_error      = None;
                         }
@@ -1191,9 +1727,10 @@ impl Frms {
                         // the tab/session attention highlight tracks reality.
                         // Runs for background sessions too — that's the point:
                         // alert the user about sessions they aren't watching.
-                        t.waiting_on_user = t.grid.lock()
+                        let menu_up = t.grid.lock()
                             .map(|g| claude_prompt::is_waiting_on_user(&g))
                             .unwrap_or(false);
+                        t.note_menu_on_screen(menu_up);
                     }
                     Self::reconcile_prompt(s, id);
                 } else if let Some(s) = self.session_for_plugin_terminal_mut(id) {
@@ -1228,55 +1765,307 @@ impl Frms {
                     self.save_persisted();
                 }
             }
-            Message::AgentMenuToggled => {
-                self.agent_menu_open = !self.agent_menu_open;
+            Message::FindToggled => {
+                // The pane in front, or — when the center is showing the
+                // editor / database instead — the session's active agent.
+                let s = &self.sessions[self.active_session];
+                let id = match s.center_tab {
+                    crate::session::CenterTab::Claude(tid) => tid,
+                    _ => s.active_terminal,
+                };
+                return self.update(Message::FindOpened(id));
             }
-            Message::AgentAdded(kind) => {
-                self.agent_menu_open = false;
+            Message::FindOpened(id) => {
+                // Toggle: the same chord that opens the bar closes it, since
+                // Escape belongs to the CLI running in the pane.
+                let open = self.find_is_open(id);
+                if open {
+                    self.find_close(id);
+                } else {
+                    self.find_open(id);
+                    return text_input::focus(crate::ui::editor::find_input_id(id));
+                }
+            }
+            Message::FindQueryChanged(id, q) => {
+                if let Some(t) = self.terminal_pane_mut(id) {
+                    t.find_query(q);
+                } else if let Some(c) = self.chat_pane_mut(id) {
+                    c.find_query(q);
+                    return self.reveal_chat_hit(id);
+                }
+            }
+            Message::FindStepped(id, forward) => {
+                if let Some(t) = self.terminal_pane_mut(id) {
+                    t.find_step(forward);
+                } else if let Some(c) = self.chat_pane_mut(id) {
+                    c.find_step(forward);
+                    return self.reveal_chat_hit(id);
+                }
+            }
+            Message::FindClosed(id) => {
+                self.find_close(id);
+            }
+            Message::AgentTabsNudged { forward } => {
+                let dx = if forward {
+                    crate::ui::editor::AGENT_TAB_NUDGE
+                } else {
+                    -crate::ui::editor::AGENT_TAB_NUDGE
+                };
+                // Clamped by the widget, so clicking at either end is a no-op.
+                return scrollable::scroll_by(
+                    crate::ui::editor::agent_strip_id(),
+                    scrollable::AbsoluteOffset { x: dx, y: 0.0 },
+                );
+            }
+            Message::AgentStripViewport(v) => {
+                self.agent_strip_overflow =
+                    v.content_bounds().width > v.bounds().width;
+            }
+            // Handled entirely by `refresh_agent_strip_overflow` in the `update`
+            // wrapper — the window's new size is iced's business, not ours.
+            Message::WindowResized => {}
+            Message::AgentsDialogOpened => {
+                let s = &self.sessions[self.active_session];
+                // Start on the agent that's in front: the common case is
+                // "switch this one", and "All" is one click away for the rest.
+                let front = match s.center_tab {
+                    crate::session::CenterTab::Claude(tid) => tid,
+                    _ => s.active_terminal,
+                };
+                let selected = s.panes.iter()
+                    .map(|p| p.id())
+                    .filter(|id| *id == front)
+                    .collect();
+                self.agents_dialog = Some(AgentsDialog {
+                    session_id: s.id,
+                    selected,
+                    choice:     None,
+                    outcome:    None,
+                    confirming: None,
+                });
+            }
+            Message::AgentsDialogClosed => {
+                self.agents_dialog = None;
+            }
+            Message::AgentsDialogPaneToggled(tid) => {
+                if let Some(d) = &mut self.agents_dialog {
+                    match d.selected.iter().position(|id| *id == tid) {
+                        Some(i) => { d.selected.remove(i); }
+                        None    => d.selected.push(tid),
+                    }
+                    // The tally described the previous selection.
+                    d.outcome = None;
+                }
+            }
+            Message::AgentsDialogSelectAll(all) => {
+                let ids: Vec<TerminalId> = if all {
+                    self.agents_dialog.as_ref()
+                        .and_then(|d| self.sessions.iter().find(|s| s.id == d.session_id))
+                        .map(|s| s.panes.iter().map(|p| p.id()).collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if let Some(d) = &mut self.agents_dialog {
+                    d.selected = ids;
+                    d.outcome  = None;
+                }
+            }
+            Message::AgentsDialogModelPicked(tool, model) => {
+                if let Some(d) = &mut self.agents_dialog {
+                    d.choice  = Some((tool, model));
+                    d.outcome = None;
+                }
+            }
+            Message::AgentsDialogApplied => {
+                let Some(d) = &self.agents_dialog else { return Task::none(); };
+                let Some((tool, model)) = d.choice else { return Task::none(); };
+                let session_id  = d.session_id;
+                let mut targets = d.selected.clone();
+                let outcome     = self.apply_model_change(session_id, &mut targets, tool, model);
+                if outcome.changed() > 0 {
+                    self.telemetry.record(crate::telemetry::Event::AgentModelChanged {
+                        tool:  tool.as_str(),
+                        count: outcome.changed(),
+                    });
+                    self.save_persisted();
+                }
+                if let Some(d) = &mut self.agents_dialog {
+                    // Relaunched panes came back under new ids; keep them ticked.
+                    d.selected = targets;
+                    d.outcome  = Some(outcome);
+                }
+            }
+            Message::AgentsDialogPaneCloseRequested(tid) => {
+                if let Some(d) = &mut self.agents_dialog {
+                    d.confirming = Some(tid);
+                }
+            }
+            Message::AgentsDialogPaneCloseCancelled => {
+                if let Some(d) = &mut self.agents_dialog {
+                    d.confirming = None;
+                }
+            }
+            Message::AgentsDialogPaneClosed(tid) => {
+                // Act on the session the dialog captured at open time, so a
+                // session switch behind the overlay can't redirect the close.
+                let sid = self.agents_dialog.as_ref().map(|d| d.session_id);
+                if let Some(s) = sid.and_then(|sid| self.sessions.iter_mut().find(|s| s.id == sid)) {
+                    if s.close_claude_terminal(tid) {
+                        self.save_persisted();
+                    }
+                }
+                if let Some(d) = &mut self.agents_dialog {
+                    d.confirming = None;
+                    d.selected.retain(|id| *id != tid);
+                    // The tally described a selection that no longer exists.
+                    d.outcome = None;
+                }
+            }
+            Message::NewDefaultAgent => {
+                let tool = self.prefs.default_tool;
+                let model = *tool.default_model();
+                return self.update(Message::AgentAdded(AgentKind::Build, tool, model));
+            }
+            Message::AgentAdded(kind, tool, model) => {
+                // Adding from the Agents dialog focuses the new pane, so the
+                // dialog has served its purpose — get out of the way of it.
+                self.agents_dialog = None;
                 let new_id = self.next_terminal_id;
                 self.next_terminal_id += 1;
                 self.pane_focus_toolbox = false;
                 let s = &mut self.sessions[self.active_session];
-                s.add_agent(new_id, kind);
+                s.add_agent(new_id, kind, tool, model);
                 s.active_terminal = new_id;
                 s.center_tab      = crate::session::CenterTab::Claude(new_id);
                 self.telemetry.record(crate::telemetry::Event::AgentCreated { kind: kind.as_str() });
                 self.save_persisted();
                 if !kind.is_agentic() {
-                    // Drop the keyboard cursor into the new chat's input box so
-                    // the user can start typing immediately.
-                    return text_input::focus(chat_input_id(new_id));
+                    // Drop keyboard focus into the new chat's composer so the
+                    // user can type immediately. The composer is a `text_editor`,
+                    // which carries no focusable id (unlike `text_input`), so we
+                    // step focus onto it with `focus_next` — the same approach the
+                    // Notes body editor uses. A freshly created chat has an empty
+                    // transcript, so its composer is the only focusable rendered
+                    // in the center pane and focus lands on it.
+                    return iced::widget::focus_next();
                 }
             }
-            Message::ChatInputEdited(id, value) => {
+            Message::ChatInputAction(id, action) => {
                 if let Some(s) = self.session_for_terminal_mut(id) {
                     if let Some(c) = s.chat_mut(id) {
-                        c.input = value;
+                        c.input.perform(action);
+                    }
+                }
+            }
+            Message::ChatBubbleAction(id, index, action) => {
+                // Transcript bubbles are read-only: apply cursor/selection
+                // movement so the user can highlight, but drop edits so the
+                // past reply can't be mutated.
+                if matches!(action, text_editor::Action::Edit(_)) {
+                    return Task::none();
+                }
+                if let Some(s) = self.session_for_terminal_mut(id) {
+                    if let Some(c) = s.chat_mut(id) {
+                        if let Some(m) = c.messages.get_mut(index) {
+                            m.content.perform(action);
+                        }
+                    }
+                }
+            }
+            Message::ChatBubbleCopy(id, index) => {
+                if let Some(s) = self.session_for_terminal_mut(id) {
+                    if let Some(c) = s.chat_mut(id) {
+                        if let Some(sel) = c.messages.get(index)
+                            .and_then(|m| m.content.selection())
+                            .filter(|s| !s.is_empty())
+                        {
+                            return Task::perform(crate::clipboard::write(sel), |_| Message::ClipboardWritten);
+                        }
+                    }
+                }
+            }
+            Message::ChatSendToNote(id, index) => {
+                let text = self.session_for_terminal_mut(id)
+                    .and_then(|s| s.chat_mut(id))
+                    .and_then(|c| c.messages.get(index))
+                    .and_then(|m| m.content.selection())
+                    .unwrap_or_default();
+                self.text_to_note(&text);
+            }
+            Message::ChatCopy(id) => {
+                if let Some(s) = self.session_for_terminal_mut(id) {
+                    if let Some(c) = s.chat_mut(id) {
+                        if let Some(sel) = c.input.selection().filter(|s| !s.is_empty()) {
+                            return Task::perform(crate::clipboard::write(sel), |_| Message::ClipboardWritten);
+                        }
+                    }
+                }
+            }
+            Message::ChatCut(id) => {
+                if let Some(s) = self.session_for_terminal_mut(id) {
+                    if let Some(c) = s.chat_mut(id) {
+                        if let Some(sel) = c.input.selection().filter(|s| !s.is_empty()) {
+                            // Match iced's built-in Cut: copy the selection out, then delete it.
+                            c.input.perform(text_editor::Action::Edit(text_editor::Edit::Delete));
+                            return Task::perform(crate::clipboard::write(sel), |_| Message::ClipboardWritten);
+                        }
+                    }
+                }
+            }
+            Message::ChatPaste(id) => {
+                return Task::perform(crate::clipboard::read(), move |c| Message::ChatPasteReady(id, c));
+            }
+            Message::ChatPasteReady(id, contents) => {
+                let Some(text) = contents.filter(|s| !s.is_empty()) else { return Task::none(); };
+                if let Some(s) = self.session_for_terminal_mut(id) {
+                    if let Some(c) = s.chat_mut(id) {
+                        c.input.perform(text_editor::Action::Edit(
+                            text_editor::Edit::Paste(std::sync::Arc::new(text)),
+                        ));
                     }
                 }
             }
             Message::ChatSubmitted(id) => {
+                // The pane's tools work in its own project directory, so the
+                // run is rooted there (captured before the mutable borrow).
+                let access = self.prefs.chat_access;
                 let Some(s) = self.session_for_terminal_mut(id) else { return Task::none(); };
+                let cwd = s.working_dir.clone();
                 let Some(c) = s.chat_mut(id) else { return Task::none(); };
-                let text = c.input.trim().to_string();
+                let text = c.input.text().trim().to_string();
                 if text.is_empty() || c.streaming {
                     return Task::none();
                 }
-                c.input.clear();
+                c.input = text_editor::Content::new();
                 c.error = None;
                 c.pending.clear();
-                c.messages.push(ChatMessage { role: ChatRole::User, text: text.clone() });
+                c.activity.clear();
+                c.push_message(ChatRole::User, &text);
                 c.streaming = true;
                 let model  = c.model();
                 let resume = c.session_id.clone();
                 return Task::run(
                     chat_api::stream_completion(
-                        id, model, text, resume,
+                        id, model, text, resume, Some(cwd), access,
                         Message::ChatDelta,
+                        Message::ChatActivity,
                         Message::ChatEnded,
                     ),
                     |m| m,
                 );
+            }
+            Message::ChatActivity(id, line) => {
+                if let Some(s) = self.session_for_terminal_mut(id) {
+                    if let Some(c) = s.chat_mut(id) {
+                        // Collapse an immediate repeat (Claude re-reading the
+                        // same file, say) so the list stays scannable.
+                        if c.activity.last().map(String::as_str) != Some(line.as_str()) {
+                            c.activity.push(line);
+                        }
+                    }
+                }
+                return self.pin_chat_tail(id);
             }
             Message::ChatDelta(id, chunk) => {
                 if let Some(s) = self.session_for_terminal_mut(id) {
@@ -1284,18 +2073,40 @@ impl Frms {
                         c.pending.push_str(&chunk);
                     }
                 }
+                // Keep the transcript pinned to the newest text as it streams in,
+                // so the answer stays visible without manual scrolling.
+                return self.pin_chat_tail(id);
+            }
+            Message::ChatScrolled(id, viewport) => {
+                if let Some(s) = self.session_for_terminal_mut(id) {
+                    if let Some(c) = s.chat_mut(id) {
+                        // Treat "within a line of the bottom" as still at the
+                        // bottom: auto-scroll survives rounding and the tiny lag
+                        // between a chunk arriving and the snap landing, but a
+                        // deliberate scroll back through the transcript sticks.
+                        let off = viewport.absolute_offset().y;
+                        let max = (viewport.content_bounds().height
+                            - viewport.bounds().height).max(0.0);
+                        c.follow_tail = off >= max - 20.0;
+                    }
+                }
             }
             Message::ChatEnded(id, result) => {
                 // Outcome captured here, recorded after the session borrow ends.
                 let mut tel: Option<crate::telemetry::Event> = None;
+                // A reply that lands while the pane is off-screen lights its tab
+                // (and its session tab), the same alert Build panes get when
+                // Claude stops on a question.
+                let offscreen = !self.pane_on_screen(id);
                 if let Some(s) = self.session_for_terminal_mut(id) {
                     if let Some(c) = s.chat_mut(id) {
                         c.streaming = false;
+                        c.unread    = offscreen;
                         // Commit whatever text streamed in (a failed request may
                         // still have produced a partial reply worth keeping).
                         if !c.pending.is_empty() {
                             let text = std::mem::take(&mut c.pending);
-                            c.messages.push(ChatMessage { role: ChatRole::Assistant, text });
+                            c.push_message(ChatRole::Assistant, &text);
                         }
                         match result {
                             // Remember the session so the next turn resumes it.
@@ -1317,6 +2128,8 @@ impl Frms {
                 if let Some(event) = tel {
                     self.telemetry.record(event);
                 }
+                // Final snap so the completed answer is fully in view.
+                return self.pin_chat_tail(id);
             }
             Message::ClaudeSessionClosed(tid) => {
                 // Same accidental-click guard as session tabs: confirm first.
@@ -1369,9 +2182,12 @@ impl Frms {
                 // cancels, everything else is swallowed.
                 if self.pending_close.is_some() {
                     match s.as_str() {
-                        "\r" | "\n" => self.confirm_pending_close(),
-                        "\x1b"      => self.pending_close = None,
-                        _           => {}
+                        "\r" | "\n" => {
+                            self.confirm_pending_close();
+                            return self.reveal_chat_panes();
+                        }
+                        "\x1b" => self.pending_close = None,
+                        _      => {}
                     }
                     return Task::none();
                 }
@@ -1394,6 +2210,10 @@ impl Frms {
                     }
                 } else {
                     let active_term = sess.active_terminal;
+                    // Keystrokes can be routed at the active tab before it has
+                    // been displayed, so launch it here rather than dropping the
+                    // input into a pane with no PTY. No-op once it's live.
+                    sess.spawn_pending(active_term);
                     if let Some(t) = sess.terminal_mut(active_term) {
                         // Snap the terminal back to the live bottom so the keystroke
                         // doesn't appear to vanish into history.
@@ -1405,24 +2225,18 @@ impl Frms {
                 }
             }
             Message::TerminalScroll(id, lines) => {
+                // Wheel "up" yields positive y in iced — scroll into history.
                 let delta = lines.round() as i32 * 3;
-                if let Some(s) = self.session_for_terminal_mut(id) {
-                    if let Some(t) = s.terminal_mut(id) {
-                        // Wheel "up" yields positive y in iced — scroll into history.
-                        if let Ok(mut g) = t.grid.lock() {
-                            g.scroll_by(delta);
-                        }
-                    }
-                } else if let Some(s) = self.session_for_plugin_terminal_mut(id) {
-                    if let Some(t) = s.terminals_plugin.terminal_mut(id) {
-                        if let Ok(mut g) = t.pane.grid.lock() {
-                            g.scroll_by(delta);
-                        }
-                    }
-                } else if let Some(t) = self.receivers.ssh_mut(id) {
-                    if let Ok(mut g) = t.pane.grid.lock() {
+                if let Some(t) = self.terminal_pane_mut(id) {
+                    if let Ok(mut g) = t.grid.lock() {
                         g.scroll_by(delta);
                     }
+                }
+            }
+            Message::TerminalScrollDrag(id, lines, row, col) => {
+                let delta = lines.round() as i32 * 3;
+                if let Some(t) = self.terminal_pane_mut(id) {
+                    t.scroll_drag(delta, row, col);
                 }
             }
             Message::TerminalMouseDown(id, row, col) => {
@@ -1442,7 +2256,7 @@ impl Frms {
                     self.receivers.unfocus_ssh();
                     eprintln!("[copydbg] MouseDown claude id={id} ({row},{col})");
                     if let Some(t) = s.terminal_mut(id) {
-                        t.selection = Some(crate::terminal::Selection::new(row, col));
+                        t.begin_selection(row, col);
                     }
                 } else if let Some(idx) = self.sessions.iter()
                     .position(|s| s.terminals_plugin.has_terminal(id))
@@ -1454,7 +2268,7 @@ impl Frms {
                     s.db_panel.focus_active    = false;
                     self.receivers.unfocus_ssh();
                     if let Some(t) = s.terminals_plugin.terminal_mut(id) {
-                        t.pane.selection = Some(crate::terminal::Selection::new(row, col));
+                        t.pane.begin_selection(row, col);
                     }
                 } else if self.receivers.has_ssh(id) {
                     // Focus the clicked receiver SSH terminal and begin a
@@ -1464,28 +2278,14 @@ impl Frms {
                     self.receivers.unfocus_ssh();
                     if let Some(t) = self.receivers.ssh_mut(id) {
                         t.focused   = true;
-                        t.pane.selection = Some(crate::terminal::Selection::new(row, col));
+                        t.pane.begin_selection(row, col);
                     }
                 }
             }
             Message::TerminalMouseMove(id, row, col) => {
                 eprintln!("[copydbg] MouseMove id={id} ({row},{col})");
-                if let Some(s) = self.session_for_terminal_mut(id) {
-                    if let Some(t) = s.terminal_mut(id) {
-                        if let Some(sel) = t.selection.as_mut() {
-                            if sel.active { sel.head = (row, col); }
-                        }
-                    }
-                } else if let Some(s) = self.session_for_plugin_terminal_mut(id) {
-                    if let Some(t) = s.terminals_plugin.terminal_mut(id) {
-                        if let Some(sel) = t.pane.selection.as_mut() {
-                            if sel.active { sel.head = (row, col); }
-                        }
-                    }
-                } else if let Some(t) = self.receivers.ssh_mut(id) {
-                    if let Some(sel) = t.pane.selection.as_mut() {
-                        if sel.active { sel.head = (row, col); }
-                    }
+                if let Some(t) = self.terminal_pane_mut(id) {
+                    t.drag_selection(row, col);
                 }
             }
             Message::TerminalMouseUp(id) => {
@@ -1636,6 +2436,7 @@ impl Frms {
                     }
                 } else {
                     let active_term = sess.active_terminal;
+                    sess.spawn_pending(active_term);
                     if let Some(t) = sess.terminal_mut(active_term) {
                         let bracketed = t.grid.lock()
                             .map(|g| g.bracketed_paste)
@@ -1649,6 +2450,13 @@ impl Frms {
             Message::TabPressed { shift } => {
                 // Swallow Tab while the close-confirmation dialog is up.
                 if self.pending_close.is_some() {
+                    return Task::none();
+                }
+                // The note body editor already indented on this press (its key
+                // binding ran first, during widget event handling). Tab is
+                // exempt from the `Status::Captured` gate in
+                // `main_key_listener`, so we get the press anyway — drop it.
+                if std::mem::take(&mut self.notes.tab_in_body) {
                     return Task::none();
                 }
                 let s = &self.sessions[self.active_session];
@@ -1722,6 +2530,20 @@ impl Frms {
                     }
                 } else {
                     let active_term = sess.active_terminal;
+                    // A chat/research pane has no PTY, so Tab can't be a terminal
+                    // byte — cycle focus instead, letting the user step into the
+                    // composer (an id-less text_editor reached via focus_next).
+                    let active_is_chat = sess.panes.iter()
+                        .find(|p| p.id() == active_term)
+                        .map_or(false, |p| p.as_chat().is_some());
+                    if active_is_chat {
+                        return if shift {
+                            iced::widget::focus_previous()
+                        } else {
+                            iced::widget::focus_next()
+                        };
+                    }
+                    sess.spawn_pending(active_term);
                     if let Some(t) = sess.terminal_mut(active_term) {
                         t.write_input(bytes);
                     }
@@ -1890,9 +2712,15 @@ impl Frms {
             // ── keyboard navigation ─────────────────────────────────────────────
             Message::CyclePane { forward } => {
                 self.cycle_pane(forward);
+                return self.reveal_chat_panes();
+            }
+            Message::CycleAgentPane { forward } => {
+                self.cycle_agent_pane(forward);
+                return self.reveal_chat_panes();
             }
             Message::CycleAttention { forward } => {
                 self.cycle_attention(forward);
+                return self.reveal_chat_panes();
             }
             Message::CycleSession { forward } => {
                 let n = self.sessions.len();
@@ -1904,7 +2732,17 @@ impl Frms {
                     };
                     self.pane_focus_toolbox = false;
                     self.save_persisted();
+                    return self.reveal_chat_panes();
                 }
+            }
+            Message::CyclePluginTab { forward } => {
+                // Cycle the toolbox to its next/previous tool. Surface the panel
+                // (and mark it the focused stop) so the switch is visible.
+                let s = &mut self.sessions[self.active_session];
+                s.plugin_panel.visible = true;
+                s.plugin_panel.cycle_tab(forward);
+                self.pane_focus_toolbox = true;
+                self.save_persisted();
             }
             Message::CloseActiveAgent => {
                 // Same confirm flow as the agent tab's ✕.
@@ -1923,39 +2761,96 @@ impl Frms {
             // ── stats ─────────────────────────────────────────────────────────
             Message::StatsRefresh => {
                 return Task::batch([
-                    Task::perform(
-                        stats::load(),
-                        |s| Message::StatsLoaded(s.unwrap_or_default()),
-                    ),
+                    Task::perform(stats::load(), Message::StatsLoaded),
                     Task::perform(stats::load_procs(), Message::ProcsLoaded),
                 ]);
             }
-            Message::StatsLoaded(s) => {
-                self.claude_stats = s;
-            }
+            Message::StatsLoaded(s) => match s {
+                Some(s) => {
+                    self.claude_stats = s;
+                    self.stats_stale  = false;
+                }
+                // A failed fetch is not "you used nothing". The endpoint rate-limits
+                // (HTTP 429) under a tight poll interval, and the token expires on
+                // its own schedule; either way, zeroing the bars would state a
+                // utilization we don't actually know. Hold the last reading and let
+                // the header mark it stale.
+                None => self.stats_stale = true,
+            },
             Message::ProcsLoaded(p) => {
                 self.claude_procs = p;
             }
             Message::StatsRefreshIntervalChanged(i) => {
                 self.stats_refresh_interval = i;
             }
+            Message::UsageBreakdownOpened(window) => {
+                let scope = stats::UsageScope::default();
+                let since = self.claude_stats.scan_start(window, scope);
+                self.usage_breakdown = Some(UsageBreakdown { window, scope, since, data: None });
+                return Task::perform(
+                    stats::load_model_breakdown(since),
+                    Message::UsageBreakdownLoaded,
+                );
+            }
+            Message::UsageBreakdownRefreshed => {
+                let Some(card) = &mut self.usage_breakdown else { return Task::none() };
+                // Re-anchor on the latest stats: the window may have rolled over
+                // since the card was opened.
+                let since = self.claude_stats.scan_start(card.window, card.scope);
+                card.since = since;
+                card.data  = None;
+                return Task::perform(
+                    stats::load_model_breakdown(since),
+                    Message::UsageBreakdownLoaded,
+                );
+            }
+            Message::UsageBreakdownScopeChanged(scope) => {
+                let Some(card) = &mut self.usage_breakdown else { return Task::none() };
+                if card.scope == scope { return Task::none(); }
+                let since = self.claude_stats.scan_start(card.window, scope);
+                card.scope = scope;
+                card.since = since;
+                card.data  = None;
+                return Task::perform(
+                    stats::load_model_breakdown(since),
+                    Message::UsageBreakdownLoaded,
+                );
+            }
+            Message::UsageBreakdownLoaded(data) => {
+                // Dropped on the floor if the card was closed mid-scan.
+                if let Some(card) = &mut self.usage_breakdown {
+                    card.data = Some(data);
+                }
+            }
+            Message::UsageBreakdownClosed => {
+                self.usage_breakdown = None;
+            }
 
             // ── plugin panel ──────────────────────────────────────────────────
             Message::PluginTabClicked(slot, tab) => {
-                let s = &mut self.sessions[self.active_session];
-                let panel = &mut s.plugin_panel;
-                // Clicking the already-active tab of a single (non-split) panel
-                // toggles it closed — preserving the original muscle memory.
-                // In a split panel the tab bar only switches that slot's plugin.
-                let toggle_hide = !panel.split
-                    && slot == PluginSlot::Top
-                    && panel.visible
-                    && panel.active_tab == tab;
-                if toggle_hide {
-                    panel.visible = false;
-                } else {
-                    panel.visible = true;
-                    panel.set_tab(slot, tab);
+                let revealed = {
+                    let s = &mut self.sessions[self.active_session];
+                    let panel = &mut s.plugin_panel;
+                    // Clicking the already-active tab of a single (non-split) panel
+                    // toggles it closed — preserving the original muscle memory.
+                    // In a split panel the tab bar only switches that slot's plugin.
+                    let toggle_hide = !panel.split
+                        && slot == PluginSlot::Top
+                        && panel.visible
+                        && panel.active_tab == tab;
+                    if toggle_hide {
+                        panel.visible = false;
+                    } else {
+                        panel.visible = true;
+                        panel.set_tab(slot, tab);
+                    }
+                    !toggle_hide
+                };
+                // The Docs index is a snapshot, so refresh it whenever the tab
+                // is brought up — otherwise a doc added since the last look
+                // would be missing with no hint as to why.
+                if revealed && tab == PluginTab::Docs {
+                    self.rescan_docs();
                 }
                 self.save_persisted();
             }
@@ -1965,12 +2860,17 @@ impl Frms {
                 self.save_persisted();
             }
             Message::PluginTabShown(tab) => {
-                let panel = &mut self.sessions[self.active_session].plugin_panel;
-                panel.show_tab(tab);
-                // Surface the just-added plugin and close the picker.
-                panel.active_tab = tab;
-                panel.adding = false;
-                panel.visible = true;
+                {
+                    let panel = &mut self.sessions[self.active_session].plugin_panel;
+                    panel.show_tab(tab);
+                    // Surface the just-added plugin and close the picker.
+                    panel.active_tab = tab;
+                    panel.adding = false;
+                    panel.visible = true;
+                }
+                if tab == PluginTab::Docs {
+                    self.rescan_docs();
+                }
                 self.save_persisted();
             }
             Message::PluginAddPickerToggled => {
@@ -1978,21 +2878,41 @@ impl Frms {
                 panel.adding = !panel.adding;
             }
             Message::PluginPanelDockToggled => {
-                self.sessions[self.active_session].plugin_panel.toggle_dock();
+                let p = &mut self.sessions[self.active_session].plugin_panel;
+                p.toggle_dock();
+                p.controls_menu = false;
                 self.save_persisted();
             }
             Message::PluginPanelSplitToggled => {
-                self.sessions[self.active_session].plugin_panel.toggle_split();
+                let p = &mut self.sessions[self.active_session].plugin_panel;
+                p.toggle_split();
+                p.controls_menu = false;
                 self.save_persisted();
+            }
+            Message::PluginPanelExpandToggled => {
+                let p = &mut self.sessions[self.active_session].plugin_panel;
+                p.toggle_expanded();
+                p.controls_menu = false;
+                self.save_persisted();
+            }
+            Message::PluginPanelControlsToggled => {
+                let p = &mut self.sessions[self.active_session].plugin_panel;
+                p.controls_menu = !p.controls_menu;
             }
             Message::PluginPanelHide => {
                 let s = &mut self.sessions[self.active_session];
                 s.plugin_panel.visible = false;
+                s.plugin_panel.expanded = false;
+                s.plugin_panel.controls_menu = false;
                 self.save_persisted();
             }
             Message::PluginPanelToggled => {
                 let s = &mut self.sessions[self.active_session];
                 s.plugin_panel.visible = !s.plugin_panel.visible;
+                if !s.plugin_panel.visible {
+                    s.plugin_panel.expanded = false;
+                    s.plugin_panel.controls_menu = false;
+                }
                 self.save_persisted();
             }
             Message::PluginPanelResizeStart => {
@@ -2054,11 +2974,48 @@ impl Frms {
                 }
             }
 
+            // ── docs ──────────────────────────────────────────────────────────
+            Message::DocsQueryChanged(q) => {
+                // Filtering runs over the in-memory index, so this never
+                // touches the disk — typing stays instant on a big doc tree.
+                self.sessions[self.active_session].docs.query = q;
+            }
+            Message::DocsDateChanged(d) => {
+                self.sessions[self.active_session].docs.date = d;
+            }
+            Message::DocsSortChanged(s) => {
+                self.sessions[self.active_session].docs.sort = s;
+            }
+            Message::DocsClearFilters => {
+                self.sessions[self.active_session].docs.clear();
+            }
+            Message::DocsRefresh => {
+                self.rescan_docs();
+            }
+            Message::DocsOpen => {
+                return self.open_plugin_tab(PluginTab::Docs, crate::ui::docs_panel::DOCS_SEARCH_INPUT);
+            }
+
             // ── notes ─────────────────────────────────────────────────────────
+            Message::NotesSearchChanged(q) => {
+                self.notes.search = q;
+            }
+            Message::NotesSearchCleared => {
+                self.notes.search.clear();
+            }
+            Message::NotesSearchOpen => {
+                return self.open_plugin_tab(
+                    PluginTab::Notes,
+                    crate::ui::plugin_panel::NOTES_SEARCH_INPUT,
+                );
+            }
             Message::NotesNew => {
                 // New notes are pinned to the active session's project; the
                 // 🖈 button in the editor header makes them global.
                 let project = self.active_project();
+                // A fresh note is empty, so a standing search would filter it
+                // straight back out of the list it was just added to.
+                self.notes.search.clear();
                 self.notes.create(project);
                 // Drop the keyboard cursor into the Title field so the user
                 // can name the new note, then Tab/Enter into the body.
@@ -2101,6 +3058,58 @@ impl Frms {
             Message::NotesViewMode(mode) => {
                 self.notes.view_mode = mode;
             }
+            // Tab / Shift+Tab arrived through the body editor's key binding,
+            // so the press also lands on `Message::TabPressed` (Tab bypasses
+            // the capture gate) — `tab_in_body` makes that handler stand down.
+            Message::NotesIndent => {
+                self.notes.naming = false;
+                self.notes.tab_in_body = true;
+                self.notes.indent();
+                self.notes.commit_body();
+            }
+            Message::NotesOutdent => {
+                self.notes.naming = false;
+                self.notes.tab_in_body = true;
+                self.notes.outdent();
+                self.notes.commit_body();
+            }
+            Message::NotesCategorySelected(choice) => {
+                let Some(id) = self.notes.selected else { return Task::none(); };
+                match choice {
+                    CategoryChoice::NewCategory => {
+                        self.notes.begin_new_category();
+                        // Drop the cursor into the name field so the user can
+                        // type the category straight away.
+                        return text_input::focus(text_input::Id::new(
+                            crate::ui::plugin_panel::NOTES_CATEGORY_INPUT,
+                        ));
+                    }
+                    CategoryChoice::Uncategorized => self.notes.set_category(id, None),
+                    CategoryChoice::Named(name)   => self.notes.set_category(id, Some(name)),
+                }
+            }
+            Message::NotesCategoryInput(s) => {
+                self.notes.category_input = s;
+            }
+            Message::NotesCategoryCommit => {
+                if let Some(id) = self.notes.selected {
+                    let name = self.notes.category_input.trim().to_string();
+                    // Empty name = cancel (leave the category untouched).
+                    if name.is_empty() {
+                        self.notes.adding_category = false;
+                        self.notes.category_input.clear();
+                    } else {
+                        self.notes.set_category(id, Some(name));
+                    }
+                }
+            }
+            Message::NotesCategoryCancel => {
+                self.notes.adding_category = false;
+                self.notes.category_input.clear();
+            }
+            Message::NotesCategoryToggleCollapsed(key) => {
+                self.notes.toggle_category_collapsed(&key);
+            }
             Message::NotesSendToClaude => {
                 // Prefer the highlighted selection; fall back to the whole note
                 // body when nothing is highlighted so the button is never a
@@ -2113,6 +3122,9 @@ impl Frms {
                 if !text.is_empty() {
                     let sess = &mut self.sessions[self.active_session];
                     let active = sess.active_terminal;
+                    // The toolbox can send a note to an agent tab the user has
+                    // never opened — start it so the paste has somewhere to go.
+                    sess.spawn_pending(active);
                     if let Some(t) = sess.terminal_mut(active) {
                         let bracketed = t.grid.lock()
                             .map(|g| g.bracketed_paste)
@@ -2124,12 +3136,35 @@ impl Frms {
             }
 
             // ── terminals plugin ──────────────────────────────────────────────
-            Message::TerminalPluginNew => {
+            Message::InstallTool(tool) => {
                 let new_id = self.next_terminal_id;
                 self.next_terminal_id += 1;
                 let s = &mut self.sessions[self.active_session];
                 let dir = s.working_dir.clone();
-                s.terminals_plugin.create(new_id, &dir);
+                let (prog, args) = crate::port::shell::install_shell(tool.install_command());
+                s.terminals_plugin.create_command(
+                    new_id, &dir, format!("Install {}", tool.label()), &prog, &args,
+                );
+                // Reveal the Terminals tab so the running install is visible.
+                s.plugin_panel.visible = true;
+                s.plugin_panel.show_tab(crate::plugin_panel::PluginTab::Terminals);
+                s.plugin_panel.set_tab(
+                    crate::plugin_panel::PluginSlot::Top,
+                    crate::plugin_panel::PluginTab::Terminals,
+                );
+            }
+            Message::TerminalPluginNew => {
+                let new_id = self.next_terminal_id;
+                self.next_terminal_id += 1;
+                // A brand-new terminal starts on the host; only the user's `ls`
+                // flags apply.
+                let init = crate::terminals::ShellInit {
+                    container: None,
+                    ls_flags:  self.prefs.ls_flags.clone(),
+                };
+                let s = &mut self.sessions[self.active_session];
+                let dir = s.working_dir.clone();
+                s.terminals_plugin.create(new_id, &dir, &init);
                 // Drop the keyboard cursor into the Name field so the user can
                 // title the new terminal, then Tab/Enter into the shell.
                 return text_input::focus(
@@ -2190,6 +3225,32 @@ impl Frms {
             Message::ReceiverContainerToggle(id) => {
                 self.receivers.toggle_expanded(id);
             }
+            Message::ReceiverContainerMoveTo(id, parent) => {
+                let name = self.receivers.container_by_id(id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                self.receivers.status = if self.receivers.move_container(id, parent) {
+                    let dest = match parent {
+                        Some(p) => self.receivers.container_path(p),
+                        None    => "the top level".to_string(),
+                    };
+                    Some(Ok(format!("Moved \"{name}\" to {dest}.")))
+                } else {
+                    Some(Err(format!("Can't move \"{name}\" there — pick a location outside it.")))
+                };
+            }
+            Message::ReceiverMoveAll(from, to) => {
+                let moved = self.receivers.move_receivers_in(from, to);
+                let dest  = self.receivers.container_path(to);
+                self.receivers.status = Some(if moved > 0 {
+                    Ok(format!(
+                        "Moved {moved} receiver{} to {dest}.",
+                        if moved == 1 { "" } else { "s" },
+                    ))
+                } else {
+                    Err("No receivers to move.".to_string())
+                });
+            }
             Message::ReceiverAdd(container) => {
                 self.receivers.add_receiver(container);
             }
@@ -2202,6 +3263,16 @@ impl Frms {
             }
             Message::ReceiverDelete(id) => {
                 self.receivers.delete_receiver(id);
+            }
+            Message::ReceiverMoveTo(id, container) => {
+                self.receivers.move_receiver(id, container);
+                let name = self.receivers.receiver_by_id(id)
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default();
+                self.receivers.status = Some(Ok(format!(
+                    "Moved \"{name}\" to {}.",
+                    self.receivers.container_path(container),
+                )));
             }
             Message::ReceiverNameEdited(s) => {
                 self.receivers.name_input = s;
@@ -2227,41 +3298,72 @@ impl Frms {
                 }
             }
             Message::ReceiverConnect(id) => {
-                let Some(r) = self.receivers.receiver_by_id(id).cloned() else {
-                    return Task::none();
-                };
-                if r.host.trim().is_empty() || r.username.trim().is_empty() {
-                    self.receivers.status =
-                        Some(Err("set a host and username before connecting".into()));
-                    return Task::none();
-                }
-                let tid = self.next_terminal_id;
-                self.next_terminal_id += 1;
-                let (prog, args, envs) = r.ssh_command();
-                match crate::terminal::TerminalPane::spawn_args(tid, &prog, &args, &envs, None) {
-                    Ok(pane) => {
-                        // Other terminals lose keyboard focus to the new SSH pane.
-                        self.sessions[self.active_session].terminals_plugin.focused = false;
-                        // Replaces any prior session to *this* receiver; sessions
-                        // to other receivers keep running so their panes survive.
-                        self.receivers.set_ssh(crate::receivers::SshTerminal {
-                            id: tid,
-                            receiver: id,
-                            name: r.name.clone(),
-                            pane,
-                            focused: true,
-                            exited: false,
-                        });
-                        self.receivers.status =
-                            Some(Ok(format!("Connected to {}", r.destination())));
-                    }
-                    Err(e) => {
-                        self.receivers.status = Some(Err(format!("ssh failed: {e}")));
-                    }
-                }
+                self.receivers.status = Some(match self.connect_receiver(id, true) {
+                    Ok(dest) => Ok(format!("Connected to {dest}")),
+                    Err(e)   => Err(e),
+                });
             }
             Message::ReceiverSshDisconnect(receiver) => {
                 self.receivers.remove_ssh_for(receiver);
+            }
+            Message::ReceiverConnectAll(container) => {
+                // Already-live sessions are left alone; an exited pane is retried.
+                let targets: Vec<u64> = self.receivers.receivers_under(container).iter()
+                    .map(|r| r.id)
+                    .filter(|id| !self.receivers.is_connected(*id))
+                    .collect();
+                if targets.is_empty() {
+                    self.receivers.status =
+                        Some(Err("nothing left to connect here".into()));
+                    return Task::none();
+                }
+                // set_ssh drops focus from every other pane, so restore whatever
+                // the user was typing into once the batch is done.
+                let was_focused = self.receivers.ssh.iter()
+                    .find(|t| t.focused)
+                    .map(|t| t.receiver);
+                let mut ok = 0usize;
+                let mut errs: Vec<String> = Vec::new();
+                for id in targets {
+                    match self.connect_receiver(id, false) {
+                        Ok(_)  => ok += 1,
+                        Err(e) => errs.push(e),
+                    }
+                }
+                if let Some(r) = was_focused {
+                    self.receivers.focus_ssh_for(r);
+                }
+                let name = self.receivers.container_by_id(container)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                self.receivers.status = Some(if errs.is_empty() {
+                    Ok(format!("Connected {ok} receiver{} in {name}",
+                               if ok == 1 { "" } else { "s" }))
+                } else {
+                    // One failure is worth naming; a pile of them isn't.
+                    let detail = if errs.len() == 1 {
+                        errs[0].clone()
+                    } else {
+                        format!("{} failed (first: {})", errs.len(), errs[0])
+                    };
+                    Err(format!("Connected {ok}, {detail}"))
+                });
+            }
+            Message::ReceiverDisconnectAll(container) => {
+                let targets: Vec<u64> = self.receivers.receivers_under(container).iter()
+                    .map(|r| r.id)
+                    .collect();
+                let gone = self.receivers.remove_ssh_many(&targets);
+                let name = self.receivers.container_by_id(container)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                self.receivers.status = Some(Ok(format!(
+                    "Disconnected {gone} session{} in {name}",
+                    if gone == 1 { "" } else { "s" },
+                )));
+            }
+            Message::ReceiverToggleConnectionForm => {
+                self.receivers.connection_collapsed = !self.receivers.connection_collapsed;
             }
             Message::ReceiverCopyPick => {
                 let Some(receiver) = self.receivers.selected_receiver else {
@@ -2277,21 +3379,32 @@ impl Frms {
                     .unwrap_or_else(|| sess.working_dir.clone());
                 let mut browser = FileBrowserState::new();
                 browser.navigate(start);
-                self.file_picker = Some(FilePicker { browser, receiver });
+                self.file_picker = Some(FilePicker {
+                    browser,
+                    purpose: PickerPurpose::ReceiverCopy(receiver),
+                });
             }
-            Message::ReceiverPickerBrowse(path) => {
+            Message::FilePickerBrowse(path) => {
                 if let Some(fp) = self.file_picker.as_mut() {
                     fp.browser.navigate(path);
                 }
             }
-            Message::ReceiverPickerChoose(path) => {
-                let receiver = self.file_picker.as_ref().map(|fp| fp.receiver);
+            Message::FilePickerChoose(path) => {
+                let purpose = self.file_picker.as_ref().map(|fp| fp.purpose);
                 self.file_picker = None;
-                if let Some(receiver) = receiver {
-                    return self.copy_files_to(receiver, vec![path]);
+                match purpose {
+                    Some(PickerPurpose::ReceiverCopy(receiver)) => {
+                        return self.copy_files_to(receiver, vec![path]);
+                    }
+                    Some(PickerPurpose::CloudSqlCredentials) => {
+                        self.prefs.cloud_sql_credentials =
+                            path.to_string_lossy().into_owned();
+                        self.prefs.save();
+                    }
+                    None => {}
                 }
             }
-            Message::ReceiverPickerCancel => {
+            Message::FilePickerCancel => {
                 self.file_picker = None;
             }
             Message::ReceiverCopyFile(path) => {
@@ -2513,30 +3626,147 @@ impl Frms {
                 p.port_str     = s;
                 p.focus_active = true;
             }
+            Message::DbInstanceEdited(s) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.config.cloud_sql_instance = s;
+                p.focus_active = true;
+            }
+            Message::DbProxyCredentialsPick => {
+                // Root the picker at the key's own folder when one is already
+                // chosen, else the session's working directory — an auth.json
+                // usually lives with the project it belongs to.
+                let sess  = &self.sessions[self.active_session];
+                let start = std::path::Path::new(self.prefs.cloud_sql_credentials.trim())
+                    .parent()
+                    .filter(|p| p.is_dir())
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| sess.working_dir.clone());
+                let mut browser = FileBrowserState::new();
+                browser.navigate(start);
+                self.file_picker = Some(FilePicker {
+                    browser,
+                    purpose: PickerPurpose::CloudSqlCredentials,
+                });
+            }
+            Message::DbProxyCredentialsCleared => {
+                self.prefs.cloud_sql_credentials.clear();
+                self.prefs.save();
+            }
+            Message::DbProxyToggleCollapsed => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.proxy_collapsed = !p.proxy_collapsed;
+            }
+            Message::DbProxyStart { then_connect } => {
+                let creds = self.prefs.cloud_sql_credentials.clone();
+                let s      = &mut self.sessions[self.active_session];
+                let sid    = s.id;
+                s.center_tab = crate::session::CenterTab::Database;
+                s.db_panel.commit_history();
+                // Kill whatever was there first — a stale or dead proxy would
+                // otherwise still be holding the port the new one wants.
+                s.db_panel.stop_proxy();
+                let spec = s.db_panel.proxy_spec(&creds);
+                s.db_panel.proxy = cloud_sql::ProxyState::Starting;
+                return Task::perform(
+                    cloud_sql::start(spec),
+                    move |r| Message::DbProxyStarted(sid, then_connect, r),
+                );
+            }
+            Message::DbProxyStarted(session_id, then_connect, result) => {
+                let active_id = self.sessions[self.active_session].id;
+                let mut connect = false;
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    match result {
+                        Ok(proxy) => {
+                            // Point the form at the listener the proxy just
+                            // opened, so Host/Port show what we actually dial.
+                            let (addr, port) = proxy.endpoint();
+                            s.db_panel.config.host = addr;
+                            s.db_panel.config.port = port;
+                            s.db_panel.port_str    = port.to_string();
+                            s.db_panel.proxy       = cloud_sql::ProxyState::Running(proxy);
+                            // Only chain into Connect for the session the user
+                            // is actually looking at — DbConnect always acts on
+                            // the active panel.
+                            connect = then_connect && session_id == active_id;
+                        }
+                        Err(err) => {
+                            s.db_panel.proxy = cloud_sql::ProxyState::Failed(err.clone());
+                            if then_connect {
+                                // The Connect that started this can't go ahead;
+                                // report the reason where the user is looking.
+                                s.db_panel.conn_state = ConnState::Failed(err);
+                            }
+                        }
+                    }
+                }
+                if connect {
+                    return Task::perform(async {}, |_| Message::DbConnect);
+                }
+            }
+            Message::DbProxyStop => {
+                self.sessions[self.active_session].db_panel.stop_proxy();
+            }
+            Message::DbProxyInstall => {
+                // Same shape as `InstallTool`: run the one-shot installer in a
+                // visible terminal so the user sees the download, the checksum
+                // check, and any sudo prompt.
+                let new_id = self.next_terminal_id;
+                self.next_terminal_id += 1;
+                let s   = &mut self.sessions[self.active_session];
+                let dir = s.working_dir.clone();
+                let (prog, args) =
+                    crate::port::shell::install_shell(&cloud_sql::setup_command());
+                s.terminals_plugin.create_command(
+                    new_id, &dir, String::from("Install Cloud SQL Proxy"), &prog, &args,
+                );
+                s.plugin_panel.visible = true;
+                s.plugin_panel.show_tab(crate::plugin_panel::PluginTab::Terminals);
+                s.plugin_panel.set_tab(
+                    crate::plugin_panel::PluginSlot::Top,
+                    crate::plugin_panel::PluginTab::Terminals,
+                );
+            }
             Message::DbConnect => {
+                // Cloud SQL is reached through the proxy, so it has to be up
+                // before there is anything on loopback to dial. Start it first
+                // when it's configured and not already listening; the reply
+                // chains back into this message.
+                {
+                    let p = &self.sessions[self.active_session].db_panel;
+                    let proxy_up = p.proxy.running().is_some_and(|x| x.is_alive());
+                    if p.cloud_sql()
+                        && !proxy_up
+                        && !p.proxy.is_starting()
+                        && !p.config.cloud_sql_instance.trim().is_empty()
+                    {
+                        return Task::perform(async {}, |_| Message::DbProxyStart {
+                            then_connect: true,
+                        });
+                    }
+                }
                 let s   = &mut self.sessions[self.active_session];
                 let sid = s.id;
                 s.db_panel.commit_history();
                 s.center_tab = crate::session::CenterTab::Database;
                 let cfg = s.db_panel.config.clone();
-                s.db_panel.conn_state   = ConnState::Connecting;
-                s.db_panel.client       = None;
-                s.db_panel.tables.clear();
-                s.db_panel.foreign_keys.clear();
-                s.db_panel.selected_tables.clear();
-                s.db_panel.columns_by_table.clear();
-                s.db_panel.selected_cols.clear();
-                s.db_panel.joins.clear();
-                s.db_panel.dragging_field = None;
-                s.db_panel.query_result = None;
-                s.db_panel.query_error  = None;
+                // Tear down whatever was there (invalidating in-flight replies)
+                // before starting the new attempt.
+                s.db_panel.reset_connection();
+                let epoch = s.db_panel.epoch;
+                s.db_panel.conn_state = ConnState::Connecting;
                 return Task::perform(
                     db::connect_and_list(cfg),
-                    move |r| Message::DbConnected(sid, r),
+                    move |r| Message::DbConnected(sid, epoch, r),
                 );
             }
-            Message::DbConnected(session_id, result) => {
+            Message::DbConnected(session_id, epoch, result) => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    // Dropped if the panel was reset (or reconnected) while this
+                    // attempt was still in flight.
+                    if !s.db_panel.is_current(epoch) {
+                        return Task::none();
+                    }
                     match result {
                         Ok((client, tables, fks, routines)) => {
                             s.db_panel.conn_state   = ConnState::Connected;
@@ -2557,25 +3787,15 @@ impl Frms {
                 }
             }
             Message::DbDisconnect => {
+                self.sessions[self.active_session].db_panel.reset_connection();
+            }
+            Message::DbReset => {
+                // Same teardown as Disconnect, but reachable from every state —
+                // including a connect that never came back or a query still
+                // marked as running against a connection that has since died.
                 let p = &mut self.sessions[self.active_session].db_panel;
-                p.client = None;
-                p.conn_state = ConnState::Disconnected;
-                p.tables.clear();
-                p.foreign_keys.clear();
-                p.routines.clear();
-                p.selected_routine = None;
-                p.routine_code     = None;
-                p.routine_loading  = false;
-                p.selected_tables.clear();
-                p.columns_by_table.clear();
-                p.selected_cols.clear();
-                p.joins.clear();
-                p.dragging_field = None;
-                p.loading_columns.clear();
-                p.query_result = None;
-                p.query_error  = None;
-                // Reopen the form so the user can reconnect.
-                p.form_collapsed = false;
+                p.reset_connection();
+                p.focus_active = false;
             }
             Message::DbTableToggled(key) => {
                 let s   = &mut self.sessions[self.active_session];
@@ -2605,10 +3825,11 @@ impl Frms {
                             p.client.clone(),
                             p.tables.iter().find(|t| t.key() == key).cloned(),
                         ) {
+                            let epoch = p.epoch;
                             p.loading_columns.insert(key.clone());
                             return Task::perform(
                                 db::list_columns(client, table),
-                                move |r| Message::DbColumnsLoaded(sid, key.clone(), r),
+                                move |r| Message::DbColumnsLoaded(sid, epoch, key.clone(), r),
                             );
                         }
                     }
@@ -2619,6 +3840,7 @@ impl Frms {
                 let sid = s.id;
                 let p   = &mut s.db_panel;
                 let Some(client) = p.client.clone() else { return Task::none(); };
+                let epoch = p.epoch;
                 p.selected_routine = Some(routine.clone());
                 p.routine_code     = None;
                 p.routine_loading  = true;
@@ -2626,12 +3848,15 @@ impl Frms {
                 // the results row hidden behind a collapsed Row 1.
                 return Task::perform(
                     db::routine_definition(client, routine),
-                    move |r| Message::DbRoutineLoaded(sid, r),
+                    move |r| Message::DbRoutineLoaded(sid, epoch, r),
                 );
             }
-            Message::DbRoutineLoaded(session_id, result) => {
+            Message::DbRoutineLoaded(session_id, epoch, result) => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                     let p = &mut s.db_panel;
+                    if !p.is_current(epoch) {
+                        return Task::none();
+                    }
                     p.routine_loading = false;
                     match result {
                         Ok(code) => { p.routine_code = Some(code); }
@@ -2649,8 +3874,11 @@ impl Frms {
                 p.routine_code     = None;
                 p.routine_loading  = false;
             }
-            Message::DbColumnsLoaded(session_id, key, result) => {
+            Message::DbColumnsLoaded(session_id, epoch, key, result) => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    if !s.db_panel.is_current(epoch) {
+                        return Task::none();
+                    }
                     s.db_panel.loading_columns.remove(&key);
                     match result {
                         Ok(cols) => { s.db_panel.columns_by_table.insert(key, cols); }
@@ -2797,13 +4025,14 @@ impl Frms {
                     Some(c) => c,
                     None    => return Task::none(),
                 };
+                let epoch = p.epoch;
                 p.query            = sql.clone();
                 p.query_running    = true;
                 p.query_error      = None;
                 p.statement_status = None;
                 return Task::perform(
                     db::run_query(client, sql),
-                    move |r| Message::DbQueryResult(sid, r),
+                    move |r| Message::DbQueryResult(sid, epoch, r),
                 );
             }
             Message::DbRefreshResults => {
@@ -2828,17 +4057,23 @@ impl Frms {
                     Some(c) => c,
                     None    => return Task::none(),
                 };
+                let epoch = p.epoch;
                 p.query_running    = true;
                 p.query_error      = None;
                 p.statement_status = None;
                 return Task::perform(
                     db::run_query(client, sql),
-                    move |r| Message::DbQueryResult(sid, r),
+                    move |r| Message::DbQueryResult(sid, epoch, r),
                 );
             }
-            Message::DbQueryResult(session_id, result) => {
+            Message::DbQueryResult(session_id, epoch, result) => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                    if !s.db_panel.is_current(epoch) {
+                        return Task::none();
+                    }
                     s.db_panel.query_running = false;
+                    // The copy confirmation described the previous result set.
+                    s.db_panel.copy_notice = None;
                     match result {
                         Ok(r)    => { s.db_panel.query_result = Some(r); s.db_panel.query_error = None; }
                         Err(err) => { s.db_panel.query_error = Some(err); }
@@ -2850,6 +4085,32 @@ impl Frms {
             }
             Message::DbSqlAction(action) => {
                 self.sessions[self.active_session].db_panel.sql_input.perform(action);
+            }
+            // Route the SQL editor's copy/cut/paste through the app's subprocess
+            // clipboard instead of iced's built-in one, whose synchronous read
+            // freezes the app on Wayland (see crate::clipboard).
+            Message::DbSqlCopy => {
+                let input = &self.sessions[self.active_session].db_panel.sql_input;
+                if let Some(sel) = input.selection().filter(|s| !s.is_empty()) {
+                    return Task::perform(crate::clipboard::write(sel), |_| Message::ClipboardWritten);
+                }
+            }
+            Message::DbSqlCut => {
+                let input = &mut self.sessions[self.active_session].db_panel.sql_input;
+                if let Some(sel) = input.selection().filter(|s| !s.is_empty()) {
+                    // Match iced's built-in Cut: copy the selection out, then delete it.
+                    input.perform(text_editor::Action::Edit(text_editor::Edit::Delete));
+                    return Task::perform(crate::clipboard::write(sel), |_| Message::ClipboardWritten);
+                }
+            }
+            Message::DbSqlPaste => {
+                return Task::perform(crate::clipboard::read(), Message::DbSqlPasteReady);
+            }
+            Message::DbSqlPasteReady(contents) => {
+                let Some(text) = contents.filter(|s| !s.is_empty()) else { return Task::none(); };
+                self.sessions[self.active_session].db_panel.sql_input.perform(
+                    text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(text))),
+                );
             }
             Message::DbRunSql => {
                 let s   = &mut self.sessions[self.active_session];
@@ -2863,19 +4124,24 @@ impl Frms {
                     Some(c) => c,
                     None    => return Task::none(),
                 };
+                let epoch = p.epoch;
                 p.query            = sql.clone();
                 p.query_running    = true;
                 p.query_error      = None;
                 p.statement_status = None;
                 return Task::perform(
                     db::run_statement(client, sql),
-                    move |r| Message::DbStatementResult(sid, r),
+                    move |r| Message::DbStatementResult(sid, epoch, r),
                 );
             }
-            Message::DbStatementResult(session_id, result) => {
+            Message::DbStatementResult(session_id, epoch, result) => {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                     let p = &mut s.db_panel;
+                    if !p.is_current(epoch) {
+                        return Task::none();
+                    }
                     p.query_running = false;
+                    p.copy_notice   = None;
                     match result {
                         Ok(StatementOutcome::Rows(r)) => {
                             p.query_result      = Some(r);
@@ -2914,6 +4180,7 @@ impl Frms {
                 p.query_result = None;
                 p.query_error  = None;
                 p.statement_status = None;
+                p.copy_notice  = None;
             }
             Message::DbRow1ToggleCollapsed => {
                 let p = &mut self.sessions[self.active_session].db_panel;
@@ -2921,6 +4188,41 @@ impl Frms {
             }
             Message::DbCopyValue(value) => {
                 return Task::perform(crate::clipboard::write(value), |_| Message::ClipboardWritten);
+            }
+            Message::DbCopyFormatChanged(format) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                p.copy_format = format;
+                p.copy_notice = None;
+            }
+            Message::DbCopyResults => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                let Some(result) = &p.query_result else { return Task::none() };
+                let text = result.to_clipboard(p.copy_format);
+                let rows = result.rows.len();
+                p.copy_notice = Some(format!(
+                    "Copied {rows} {} as {}",
+                    if rows == 1 { "row" } else { "rows" },
+                    p.copy_format,
+                ));
+                return Task::perform(crate::clipboard::write(text), |_| Message::ClipboardWritten);
+            }
+            Message::DbCopyRow(idx) => {
+                let p = &mut self.sessions[self.active_session].db_panel;
+                let Some(result) = &p.query_result else { return Task::none() };
+                let Some(text) = result.row_to_clipboard(idx, p.copy_format) else {
+                    return Task::none();
+                };
+                p.copy_notice = Some(format!("Copied row {} as {}", idx + 1, p.copy_format));
+                return Task::perform(crate::clipboard::write(text), |_| Message::ClipboardWritten);
+            }
+            Message::DbResultsScrolled(viewport) => {
+                // Mirror the body's horizontal offset onto the frozen header so
+                // the column titles stay lined up with the cells beneath them.
+                let x = viewport.absolute_offset().x;
+                return scrollable::scroll_to(
+                    ui::db_panel::results_header_scroll_id(),
+                    scrollable::AbsoluteOffset { x, y: 0.0 },
+                );
             }
             Message::CenterTabSelected(tab) => {
                 let s = &mut self.sessions[self.active_session];
@@ -2937,6 +4239,9 @@ impl Frms {
                         text_input::Id::new(crate::ui::db_panel::FIELD_HOST),
                     );
                 }
+                // Landing on a chat tab: put its transcript back at the newest
+                // message (the scroll offset died when the pane left the view).
+                return self.reveal_chat_panes();
             }
 
             // ── preferences ───────────────────────────────────────────────────
@@ -2998,15 +4303,51 @@ impl Frms {
                 self.prefs.terminal_font_scale = f;
                 self.prefs.save();
             }
+            Message::PrefsSubmoduleColorChanged(c) => {
+                if self.prefs.submodule_color != c {
+                    self.prefs.submodule_color = c;
+                    self.prefs.save();
+                }
+            }
+            Message::PrefsDefaultToolChanged(t) => {
+                if self.prefs.default_tool != t {
+                    self.prefs.default_tool = t;
+                    self.prefs.save();
+                }
+            }
+            Message::PrefsFilterToolsToggled(on) => {
+                self.prefs.filter_tools_to_installed = on;
+                self.prefs.save();
+            }
+            Message::PrefsChatAccessChanged(access) => {
+                if self.prefs.chat_access != access {
+                    self.prefs.chat_access = access;
+                    self.prefs.save();
+                    // Read on each send, so open chat panes pick this up on
+                    // their next turn — nothing to restart.
+                }
+            }
+            Message::PrefsLsFlagToggled(flag, on) => {
+                self.prefs.set_ls_flag(flag, on);
+                self.prefs.save();
+                // Deliberately not pushed into shells that are already open —
+                // typing an alias into one would land in whatever program the
+                // user has running there. New terminals pick it up.
+            }
+            Message::PrefsImmutableSystemToggled(on) => {
+                self.prefs.immutable_system = on;
+                self.prefs.save();
+                // Takes effect on the next launch (and immediately for the
+                // Terminals-tab container badge). Nothing to restart: which
+                // container a shell is in is tracked either way, this only
+                // decides whether frms acts on it.
+            }
             Message::PrefsTelemetryToggled(on) => {
                 self.prefs.telemetry = on;
                 self.prefs.save();
-                // Apply immediately: start a fresh sender, or drop to a no-op.
-                self.telemetry = if on {
-                    crate::telemetry::Telemetry::start(true)
-                } else {
-                    crate::telemetry::Telemetry::disabled()
-                };
+                // Applies immediately to the optional tier; the sender keeps
+                // running either way so install/launch counts still report.
+                self.telemetry.set_optional(on);
             }
             Message::NdaChoice(accepted) => {
                 if accepted {
@@ -3021,14 +4362,10 @@ impl Frms {
                 self.prefs.telemetry           = keep_on;
                 self.prefs.telemetry_notice_ack = true;
                 self.prefs.save();
-                // Consent given: start telemetry now (if kept on) and record the
-                // first launch — the one we deliberately held back in `new`.
-                if keep_on {
-                    self.telemetry = crate::telemetry::Telemetry::start(true);
-                    self.telemetry.record(crate::telemetry::Event::Launch);
-                } else {
-                    self.telemetry = crate::telemetry::Telemetry::disabled();
-                }
+                // The choice covers the optional tier only — install/launch are
+                // disclosed by the notice as always-on, and were already sent
+                // by `new`. Same path as the Profile toggle.
+                self.telemetry.set_optional(keep_on);
             }
             Message::ThemeAnimTick => {
                 if matches!(&self.theme_anim, Some(a) if a.finished()) {
@@ -3081,10 +4418,18 @@ impl Frms {
 
         // Receiver file picker — full-screen overlay for choosing a file to scp.
         if let Some(fp) = &self.file_picker {
-            let receiver_name = self.receivers.receiver_by_id(fp.receiver)
-                .map(|r| r.name.as_str())
-                .unwrap_or("receiver");
-            return ui::file_picker::view(&fp.browser, receiver_name, colors);
+            let receiver_name = match fp.purpose {
+                PickerPurpose::ReceiverCopy(id) => self.receivers.receiver_by_id(id)
+                    .map(|r| r.name.as_str())
+                    .unwrap_or("receiver"),
+                PickerPurpose::CloudSqlCredentials => "",
+            };
+            return ui::file_picker::view(
+                &fp.browser,
+                fp.purpose.title(receiver_name),
+                fp.purpose.hint(),
+                colors,
+            );
         }
 
         // If the new-session dialog is open, show it full-screen instead of the IDE
@@ -3103,6 +4448,7 @@ impl Frms {
         let header        = ui::header::view(
             plugin_panel.visible,
             &self.claude_stats,
+            self.stats_stale,
             &self.claude_procs,
             self.stats_refresh_interval,
             self.header_collapsed,
@@ -3178,6 +4524,28 @@ impl Frms {
             })
             .into();
 
+        // Per-model usage breakdown, opened from a header bar.
+        if let Some(card) = &self.usage_breakdown {
+            return iced::widget::stack![base, ui::usage_dialog::overlay(card, colors)]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
+
+        // "Change model" dialog floats over the IDE, scoped to the session it
+        // was opened for (which stays put even if the active session changes).
+        if let Some(dialog) = &self.agents_dialog {
+            if let Some(session) = self.sessions.iter().find(|s| s.id == dialog.session_id) {
+                return iced::widget::stack![
+                    base,
+                    ui::agents_dialog::overlay(dialog, &session.panes, colors),
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+            }
+        }
+
         // Close-confirmation dialog floats above everything else.
         let Some(pending) = self.pending_close else {
             return base;
@@ -3241,6 +4609,10 @@ impl Frms {
         let pending      = session.pending_prompt.as_ref();
         let prompt_src   = session.prompt_source_terminal;
         let center_tab   = session.center_tab;
+        let submodule_color = self.prefs.submodule_color;
+        // The one Cloud SQL setting the user owns: their service-account key.
+        // Where the proxy binary lives is frms' problem, not theirs.
+        let cloud_sql_creds = &self.prefs.cloud_sql_credentials;
 
         // File browser hidden (Terminal layout only): skip the pane grid and
         // lay out a thin expand strip beside a full-width editor, so the
@@ -3263,6 +4635,10 @@ impl Frms {
                 prompt_src,
                 &self.renaming_claude,
                 self.agent_menu_open,
+                self.prefs.default_tool,
+                self.prefs.filter_tools_to_installed,
+                self.agent_strip_overflow,
+                cloud_sql_creds,
             );
             let editor_bordered = iced::widget::container(editor_el)
                 .width(Length::Fill)
@@ -3279,7 +4655,7 @@ impl Frms {
         } else {
             pane_grid::PaneGrid::new(panes, move |_pane, kind, _maximized| {
                 let content = match kind {
-                    PaneKind::FileBrowser => ui::file_browser::view(file_browser),
+                    PaneKind::FileBrowser => ui::file_browser::view(file_browser, submodule_color),
                     PaneKind::Editor  => {
                         ui::editor::view(
                             editor,
@@ -3291,6 +4667,10 @@ impl Frms {
                             prompt_src,
                             &self.renaming_claude,
                             self.agent_menu_open,
+                            self.prefs.default_tool,
+                            self.prefs.filter_tools_to_installed,
+                            self.agent_strip_overflow,
+                            cloud_sql_creds,
                         )
                     }
                     PaneKind::Browser => {
@@ -3323,14 +4703,23 @@ impl Frms {
                 &session.plugin_panel,
                 &self.prefs,
                 &self.notes,
+                &session.docs,
                 session.working_dir.to_str(),
                 &session.terminals_plugin,
                 &self.receivers,
                 session.db_panel.client.is_some(),
                 &session.db_panel.tables,
-                self.claude_installed,
                 self.prefs.telemetry,
             );
+            // Expanded: the panel swallows the whole width and the main working
+            // area is hidden — the mirror of hiding the panel for a full-width
+            // main area.
+            if session.plugin_panel.expanded {
+                return iced::widget::container(panel)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+            }
             // Dock side decides whether the panel sits left of the file browser
             // or right of everything.
             let row = match session.plugin_panel.dock {
@@ -3467,6 +4856,102 @@ impl Frms {
     /// child processes first closes their PTY ends (tidy on every platform);
     /// `process::exit` then skips the runtime join entirely. State is already
     /// persisted incrementally (on each mutation), so nothing is lost here.
+    /// Is agent pane `tid` currently on screen? Only the active session's
+    /// center area is rendered — or both slots' while the two-up split is up —
+    /// and only the one pane its center tab points at.
+    fn pane_on_screen(&self, tid: TerminalId) -> bool {
+        let tab = crate::session::CenterTab::Claude(tid);
+        match &self.split_view {
+            Some(sv) => self.sessions.iter().any(|s| {
+                (s.id == sv.top_id || s.id == sv.bottom_id) && s.center_tab == tab
+            }),
+            None => self.sessions[self.active_session].center_tab == tab,
+        }
+    }
+
+    /// Launch the CLI for any agent pane that is now on screen but hasn't
+    /// started yet.
+    ///
+    /// Build panes are created unspawned (`AgentPane::Pending`), so opening
+    /// frms with several restored sessions doesn't start one `claude` per agent
+    /// tab before the user has looked at any of them — a session left untouched
+    /// for the whole run never costs a process. This runs after every update,
+    /// the one place that sees every path which can change what is displayed
+    /// (tab clicks, Ctrl+Tab, session switches, the two-up split, restore), so
+    /// no individual navigation handler has to remember to ask.
+    fn spawn_visible_panes(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        // Collected first: `pane_on_screen` borrows `self`, and spawning
+        // borrows it mutably.
+        let pending: Vec<(usize, TerminalId)> = self.sessions.iter().enumerate()
+            .flat_map(|(i, s)| s.panes.iter()
+                .filter(|p| p.is_pending())
+                .map(move |p| (i, p.id())))
+            .collect();
+        for (i, tid) in pending {
+            if self.pane_on_screen(tid) {
+                self.sessions[i].spawn_pending(tid);
+            }
+        }
+    }
+
+    /// Snap one chat transcript to its newest message, unless the user has
+    /// scrolled back through it.
+    ///
+    /// Called as replies stream in so the answer scrolls itself into view. A
+    /// snap aimed at an off-screen scrollable is a harmless no-op — those panes
+    /// are re-pinned by [`Self::reveal_chat_panes`] when they come back.
+    fn pin_chat_tail(&mut self, tid: TerminalId) -> Task<Message> {
+        let following = self
+            .sessions
+            .iter()
+            .flat_map(|s| s.panes.iter())
+            .find(|p| p.id() == tid)
+            .and_then(|p| p.as_chat())
+            .map_or(false, |c| c.follow_tail);
+        if !following {
+            return Task::none();
+        }
+        scrollable::snap_to(chat_scroll_id(tid), scrollable::RelativeOffset::END)
+    }
+
+    /// Re-pin the chat panes that are now on screen to the end of their
+    /// transcripts, and clear their unread markers.
+    ///
+    /// iced keeps a scrollable's offset in the widget tree, so a chat pane that
+    /// left the view (the user switched center tab or session) loses it and
+    /// comes back scrolled to the top — with any reply that arrived meanwhile
+    /// below the fold. Every navigation that can change which pane is displayed
+    /// runs this, so returning to a conversation lands at its newest message.
+    fn reveal_chat_panes(&mut self) -> Task<Message> {
+        let visible: Vec<TerminalId> = self
+            .sessions
+            .iter()
+            .flat_map(|s| s.panes.iter().map(|p| p.id()))
+            .filter(|&tid| self.pane_on_screen(tid))
+            .collect();
+        let mut tasks = Vec::new();
+        for s in &mut self.sessions {
+            for p in &mut s.panes {
+                let Some(c) = p.as_chat_mut() else { continue };
+                if !visible.contains(&c.id) {
+                    continue;
+                }
+                c.unread      = false;
+                // A revealed pane starts at the top regardless of where the user
+                // had scrolled to before, so following resumes with it.
+                c.follow_tail = true;
+                tasks.push(scrollable::snap_to(
+                    chat_scroll_id(c.id),
+                    scrollable::RelativeOffset::END,
+                ));
+            }
+        }
+        Task::batch(tasks)
+    }
+
     /// Move keyboard focus to agent pane `tid` in session `idx`, clearing the
     /// other focus owners — the shared logic behind pane clicks and Ctrl+Tab.
     fn focus_pane(&mut self, idx: usize, tid: TerminalId) {
@@ -3508,13 +4993,30 @@ impl Frms {
         }
     }
 
+    /// Ctrl+Shift+A: cycle focus through only the active session's agent panes,
+    /// wrapping around and never stopping on the toolbox.
+    fn cycle_agent_pane(&mut self, forward: bool) {
+        let idx = self.active_session;
+        let ids: Vec<TerminalId> = self.sessions[idx].panes.iter().map(|p| p.id()).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let n = ids.len();
+        let cur = ids
+            .iter()
+            .position(|&t| t == self.sessions[idx].active_terminal)
+            .unwrap_or(0);
+        let next = if forward { (cur + 1) % n } else { (cur + n - 1) % n };
+        self.focus_pane(idx, ids[next]);
+    }
+
     /// Ctrl+Shift+↑/↓: jump to the next/previous pane that's waiting on the user
     /// (a surfaced question or a review), scanning across every session.
     fn cycle_attention(&mut self, forward: bool) {
         let mut waiting: Vec<(usize, TerminalId)> = Vec::new();
         for (si, s) in self.sessions.iter().enumerate() {
             for p in &s.panes {
-                if p.waiting_on_user() {
+                if p.needs_attention() {
                     waiting.push((si, p.id()));
                 }
             }
@@ -3536,7 +5038,14 @@ impl Frms {
     }
 
     fn shutdown(&mut self) -> ! {
+        // Snapshot state while the shells are still alive — save_persisted reads
+        // each pinned terminal's live cwd from its (about-to-be-killed) child,
+        // so it must run before the kill loop below or the location is lost.
+        self.save_persisted();
         for session in &mut self.sessions {
+            // Managed children that aren't PTYs: the Cloud SQL proxy holds a
+            // local port, so leaving one behind would block the next launch.
+            session.db_panel.stop_proxy();
             for pane in &mut session.panes {
                 if let Some(t) = pane.as_terminal_mut() {
                     if let Ok(mut c) = t.child.lock() {
@@ -3596,7 +5105,7 @@ impl Frms {
         let dir = working_dir.unwrap_or_else(|| {
             crate::port::dirs::home().unwrap_or_else(|| PathBuf::from("."))
         });
-        let session = Session::new(id, name, kind, first_term, dir);
+        let session = Session::new(id, name, kind, first_term, dir, self.prefs.default_tool);
         self.sessions.push(session);
         self.active_session = self.sessions.len() - 1;
         self.telemetry.record(crate::telemetry::Event::SessionCreated {
@@ -3607,12 +5116,180 @@ impl Frms {
         });
     }
 
+    /// Spawn an interactive SSH session to `receiver`, replacing any prior
+    /// session to that same receiver. `focus` routes the keyboard to the new
+    /// pane — false during bulk connects, where nothing is on screen to type
+    /// into and stealing focus per host would just thrash it.
+    ///
+    /// Returns the destination on success, or the reason it couldn't start.
+    fn connect_receiver(&mut self, id: u64, focus: bool) -> Result<String, String> {
+        let r = self.receivers.receiver_by_id(id).cloned()
+            .ok_or_else(|| "receiver not found".to_string())?;
+        if r.host.trim().is_empty() || r.username.trim().is_empty() {
+            return Err(format!("{}: set a host and username before connecting", r.name));
+        }
+        let tid = self.next_terminal_id;
+        self.next_terminal_id += 1;
+        let (prog, args, envs) = r.ssh_command();
+        match crate::terminal::TerminalPane::spawn_args(tid, &prog, &args, &envs, None) {
+            Ok(pane) => {
+                if focus {
+                    // Other terminals lose keyboard focus to the new SSH pane.
+                    self.sessions[self.active_session].terminals_plugin.focused = false;
+                }
+                // Replaces any prior session to *this* receiver; sessions to
+                // other receivers keep running so their panes survive.
+                self.receivers.set_ssh(crate::receivers::SshTerminal {
+                    id: tid,
+                    receiver: id,
+                    name: r.name.clone(),
+                    pane,
+                    focused: focus,
+                    exited: false,
+                });
+                Ok(r.destination())
+            }
+            Err(e) => Err(format!("{}: ssh failed: {e}", r.name)),
+        }
+    }
+
     fn session_for_terminal_mut(&mut self, id: TerminalId) -> Option<&mut Session> {
         self.sessions.iter_mut().find(|s| s.panes.iter().any(|p| p.id() == id))
     }
 
     fn session_for_plugin_terminal_mut(&mut self, id: TerminalId) -> Option<&mut Session> {
         self.sessions.iter_mut().find(|s| s.terminals_plugin.has_terminal(id))
+    }
+
+    /// The chat pane behind `id` (a Research / Chat agent), if that's what it
+    /// is. The find handlers use it to fall through from PTY panes to chats.
+    fn chat_pane_mut(&mut self, id: TerminalId) -> Option<&mut crate::agent::ChatPane> {
+        let i = self.sessions.iter().position(|s| s.panes.iter().any(|p| p.id() == id))?;
+        self.sessions[i].chat_mut(id)
+    }
+
+    /// Re-measure whether the agent-tab strip overflows, after a message that
+    /// could have changed either the tabs or the room they have.
+    ///
+    /// "Measure" here means: assume they fit. The strip publishes its geometry
+    /// (`Message::AgentStripViewport`) on the next redraw *only* while it
+    /// overflows, so clearing the flag and letting the strip contradict us is
+    /// the whole detection — an unpadded strip that turns out to overflow is
+    /// corrected within a frame, and one that fits simply stays unpadded and
+    /// keeps the callout at its natural height.
+    fn refresh_agent_strip_overflow(&mut self, relaid_out: bool) {
+        let sig = self.agent_strip_signature();
+        if relaid_out || sig != self.agent_strip_sig {
+            self.agent_strip_sig      = sig;
+            self.agent_strip_overflow = false;
+        }
+    }
+
+    /// Fingerprint of everything that decides how wide the agent-tab strip is:
+    /// which session is on screen (each project has its own set of tabs), which
+    /// panes it holds, what they're called, and any rename box currently open in
+    /// their place.
+    ///
+    /// Deliberately *not* hashed: the panes' attention badges. A badge does
+    /// nudge a tab's width, but it also flips several times a second while a
+    /// CLI repaints (see [`TerminalPane::note_menu_on_screen`]), and every flip
+    /// cleared the overflow flag, dropped the strip's scrollbar gutter, and
+    /// handed the terminal below an extra row — resizing the pty, forcing a
+    /// repaint, and flipping the badge again. The strip re-reports overflow on
+    /// its own the moment it overflows, so all a badge can cost us here is a
+    /// gutter that lingers until the next real layout change.
+    ///
+    /// Only the sessions actually rendering a strip are hashed — the active one
+    /// plus, in split view, the two on either side of the divider. Hashing every
+    /// session would miss the case that matters most here: switching projects
+    /// swaps one set of tabs for another without changing any session's
+    /// contents, and a strip that overflowed in the project just left must not
+    /// leave its gutter behind in the one just opened.
+    fn agent_strip_signature(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+
+        let mut visible: Vec<usize> = Vec::with_capacity(3);
+        if let Some(s) = self.sessions.get(self.active_session) {
+            visible.push(s.id);
+        }
+        if let Some(sv) = &self.split_view {
+            visible.push(sv.top_id);
+            visible.push(sv.bottom_id);
+        }
+
+        for id in visible {
+            id.hash(&mut h);
+            let Some(s) = self.sessions.iter().find(|s| s.id == id) else { continue };
+            for p in &s.panes {
+                p.id().hash(&mut h);
+                p.name().hash(&mut h);
+                p.kind().label().hash(&mut h);
+            }
+        }
+        self.renaming_claude.hash(&mut h);
+        h.finish()
+    }
+
+    /// Whether the find bar is open on `id`, whichever kind of agent pane it is.
+    fn find_is_open(&self, id: TerminalId) -> bool {
+        let Some(s) = self.sessions.iter().find(|s| s.panes.iter().any(|p| p.id() == id)) else {
+            return false;
+        };
+        s.terminal(id).map_or(false, |t| t.find.is_some())
+            || s.chat(id).map_or(false, |c| c.find.is_some())
+    }
+
+    /// Open the find bar on `id` and refresh its hits.
+    fn find_open(&mut self, id: TerminalId) {
+        if let Some(t) = self.terminal_pane_mut(id) {
+            t.find_open();
+        } else if let Some(c) = self.chat_pane_mut(id) {
+            c.find_open();
+        }
+    }
+
+    /// Close the find bar on `id`.
+    fn find_close(&mut self, id: TerminalId) {
+        if let Some(t) = self.terminal_pane_mut(id) {
+            t.find_close();
+        } else if let Some(c) = self.chat_pane_mut(id) {
+            c.find_close();
+        }
+    }
+
+    /// Scroll a chat pane's transcript to its current find hit. Bubbles vary in
+    /// height, so this positions by *message index* rather than pixels: it puts
+    /// the view in the right neighbourhood, and the hit bubble's accent border
+    /// is what pins it down exactly.
+    fn reveal_chat_hit(&mut self, id: TerminalId) -> Task<Message> {
+        let Some(c) = self.chat_pane_mut(id) else { return Task::none() };
+        let total = c.messages.len();
+        let Some(hit) = c.find.as_ref().and_then(|f| f.hits.get(f.current).copied()) else {
+            return Task::none();
+        };
+        // Reading a hit means reading what led to it, so aim slightly above.
+        let y = if total > 1 {
+            (hit.saturating_sub(1) as f32 / (total - 1) as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // The user is now driving the viewport; stop streaming from yanking it.
+        c.follow_tail = false;
+        scrollable::snap_to(chat_scroll_id(id), scrollable::RelativeOffset { x: 0.0, y })
+    }
+
+    /// The terminal pane behind `id`, wherever it lives — an agent/Claude pane,
+    /// a plugin shell terminal, or a receiver SSH session. Lets the scroll and
+    /// drag-selection handlers treat all three alike.
+    fn terminal_pane_mut(&mut self, id: TerminalId) -> Option<&mut TerminalPane> {
+        if let Some(i) = self.sessions.iter().position(|s| s.panes.iter().any(|p| p.id() == id)) {
+            return self.sessions[i].terminal_mut(id);
+        }
+        if let Some(i) = self.sessions.iter().position(|s| s.terminals_plugin.has_terminal(id)) {
+            return self.sessions[i].terminals_plugin.terminal_mut(id).map(|t| &mut t.pane);
+        }
+        self.receivers.ssh_mut(id).map(|t| &mut t.pane)
     }
 
     /// Execute the close the user just confirmed in the dialog — either a
@@ -3630,6 +5307,9 @@ impl Frms {
                     ) {
                         self.split_view = None;
                     }
+                    // The Cloud SQL proxy is a child of frms, not of the pane —
+                    // closing its session has to take it down too.
+                    self.sessions[idx].db_panel.stop_proxy();
                     self.sessions.remove(idx);
                     if self.active_session >= self.sessions.len() {
                         self.active_session = self.sessions.len() - 1;
@@ -3654,6 +5334,35 @@ impl Frms {
         self.sessions.get(self.active_session)
             .and_then(|s| s.working_dir.to_str())
             .map(String::from)
+    }
+
+    /// Re-index the active session's `_specs` / `_docs` folders. Runs whenever
+    /// the Docs tab comes on screen (and on the ↻ button) rather than on a
+    /// watcher, so the list is current each time it's looked at without frms
+    /// holding a watch on every project it has ever opened.
+    fn rescan_docs(&mut self) {
+        let Some(s) = self.sessions.get_mut(self.active_session) else { return };
+        s.docs.rescan(&s.working_dir);
+    }
+
+    /// Bring `tab` up in the toolbox's top slot and drop the caret into the
+    /// widget `focus_id` — the shared path behind the "go straight to this
+    /// search" chords. Un-hides the plugin if the user had closed its tab, so
+    /// the chord works from any state rather than silently doing nothing.
+    fn open_plugin_tab(&mut self, tab: PluginTab, focus_id: &'static str) -> Task<Message> {
+        {
+            let panel = &mut self.sessions[self.active_session].plugin_panel;
+            panel.show_tab(tab);
+            panel.active_tab = tab;
+            panel.visible = true;
+            panel.adding = false;
+            panel.controls_menu = false;
+        }
+        if tab == PluginTab::Docs {
+            self.rescan_docs();
+        }
+        self.save_persisted();
+        text_input::focus(text_input::Id::new(focus_id))
     }
 
     /// Capture terminal `id`'s selection into a brand-new note (clearing the
@@ -3704,12 +5413,22 @@ impl Frms {
         } else {
             None
         };
-        let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return };
+        let Some(text) = text else { return };
+        self.text_to_note(&text);
+    }
+
+    /// Create a note from `text` (ignored when blank) and reveal the Notes tab
+    /// in the active session. Shared by the terminal selection path
+    /// ([`Self::selection_to_note`]) and the chat-bubble "+ Note" affordance.
+    fn text_to_note(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
 
         // The note lands in the active session's Notes tab, so pin it to
         // that session's project.
         let project = self.active_project();
-        self.notes.create_from(&text, project);
+        self.notes.create_from(text, project);
 
         // Reveal the Notes plugin in the active session. If a split panel
         // already shows Notes in the bottom slot, leave the slots alone;
@@ -3726,8 +5445,16 @@ impl Frms {
     /// Re-evaluate whether a Claude permission prompt is currently on-screen
     /// for `source`'s terminal and update the inline response panel state.
     fn reconcile_prompt(s: &mut Session, source: TerminalId) {
-        let detected = s.terminal(source)
-            .and_then(|t| t.grid.lock().ok().and_then(|g| claude_prompt::detect(&g)));
+        // Both readings come from one lock: whether the prompt parses, and
+        // whether *any* question menu is on screen. They disagree exactly when
+        // the CLI is mid-repaint, which is the case the debounce below cares
+        // about.
+        let (detected, menu_up) = s.terminal(source)
+            .and_then(|t| t.grid.lock().ok())
+            .map(|g| (claude_prompt::detect(&g), claude_prompt::is_waiting_on_user(&g)))
+            .unwrap_or((None, false));
+
+        let surfaced = s.prompt_source_terminal == Some(source) && s.pending_prompt.is_some();
 
         match detected {
             Some(prompt) => {
@@ -3738,27 +5465,45 @@ impl Frms {
                 if s.last_handled_prompt.as_deref() == Some(fp.as_str()) {
                     return;
                 }
-                if s.pending_prompt.as_ref() != Some(&prompt) {
-                    s.pending_prompt         = Some(prompt);
-                    s.prompt_source_terminal = Some(source);
+                match &s.pending_prompt {
+                    // Nothing up yet: surface at once. A question the user is
+                    // being kept waiting on shouldn't sit behind a settle timer.
+                    None => {
+                        s.pending_prompt         = Some(prompt);
+                        s.prompt_source_terminal = Some(source);
+                        s.prompt_swap            = None;
+                    }
+                    Some(cur) if *cur == prompt => s.prompt_swap = None,
+                    // A *different* reading while a panel is already up. Half of
+                    // these are half-drawn frames whose diff is truncated or
+                    // empty; adopting each one makes the panel's contents jump.
+                    // Only swap once the new reading has held still.
+                    Some(_) => match &s.prompt_swap {
+                        Some((seen, since)) if *seen == fp => {
+                            if since.elapsed() >= PROMPT_SWAP_SETTLE {
+                                s.pending_prompt         = Some(prompt);
+                                s.prompt_source_terminal = Some(source);
+                                s.prompt_swap            = None;
+                            }
+                        }
+                        _ => s.prompt_swap = Some((fp, Instant::now())),
+                    },
                 }
             }
-            None if s.prompt_source_terminal == Some(source) && s.pending_prompt.is_some() => {
-                // The prompt vanished from a surfaced source. This is usually a
-                // transient mid-repaint frame caused by the response pane
-                // resizing the terminal — tearing the pane down now would
-                // resize back and flicker forever. Debounce: only drop the
-                // prompt once it's stayed gone past PROMPT_CLEAR_DELAY.
-                let now = std::time::Instant::now();
-                match s.prompt_lost_at {
-                    None => s.prompt_lost_at = Some(now),
-                    Some(t0) if now.duration_since(t0) >= PROMPT_CLEAR_DELAY => {
-                        s.pending_prompt         = None;
-                        s.prompt_source_terminal = None;
-                        s.prompt_lost_at         = None;
-                        s.last_handled_prompt    = None;
-                    }
-                    _ => {}
+            None if surfaced => {
+                // The prompt stopped parsing on a source whose panel is up.
+                // Showing the panel shrinks the terminal, which makes the CLI
+                // repaint, and a mid-repaint frame has no parseable prompt on
+                // it — tearing the panel down there would resize the terminal
+                // back and flicker forever. So debounce, and hold far longer
+                // while the terminal still shows a menu of some kind: that says
+                // the question is still up and only our parse of it failed.
+                // The hold is bounded so a *different*, unparseable question
+                // can't leave the previous diff stranded on screen.
+                let lost_for = s.prompt_lost_at.get_or_insert_with(Instant::now).elapsed();
+                let limit = if menu_up { PROMPT_STALE_MAX } else { PROMPT_CLEAR_DELAY };
+                if lost_for >= limit {
+                    s.clear_prompt();
                 }
             }
             None => {
@@ -3766,6 +5511,7 @@ impl Frms {
                 // bookkeeping so the next (different) prompt can re-surface.
                 s.prompt_lost_at      = None;
                 s.last_handled_prompt = None;
+                s.prompt_swap         = None;
             }
         }
     }
@@ -3776,18 +5522,18 @@ impl Frms {
     fn respond_to_prompt(&mut self, bytes: &[u8]) {
         let s = &mut self.sessions[self.active_session];
         let Some(target) = s.prompt_source_terminal else { return };
-        if let Some(prompt) = &s.pending_prompt {
-            s.last_handled_prompt = Some(prompt.fingerprint());
-        }
+        let answered = s.pending_prompt.as_ref().map(|p| p.fingerprint());
         if let Some(t) = s.terminal_mut(target) {
             t.write_input(bytes);
             // Drop the attention highlight immediately — the next PTY data
             // chunk would clear it anyway, but this avoids a stale flash.
-            t.waiting_on_user = false;
+            t.clear_waiting();
         }
-        s.pending_prompt         = None;
-        s.prompt_source_terminal = None;
-        s.prompt_lost_at         = None;
+        // Clear everything, then re-arm the one piece that has to survive: the
+        // fingerprint of what was just answered, so the panel doesn't re-open
+        // on the same question in the frames before the CLI redraws without it.
+        s.clear_prompt();
+        s.last_handled_prompt = answered;
     }
 }
 
@@ -3829,6 +5575,7 @@ fn plugin_panel_drag_listener(
 /// Always-on listener that turns the window-manager close request (the
 /// title-bar X) into `Message::Quit`, so it runs through our hard-shutdown
 /// path instead of iced's default graceful exit (which hangs on Windows).
+/// It also forwards resizes, which change how much room the agent-tab strip has.
 fn window_close_listener(
     event:   iced::Event,
     _status: iced::event::Status,
@@ -3836,6 +5583,7 @@ fn window_close_listener(
 ) -> Option<Message> {
     match event {
         iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Quit),
+        iced::Event::Window(iced::window::Event::Resized(_))     => Some(Message::WindowResized),
         _ => None,
     }
 }
@@ -3863,29 +5611,41 @@ fn main_key_listener(
     status: iced::event::Status,
     _window: iced::window::Id,
 ) -> Option<Message> {
-    // TEMP DEBUG (FRMS_KEYLOG=1): log every key press + its capture status so we
-    // can see whether ArrowRight is arriving Captured (eaten by a widget) or
-    // Ignored (so the swallow is downstream). Remove once the arrow bug is found.
+    // FRMS_KEYLOG=1 logs every key press with its physical key, modifiers, and
+    // capture status. Kept (not temp): `Captured` vs `Ignored` is the fastest
+    // way to tell a key a widget swallowed from one we mis-route ourselves —
+    // that's how the Ctrl+Shift+arrow and numpad bugs were pinned down — and
+    // it shows what the keypad reports under either NumLock state.
     if std::env::var("FRMS_KEYLOG").is_ok() {
-        if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) = &event {
-            eprintln!("[keylog] key={key:?} status={status:?}");
+        if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key, physical_key, modifiers, ..
+        }) = &event {
+            eprintln!("[keylog] key={key:?} physical={physical_key:?} mods={modifiers:?} status={status:?}");
         }
     }
-    let is_tab = matches!(
-        &event,
-        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
-            ..
-        })
-    );
-    if !is_tab && status == iced::event::Status::Captured {
+    let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key, modifiers, text, physical_key, ..
+    }) = event else {
+        return None;
+    };
+
+    // App-level chords are resolved first, ahead of the capture gate below —
+    // they're global by design, so a focused text widget must not be able to
+    // swallow them. See `app_chord` for which keys that covers and what text
+    // editing gives up. Two ways the gate used to eat them: Ctrl+Shift+arrow
+    // (and PageUp/PageDown, Enter, C/V/X/A) are claimed outright by
+    // `text_input`/`text_editor`, and a numpad digit with NumLock off arrives
+    // as End / ArrowDown / PageUp / … — navigation keys those widgets consume.
+    if let Some(message) = app_chord(&key, modifiers, &physical_key) {
+        return Some(message);
+    }
+
+    if !matches!(key, iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab))
+        && status == iced::event::Status::Captured
+    {
         return None;
     }
-    if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, text, .. }) = event {
-        handle_key(key, modifiers, text.map(|t| t.to_string()))
-    } else {
-        None
-    }
+    handle_key(key, modifiers, text.map(|t| t.to_string()), physical_key)
 }
 
 /// Wrap pasted text with bracketed-paste markers if the terminal program
@@ -3901,71 +5661,185 @@ fn paste_payload(text: &str, bracketed: bool) -> String {
     }
 }
 
+/// App-level chords, which outrank every widget.
+///
+/// `main_key_listener` resolves these *before* its `Status::Captured` gate, so
+/// they fire even when a focused text widget has already eaten the key. That
+/// bypass is the whole point: iced's `text_input` and `text_editor` claim
+/// Ctrl+Shift+arrow (select by word), Ctrl+Shift+PageUp/PageDown (select by
+/// page), Enter, and Ctrl+Shift+C/V/X/A — none of those arms guard on Shift —
+/// so every navigation chord here silently died the moment focus landed in the
+/// code editor or any text field. Behind the gate they were unreachable.
+///
+/// The unshifted forms still reach the widget, so text editing keeps plain
+/// Ctrl+C/V/X/A, plain and Ctrl+arrow motion, and Shift+arrow selection. What
+/// it gives up is Ctrl+Shift+arrow / Ctrl+Shift+PageUp/PageDown selection —
+/// the app owns those.
+///
+/// Note what running early does *not* do: the listener only observes, so a
+/// widget that captured the key still acts on it. Both halves happen. That's
+/// fine for navigation (the widget moves a cursor we're about to defocus) but
+/// not for the clipboard, so Ctrl+Shift+C/V deliberately stay behind the gate
+/// in [`handle_key`] — see there.
+fn app_chord(
+    key:       &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    physical:  &keyboard::key::Physical,
+) -> Option<Message> {
+    if !modifiers.control() {
+        return None;
+    }
+    // Ctrl+Tab / Ctrl+Shift+Tab — cycle panes (incl. the toolbox). Kept as a
+    // fallback where the OS leaves it free; the primary binding is
+    // Ctrl+Shift+→/← below. Checked first: it isn't a terminal control code,
+    // so the shell never wants it.
+    if matches!(key, keyboard::Key::Named(key::Named::Tab)) {
+        return Some(Message::CyclePane { forward: !modifiers.shift() });
+    }
+
+    // Ctrl+1…9 → jump straight to project session N (like browser tabs), from
+    // the number row or the numeric keypad.
+    if let Some(index) = session_switch_chord(key, modifiers, physical) {
+        return Some(Message::SessionSelected(index));
+    }
+
+    if modifiers.shift() {
+        match key {
+            keyboard::Key::Named(key::Named::ArrowDown) =>
+                return Some(Message::CycleAttention { forward: true }),
+            keyboard::Key::Named(key::Named::ArrowUp) =>
+                return Some(Message::CycleAttention { forward: false }),
+            // Ctrl+Shift+→/← — cycle panes (incl. the toolbox). Replaces
+            // Ctrl+Tab, which the OS reserves; →=next, ←=previous.
+            keyboard::Key::Named(key::Named::ArrowRight) =>
+                return Some(Message::CyclePane { forward: true }),
+            keyboard::Key::Named(key::Named::ArrowLeft) =>
+                return Some(Message::CyclePane { forward: false }),
+            // Ctrl+Shift+PageDown/PageUp — cycle the toolbox's tool tabs.
+            keyboard::Key::Named(key::Named::PageDown) =>
+                return Some(Message::CyclePluginTab { forward: true }),
+            keyboard::Key::Named(key::Named::PageUp) =>
+                return Some(Message::CyclePluginTab { forward: false }),
+            keyboard::Key::Named(key::Named::Enter) =>
+                return Some(Message::PromptAccepted),
+            keyboard::Key::Character(s) => {
+                // Session switch. Accept both the base and shifted glyphs
+                // ("[" vs "{") since layouts report either for Shift+[.
+                match s.as_ref() {
+                    "[" | "{" => return Some(Message::CycleSession { forward: false }),
+                    "]" | "}" => return Some(Message::CycleSession { forward: true }),
+                    _ => {}
+                }
+                match s.to_ascii_lowercase().as_str() {
+                    // Ctrl+Shift+A → cycle focus through the active session's
+                    // agent panes only (skips the toolbox, unlike Ctrl+Shift+→).
+                    "a" => return Some(Message::CycleAgentPane { forward: true }),
+                    // Ctrl+Shift+N → new note from the selection. (C/V are the
+                    // clipboard pair and live in `handle_key`, behind the
+                    // capture gate.)
+                    "n" => return Some(Message::TerminalSendToNote),
+                    // Toolbox toggle / new agent / close focused agent.
+                    "b" => return Some(Message::PluginPanelToggled),
+                    // Ctrl+Shift+F → blow the toolbox up to the full window
+                    // width, or restore the main area. Expanding implies
+                    // showing it, so this works from a hidden toolbox too.
+                    "f" => return Some(Message::PluginPanelExpandToggled),
+                    // Ctrl+Shift+E → show/hide the file explorer beside the
+                    // editor and agent panes.
+                    "e" => return Some(Message::FileBrowserToggleCollapsed),
+                    // Ctrl+Shift+D → open this project's Database tool. D for
+                    // Database, the obvious key for it; the docs search that
+                    // used to hold it moved to S (for _specs).
+                    "d" => return Some(Message::CenterTabSelected(
+                        crate::session::CenterTab::Database,
+                    )),
+                    // Ctrl+Shift+S → jump straight to the Docs search over this
+                    // project's _specs / _docs, caret already in the field.
+                    "s" => return Some(Message::DocsOpen),
+                    // Ctrl+Shift+G → the same, for searching notes. G because
+                    // D/F/E are taken and Ctrl+Shift+N already makes a note.
+                    "g" => return Some(Message::NotesSearchOpen),
+                    // Ctrl+Shift+M → change the model on one or many of this
+                    // project's agent panes.
+                    "m" => return Some(Message::AgentsDialogOpened),
+                    // Ctrl+Shift+L → find in the agent conversation that's in
+                    // front. Resolved to that pane's id in `update`; L rather
+                    // than the conventional F because F expands the toolbox,
+                    // and Ctrl+F belongs to the CLI running in the pane.
+                    "l" => return Some(Message::FindToggled),
+                    // Quick "new agent" — resolved against the user's
+                    // default tool in `update` (no prefs access here).
+                    "t" => return Some(Message::NewDefaultAgent),
+                    "w" => return Some(Message::CloseActiveAgent),
+                    // Ctrl+Shift+Q → quit the app (same hard-shutdown path as
+                    // the title-bar X and the header Quit button).
+                    "q" => return Some(Message::Quit),
+                    // Answer the surfaced prompt: Enter accepts, R rejects.
+                    "r" => return Some(Message::PromptRejected),
+                    _   => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Ctrl+Shift+1…9 → jump straight to agent pane N *within* the session.
+    // The shifted sibling of Ctrl+1…9, so the pair reads as "Ctrl+digit picks
+    // the project, add Shift to pick the session inside it".
+    //
+    // Deliberately last. A numeric-keypad key with NumLock off reports itself
+    // as End / ArrowDown / PageUp, which are Ctrl+Shift chords in their own
+    // right — resolving those first keeps Ctrl+Shift+↓ meaning "next pane
+    // needing attention" even when it arrives from the keypad.
+    if let Some(index) = agent_pane_chord(key, modifiers, physical) {
+        return Some(Message::AgentPaneSelected(index));
+    }
+    None
+}
+
 /// Top-level keyboard handler — returns app messages or terminal input.
 fn handle_key(
     key: keyboard::Key,
     modifiers: keyboard::Modifiers,
     text: Option<String>,
+    physical: keyboard::key::Physical,
 ) -> Option<Message> {
-    if modifiers.control() {
-        // Ctrl+Tab / Ctrl+Shift+Tab — cycle panes (incl. the toolbox). Checked
-        // first: it isn't a terminal control code, so the shell never wants it.
-        if matches!(key, keyboard::Key::Named(key::Named::Tab)) {
-            return Some(Message::CyclePane { forward: !modifiers.shift() });
-        }
+    // Global chords win. `main_key_listener` has normally resolved these
+    // already (ahead of its capture gate); repeated here so this function is
+    // correct on its own, and so they stay ahead of the Ctrl+<letter> →
+    // control-byte mapping below rather than reaching the shell.
+    if let Some(msg) = app_chord(&key, modifiers, &physical) {
+        return Some(msg);
+    }
 
-        // Ctrl+Shift+<key> — app-level chords, handled before the generic
-        // Ctrl+<letter> → control-byte mapping so they don't reach the shell.
-        if modifiers.shift() {
-            match &key {
-                keyboard::Key::Named(key::Named::ArrowDown) =>
-                    return Some(Message::CycleAttention { forward: true }),
-                keyboard::Key::Named(key::Named::ArrowUp) =>
-                    return Some(Message::CycleAttention { forward: false }),
-                keyboard::Key::Named(key::Named::Enter) =>
-                    return Some(Message::PromptAccepted),
-                keyboard::Key::Character(s) => {
-                    // Session switch. Accept both the base and shifted glyphs
-                    // ("[" vs "{") since layouts report either for Shift+[.
-                    match s.as_ref() {
-                        "[" | "{" => return Some(Message::CycleSession { forward: false }),
-                        "]" | "}" => return Some(Message::CycleSession { forward: true }),
-                        _ => {}
-                    }
-                    match s.to_ascii_lowercase().as_str() {
-                        // Ctrl+Shift+C/V → terminal copy / paste (shift frees the
-                        // unshifted Ctrl+C → SIGINT and Ctrl+V for the shell);
-                        // Ctrl+Shift+N → new note from the selection.
-                        "c" => return Some(Message::TerminalCopy),
-                        "v" => return Some(Message::TerminalPaste),
-                        "n" => return Some(Message::TerminalSendToNote),
-                        // Toolbox toggle / new agent / close focused agent.
-                        "b" => return Some(Message::PluginPanelToggled),
-                        "t" => return Some(Message::AgentAdded(crate::agent::AgentKind::Build)),
-                        "w" => return Some(Message::CloseActiveAgent),
-                        // Answer the surfaced prompt: Enter accepts, R rejects.
-                        "r" => return Some(Message::PromptRejected),
-                        _   => {}
-                    }
-                }
-                _ => {}
+    // Ctrl+Shift+C/V → terminal copy / paste (the shift frees unshifted Ctrl+C
+    // → SIGINT and Ctrl+V for the shell). Unlike the chords in `app_chord`,
+    // these are held behind the caller's capture gate on purpose: iced's text
+    // widgets claim them too, and since a captured key still reaches the
+    // widget, running early would copy over the clipboard it just wrote, or
+    // paste into the terminal *as well as* the field being typed in. With a
+    // text widget focused the widget wins; a focused terminal captures nothing,
+    // so the intended case is unaffected.
+    if modifiers.control() && modifiers.shift() {
+        if let keyboard::Key::Character(s) = &key {
+            match s.to_ascii_lowercase().as_str() {
+                "c" => return Some(Message::TerminalCopy),
+                "v" => return Some(Message::TerminalPaste),
+                _   => {}
             }
         }
+    }
 
+    if modifiers.control() {
         // General Ctrl+<key> → ASCII control byte, sent to the focused terminal.
         // Ctrl+A…Ctrl+Z map to 0x01…0x1A and Ctrl+[ \ ] ^ _ @ to 0x1B…0x1F / 0x00
         // — the standard caret-notation control codes — so readline chords
         // (Ctrl+A, Ctrl+E, Ctrl+R, Ctrl+U, Ctrl+W, …) reach the shell.
         if let keyboard::Key::Character(s) = &key {
             let ch = s.chars().next()?;
-            // Ctrl+1…9 → jump straight to project session N (like browser tabs).
-            // Only the unshifted digits: Ctrl+Shift+<digit> yields a symbol
-            // ("!", "@", …) that falls through to a no-op below.
-            if let Some(d) = ch.to_digit(10) {
-                if (1..=9).contains(&d) {
-                    return Some(Message::SessionSelected(d as usize - 1));
-                }
-            }
+            // Digits already went to `session_switch_chord` above; anything left
+            // here (including Ctrl+Shift+<digit>, which arrives as "!", "@", …)
+            // falls through to the control-byte mapping or a no-op.
             if ch.is_ascii_alphabetic() || "@[\\]^_".contains(ch) {
                 let byte = (ch.to_ascii_uppercase() as u8) & 0x1f;
                 return Some(Message::TerminalInput((byte as char).to_string()));
@@ -3987,6 +5861,118 @@ fn handle_key(
         keyboard::Key::Unidentified => None,
     }?;
     Some(Message::TerminalInput(bytes))
+}
+
+/// Ctrl+1…9 → the 0-based session index to jump to, or `None` if this isn't
+/// that chord.
+///
+/// Two ways in. The number row comes through as a logical `Character("1")`.
+/// The numeric keypad has to be matched on its *physical* key instead, because
+/// its logical key depends on NumLock: on, the digits arrive as characters;
+/// off, they arrive as End / ArrowDown / PageUp / Insert / … — the navigation
+/// keys those positions double as. Physical codes are stable across both, and
+/// across keyboard layouts.
+///
+/// Shift is excluded so the Ctrl+Shift+<key> chords keep the field to
+/// themselves (Ctrl+Shift+<digit> also arrives as a symbol — "!", "@", … — on
+/// the number row, which wouldn't parse as a digit anyway).
+fn session_switch_chord(
+    key:       &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    physical:  &keyboard::key::Physical,
+) -> Option<usize> {
+    if !modifiers.control() || modifiers.shift() {
+        return None;
+    }
+    let digit = match numpad_digit(physical) {
+        Some(d) => d,
+        None => match key {
+            keyboard::Key::Character(s) => s.chars().next()?.to_digit(10)?,
+            _ => return None,
+        },
+    };
+    // Sessions are 1-indexed on the keyboard; there's no session 0.
+    (1..=9).contains(&digit).then(|| digit as usize - 1)
+}
+
+/// Ctrl+Shift+1…9 → the index of the agent pane to focus in the active
+/// session, 0-based. The counterpart of [`session_switch_chord`].
+///
+/// Reads the *physical* key rather than the character, because a shifted
+/// number-row digit arrives as its symbol — "!" , "@", "#" on a US layout and
+/// something else entirely elsewhere. The symbols are accepted too, as a
+/// fallback for platforms that report no usable physical code.
+fn agent_pane_chord(
+    key:       &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+    physical:  &keyboard::key::Physical,
+) -> Option<usize> {
+    if !modifiers.control() || !modifiers.shift() {
+        return None;
+    }
+    // A letter is never a digit chord, whatever physical key it happens to sit
+    // on — Ctrl+Shift+<letter> owns those.
+    if let keyboard::Key::Character(s) = key {
+        if s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+    }
+    let digit = row_digit(physical)
+        .or_else(|| numpad_digit(physical))
+        .or_else(|| match key {
+            keyboard::Key::Character(s) => shifted_digit(s.chars().next()?),
+            _ => None,
+        })?;
+    // Panes are 1-indexed on the keyboard; there's no pane 0.
+    (1..=9).contains(&digit).then(|| digit as usize - 1)
+}
+
+/// The digit (1–9) of a number-row key, by physical position — so it is right
+/// whatever the layout prints on the keycap and whatever Shift turns it into.
+fn row_digit(physical: &keyboard::key::Physical) -> Option<u32> {
+    use keyboard::key::{Code, Physical};
+    match physical {
+        Physical::Code(Code::Digit1) => Some(1),
+        Physical::Code(Code::Digit2) => Some(2),
+        Physical::Code(Code::Digit3) => Some(3),
+        Physical::Code(Code::Digit4) => Some(4),
+        Physical::Code(Code::Digit5) => Some(5),
+        Physical::Code(Code::Digit6) => Some(6),
+        Physical::Code(Code::Digit7) => Some(7),
+        Physical::Code(Code::Digit8) => Some(8),
+        Physical::Code(Code::Digit9) => Some(9),
+        _ => None,
+    }
+}
+
+/// The digit behind a shifted number-row character on a US layout, or a bare
+/// digit where the layout reports one despite Shift. Last-resort fallback for
+/// [`agent_pane_chord`].
+fn shifted_digit(c: char) -> Option<u32> {
+    match c {
+        '!' => Some(1), '@' => Some(2), '#' => Some(3),
+        '$' => Some(4), '%' => Some(5), '^' => Some(6),
+        '&' => Some(7), '*' => Some(8), '(' => Some(9),
+        _   => c.to_digit(10),
+    }
+}
+
+/// The digit (1–9) of a numeric-keypad key, or `None` for anything else.
+/// Numpad0 is intentionally excluded — there's no session 0.
+fn numpad_digit(physical: &keyboard::key::Physical) -> Option<u32> {
+    use keyboard::key::{Code, Physical};
+    match physical {
+        Physical::Code(Code::Numpad1) => Some(1),
+        Physical::Code(Code::Numpad2) => Some(2),
+        Physical::Code(Code::Numpad3) => Some(3),
+        Physical::Code(Code::Numpad4) => Some(4),
+        Physical::Code(Code::Numpad5) => Some(5),
+        Physical::Code(Code::Numpad6) => Some(6),
+        Physical::Code(Code::Numpad7) => Some(7),
+        Physical::Code(Code::Numpad8) => Some(8),
+        Physical::Code(Code::Numpad9) => Some(9),
+        _ => None,
+    }
 }
 
 fn named_key_bytes(key: &key::Named) -> Option<String> {
@@ -4239,4 +6225,277 @@ async fn take_screenshot(session_id: usize, url: String) -> (usize, Result<Vec<u
     );
 
     (session_id, Err(last_err))
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use iced::keyboard::key::{Code, Physical};
+    use iced::keyboard::{Key, Modifiers};
+
+    /// Physical key for a number-row press — anything that isn't a numpad code.
+    const ROW: Physical = Physical::Code(Code::Digit1);
+
+    fn ch(s: &str) -> Key {
+        Key::Character(s.into())
+    }
+
+    #[test]
+    fn number_row_ctrl_digit_selects_session() {
+        assert_eq!(session_switch_chord(&ch("1"), Modifiers::CTRL, &ROW), Some(0));
+        assert_eq!(session_switch_chord(&ch("9"), Modifiers::CTRL, &ROW), Some(8));
+    }
+
+    /// NumLock on: the keypad reports a digit, same as the number row.
+    #[test]
+    fn numpad_with_numlock_on_selects_session() {
+        let physical = Physical::Code(Code::Numpad3);
+        assert_eq!(session_switch_chord(&ch("3"), Modifiers::CTRL, &physical), Some(2));
+    }
+
+    /// NumLock off: the keypad reports navigation keys, so only the physical
+    /// code identifies the digit. This is the case that used to fall through to
+    /// the capture gate and get eaten by whatever text widget had focus.
+    #[test]
+    fn numpad_with_numlock_off_selects_session() {
+        for (named, physical, expect) in [
+            (key::Named::End,       Code::Numpad1, 0),
+            (key::Named::ArrowDown, Code::Numpad2, 1),
+            (key::Named::PageUp,    Code::Numpad9, 8),
+        ] {
+            let got = session_switch_chord(
+                &Key::Named(named),
+                Modifiers::CTRL,
+                &Physical::Code(physical),
+            );
+            assert_eq!(got, Some(expect), "{named:?} on {physical:?}");
+        }
+    }
+
+    #[test]
+    fn zero_is_not_a_session() {
+        assert_eq!(session_switch_chord(&ch("0"), Modifiers::CTRL, &ROW), None);
+        let numpad0 = Physical::Code(Code::Numpad0);
+        assert_eq!(session_switch_chord(&ch("0"), Modifiers::CTRL, &numpad0), None);
+    }
+
+    /// Shift belongs to the Ctrl+Shift+<key> chords, and plain digits are just
+    /// text — neither may switch sessions.
+    #[test]
+    fn needs_ctrl_without_shift() {
+        let both = Modifiers::CTRL | Modifiers::SHIFT;
+        assert_eq!(session_switch_chord(&ch("1"), both, &ROW), None);
+        assert_eq!(
+            session_switch_chord(&Key::Named(key::Named::End), both, &Physical::Code(Code::Numpad1)),
+            None,
+        );
+        assert_eq!(session_switch_chord(&ch("1"), Modifiers::empty(), &ROW), None);
+    }
+
+    #[test]
+    fn non_digits_are_left_alone() {
+        assert_eq!(session_switch_chord(&ch("a"), Modifiers::CTRL, &ROW), None);
+        assert_eq!(
+            session_switch_chord(&Key::Named(key::Named::End), Modifiers::CTRL, &ROW),
+            None,
+        );
+    }
+
+    // ── Ctrl+Shift+digit: agent pane within the session ──────────────────────
+
+    /// The physical key decides, so the chord works on a layout whose Shift+2
+    /// is not "@" — and on one where it is.
+    #[test]
+    fn shifted_digit_selects_an_agent_pane_by_physical_key() {
+        let both = Modifiers::CTRL | Modifiers::SHIFT;
+        for (code, expect) in [(Code::Digit1, 0), (Code::Digit6, 5), (Code::Digit9, 8)] {
+            let got = agent_pane_chord(&ch("?"), both, &Physical::Code(code));
+            assert_eq!(got, Some(expect), "{code:?}");
+        }
+    }
+
+    /// Fallback path: no usable physical code, so the US shifted glyph is read.
+    #[test]
+    fn shifted_symbols_fall_back_to_their_digit() {
+        let both = Modifiers::CTRL | Modifiers::SHIFT;
+        let none = Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified);
+        for (sym, expect) in [("!", 0), ("@", 1), ("^", 5), ("(", 8)] {
+            assert_eq!(agent_pane_chord(&ch(sym), both, &none), Some(expect), "{sym}");
+        }
+        // A layout that reports the bare digit despite Shift works too.
+        assert_eq!(agent_pane_chord(&ch("3"), both, &none), Some(2));
+    }
+
+    /// The keypad serves both chords — Shift picks which one.
+    #[test]
+    fn the_two_digit_chords_never_both_fire() {
+        let ctrl = Modifiers::CTRL;
+        let both = Modifiers::CTRL | Modifiers::SHIFT;
+        let numpad4 = Physical::Code(Code::Numpad4);
+
+        // Ctrl+4 → project session 4, and nothing else.
+        assert_eq!(session_switch_chord(&ch("4"), ctrl, &numpad4), Some(3));
+        assert_eq!(agent_pane_chord(&ch("4"), ctrl, &numpad4), None);
+
+        // Ctrl+Shift+4 → agent pane 4, and nothing else.
+        assert_eq!(agent_pane_chord(&ch("$"), both, &numpad4), Some(3));
+        assert_eq!(session_switch_chord(&ch("$"), both, &numpad4), None);
+    }
+
+    #[test]
+    fn an_agent_pane_chord_needs_both_modifiers() {
+        assert_eq!(agent_pane_chord(&ch("!"), Modifiers::SHIFT, &ROW), None);
+        assert_eq!(agent_pane_chord(&ch("!"), Modifiers::empty(), &ROW), None);
+    }
+
+    /// Zero is not a pane, same as it is not a session.
+    #[test]
+    fn zero_is_not_an_agent_pane() {
+        let both = Modifiers::CTRL | Modifiers::SHIFT;
+        let numpad0 = Physical::Code(Code::Numpad0);
+        assert_eq!(agent_pane_chord(&ch("0"), both, &numpad0), None);
+        assert_eq!(agent_pane_chord(&ch(")"), both, &numpad0), None);
+    }
+
+    /// A keypad key with NumLock off reports itself as a navigation key, and
+    /// those are Ctrl+Shift chords in their own right. The pane chord resolves
+    /// last so it can't shadow them.
+    #[test]
+    fn navigation_chords_outrank_a_numlock_off_keypad_digit() {
+        let both = Modifiers::CTRL | Modifiers::SHIFT;
+        let numpad2 = Physical::Code(Code::Numpad2);
+        assert!(matches!(
+            app_chord(&Key::Named(key::Named::ArrowDown), both, &numpad2),
+            Some(Message::CycleAttention { forward: true }),
+        ));
+        // With NumLock on the same key is a digit, and then it is pane 2.
+        assert!(matches!(
+            app_chord(&ch("@"), both, &numpad2),
+            Some(Message::AgentPaneSelected(1)),
+        ));
+    }
+
+    /// Ctrl+Shift+D opens the Database tool from anywhere, including out of a
+    /// focused text field (that's why it lives in `app_chord`).
+    #[test]
+    fn ctrl_shift_d_opens_the_database_tool() {
+        let both = Modifiers::CTRL | Modifiers::SHIFT;
+        assert!(matches!(
+            app_chord(&ch("d"), both, &ROW),
+            Some(Message::CenterTabSelected(crate::session::CenterTab::Database)),
+        ));
+        // Shift is required — plain Ctrl+D is EOF and belongs to the shell.
+        assert!(app_chord(&ch("d"), Modifiers::CTRL, &ROW).is_none());
+    }
+}
+
+#[cfg(test)]
+mod chord_tests {
+    use super::*;
+    use iced::keyboard::key::{Code, Named, Physical};
+    use iced::keyboard::{Key, Modifiers};
+
+    /// Stand-in physical key — every chord here is identified by its logical
+    /// key, so the physical code only matters for the numpad (covered in
+    /// `key_tests`).
+    const PHYS: Physical = Physical::Code(Code::KeyA);
+
+    fn chord(key: Key, modifiers: Modifiers) -> Option<Message> {
+        app_chord(&key, modifiers, &PHYS)
+    }
+
+    fn named(n: Named, modifiers: Modifiers) -> Option<Message> {
+        chord(Key::Named(n), modifiers)
+    }
+
+    /// The regression this function exists for: iced's text widgets claim
+    /// Ctrl+Shift+arrow as select-by-word and mark it Captured, which used to
+    /// kill pane cycling outright whenever the editor or any text field had
+    /// focus. `app_chord` runs before that gate, so these must resolve.
+    #[test]
+    fn ctrl_shift_arrows_cycle_panes_and_attention() {
+        let m = Modifiers::CTRL | Modifiers::SHIFT;
+        assert!(matches!(named(Named::ArrowRight, m), Some(Message::CyclePane { forward: true })));
+        assert!(matches!(named(Named::ArrowLeft,  m), Some(Message::CyclePane { forward: false })));
+        assert!(matches!(named(Named::ArrowDown,  m), Some(Message::CycleAttention { forward: true })));
+        assert!(matches!(named(Named::ArrowUp,    m), Some(Message::CycleAttention { forward: false })));
+    }
+
+    /// Same story for the other keys iced's text widgets swallow: PageUp/Down
+    /// (select by page), Enter, and Ctrl+Shift+A (their select-all arm doesn't
+    /// guard on Shift).
+    #[test]
+    fn other_captured_keys_still_reach_the_app() {
+        let m = Modifiers::CTRL | Modifiers::SHIFT;
+        assert!(matches!(named(Named::PageDown, m), Some(Message::CyclePluginTab { forward: true })));
+        assert!(matches!(named(Named::PageUp,   m), Some(Message::CyclePluginTab { forward: false })));
+        assert!(matches!(named(Named::Enter,    m), Some(Message::PromptAccepted)));
+        assert!(matches!(chord(Key::Character("a".into()), m), Some(Message::CycleAgentPane { forward: true })));
+        assert!(matches!(chord(Key::Character("m".into()), m), Some(Message::AgentsDialogOpened)));
+    }
+
+    /// The clipboard pair is the deliberate exception: it must NOT resolve
+    /// pre-gate (a focused field would get pasted into and the terminal too),
+    /// but must still work from `handle_key`, which only runs once the gate
+    /// has let the key through.
+    #[test]
+    fn clipboard_chords_stay_behind_the_capture_gate() {
+        let m = Modifiers::CTRL | Modifiers::SHIFT;
+        assert!(chord(Key::Character("c".into()), m).is_none());
+        assert!(chord(Key::Character("v".into()), m).is_none());
+
+        let copy  = handle_key(Key::Character("c".into()), m, None, PHYS);
+        let paste = handle_key(Key::Character("v".into()), m, None, PHYS);
+        assert!(matches!(copy,  Some(Message::TerminalCopy)));
+        assert!(matches!(paste, Some(Message::TerminalPaste)));
+    }
+
+    /// Ctrl+Shift+E hides/shows the file explorer. Like the rest of the panel
+    /// toggles it has to resolve pre-gate, since the editor usually has focus
+    /// when the user wants the extra width.
+    #[test]
+    fn ctrl_shift_e_toggles_the_file_explorer() {
+        let m = Modifiers::CTRL | Modifiers::SHIFT;
+        assert!(matches!(
+            chord(Key::Character("e".into()), m),
+            Some(Message::FileBrowserToggleCollapsed),
+        ));
+        // Unshifted Ctrl+E is the markdown-formatting binding — leave it alone.
+        assert!(chord(Key::Character("e".into()), Modifiers::CTRL).is_none());
+    }
+
+    /// Ctrl+Shift+S / Ctrl+Shift+G jump to the Docs and Notes searches. Both
+    /// resolve pre-gate like the other toolbox chords, since the user is
+    /// usually typing in the editor or a terminal when they go looking.
+    #[test]
+    fn search_chords_open_their_toolbox_tabs() {
+        let m = Modifiers::CTRL | Modifiers::SHIFT;
+        assert!(matches!(chord(Key::Character("s".into()), m), Some(Message::DocsOpen)));
+        assert!(matches!(chord(Key::Character("g".into()), m), Some(Message::NotesSearchOpen)));
+        // Unshifted Ctrl+S is XOFF and Ctrl+G is BEL — both belong to the shell.
+        assert!(chord(Key::Character("s".into()), Modifiers::CTRL).is_none());
+        assert!(chord(Key::Character("g".into()), Modifiers::CTRL).is_none());
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_panes_both_ways() {
+        assert!(matches!(named(Named::Tab, Modifiers::CTRL), Some(Message::CyclePane { forward: true })));
+        assert!(matches!(
+            named(Named::Tab, Modifiers::CTRL | Modifiers::SHIFT),
+            Some(Message::CyclePane { forward: false }),
+        ));
+    }
+
+    /// Everything the app doesn't claim must fall through — plain keys go to
+    /// the terminal, and the unshifted Ctrl forms stay with the widget (word
+    /// motion) or the shell (Ctrl+C → SIGINT).
+    #[test]
+    fn unclaimed_keys_fall_through() {
+        assert!(named(Named::ArrowRight, Modifiers::empty()).is_none());
+        assert!(named(Named::ArrowRight, Modifiers::SHIFT).is_none());
+        assert!(named(Named::ArrowRight, Modifiers::CTRL).is_none());
+        assert!(named(Named::Enter, Modifiers::empty()).is_none());
+        assert!(chord(Key::Character("c".into()), Modifiers::CTRL).is_none());
+        assert!(chord(Key::Character("z".into()), Modifiers::CTRL | Modifiers::SHIFT).is_none());
+    }
 }

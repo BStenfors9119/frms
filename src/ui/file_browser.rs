@@ -7,7 +7,7 @@ use crate::fonts::{ICON_FONT, UI_FONT};
 use crate::file_browser::{DirEdit, Entry, FileBrowserState};
 use crate::ui::buttons;
 
-pub fn view(state: &FileBrowserState) -> Element<'_, Message> {
+pub fn view(state: &FileBrowserState, submodule_color: iced::Color) -> Element<'_, Message> {
     let full_path = state.current_dir.display().to_string();
 
     // Big, bold name of the current directory (just its final component;
@@ -37,7 +37,7 @@ pub fn view(state: &FileBrowserState) -> Element<'_, Message> {
         dir_heading,
         Space::with_width(Length::Fill),
         new_folder_btn,
-        collapse_btn,
+        crate::ui::with_tip(collapse_btn, "Hide the file explorer (Ctrl+Shift+E)"),
     ]
     .align_y(Alignment::Center)
     .spacing(6);
@@ -102,7 +102,7 @@ pub fn view(state: &FileBrowserState) -> Element<'_, Message> {
             _ => {}
         }
 
-        list = list.push(entry_row(entry));
+        list = list.push(entry_row(entry, submodule_color));
     }
 
     let mut body = column![heading_row, dir_label].spacing(4);
@@ -125,8 +125,15 @@ pub fn view(state: &FileBrowserState) -> Element<'_, Message> {
 
 /// One listing row. Directories get inline ✎ rename and ✕ delete buttons
 /// after the navigation button; files are just the open button.
-fn entry_row(entry: &Entry) -> Element<'static, Message> {
-    let prefix = if entry.is_dir { "> " } else { "  " };
+fn entry_row(entry: &Entry, submodule_color: iced::Color) -> Element<'static, Message> {
+    // Submodules get a double-chevron so they read as a nested project even at
+    // a glance; other folders keep the plain "> " chevron. (Stick to Latin-1 —
+    // the label's Liberation Sans is Latin-only and tofus anything beyond it.)
+    let prefix = match (entry.is_dir, entry.is_submodule) {
+        (_, true)      => "\u{00BB} ", // » — submodule (a repo within the repo)
+        (true, false)  => "> ",
+        (false, _)     => "  ",
+    };
     let label  = format!("{}{}", prefix, entry.name);
     let msg    = if entry.is_dir {
         Message::BrowseDir(entry.path.clone())
@@ -137,8 +144,17 @@ fn entry_row(entry: &Entry) -> Element<'static, Message> {
     let main = button(text(label).size(buttons::TEXT_SIZE))
         .on_press(msg)
         .padding(buttons::PADDING)
-        .style(buttons::primary)
+        .style(buttons::file_row(entry.is_submodule.then_some(submodule_color)))
         .width(Length::Fill);
+
+    // 📋 puts this entry's full path on the clipboard.
+    let copy_path = crate::ui::with_tip(
+        button(text("\u{1F4CB}").font(ICON_FONT).size(11))
+            .on_press(Message::CopyPath(entry.path.display().to_string()))
+            .padding([4, 6])
+            .style(buttons::secondary),
+        "Copy full path",
+    );
 
     if !entry.is_dir {
         // 📤 copies this file to the currently-selected TSR receiver (scp).
@@ -149,7 +165,7 @@ fn entry_row(entry: &Entry) -> Element<'static, Message> {
                 .style(buttons::secondary),
             "Copy to selected receiver",
         );
-        return row![main, to_receiver]
+        return row![main, copy_path, to_receiver]
             .spacing(4)
             .align_y(Alignment::Center)
             .into();
@@ -169,7 +185,7 @@ fn entry_row(entry: &Entry) -> Element<'static, Message> {
         .padding([4, 6])
         .style(buttons::danger);
 
-    row![main, rename, delete]
+    row![main, copy_path, rename, delete]
         .spacing(4)
         .align_y(Alignment::Center)
         .into()
@@ -229,7 +245,7 @@ pub fn collapsed_strip() -> Element<'static, Message> {
         .padding([2, 6])
         .style(buttons::secondary);
 
-    column![expand_btn]
+    column![crate::ui::with_tip(expand_btn, "Show the file explorer (Ctrl+Shift+E)")]
         .align_x(Alignment::Center)
         .padding(6)
         .height(Length::Fill)

@@ -1,8 +1,32 @@
-use iced::{Alignment, Background, Border, Color, Element, Font, Length, Renderer, Theme};
+use iced::{Alignment, Background, Border, Color, ContentFit, Element, Font, Length, Renderer, Theme};
+use iced::keyboard::{self, key};
 use iced::widget::{button, column, container, image, mouse_area, row, scrollable, stack, text, text_editor, text_input, Column};
 
+/// Height of the chat composer: tall enough for ~4 lines before its own
+/// vertical scroll kicks in.
+const CHAT_INPUT_HEIGHT: f32 = 84.0;
+
+/// Scrollable id of the agent-tab strip, so the ❮ ❯ buttons can scroll it.
+/// Only one strip is ever on screen (the active session's), so one id serves.
+pub fn agent_strip_id() -> scrollable::Id {
+    scrollable::Id::new("agent-tab-strip")
+}
+
+/// How far one ❮ / ❯ click nudges the agent-tab strip — a bit more than a
+/// typical tab's width, so each click reveals a fresh tab without skipping one.
+pub const AGENT_TAB_NUDGE: f32 = 160.0;
+
+/// Blank height reserved under the agent tabs for their horizontal scrollbar.
+/// Iced paints a horizontal bar *over* the bottom `max(width, scroller) +
+/// 2·margin` of the scrollable, so the strip pads itself by that much (14px for
+/// the bar below) plus breathing room — the bar then lands in empty space
+/// rather than across the tab labels. Dropping the callout's "AI AGENT
+/// SESSIONS" heading freed about this much height, so the callout itself stays
+/// the size it was.
+const AGENT_SCROLLBAR_GUTTER: f32 = 18.0;
+
 use crate::agent::{AgentKind, AgentPane, ChatPane, ChatRole};
-use crate::app::{self, Message};
+use crate::app::Message;
 use crate::claude_prompt::PendingPrompt;
 use crate::db_panel::DbPanel;
 use crate::editor::{EditorState, PreviewKind};
@@ -21,275 +45,30 @@ pub fn view<'a>(
     pending_prompt:  Option<&'a PendingPrompt>,
     prompt_source:   Option<TerminalId>,
     renaming:        &'a Option<(TerminalId, String)>,
-    agent_menu_open: bool,
+    strip_overflow:  bool,
+    cloud_sql_creds: &'a str,
 ) -> Element<'a, Message> {
     let tab_content: Element<'_, Message> = match active_tab {
         CenterTab::Editor   => editor_view(state),
-        CenterTab::Database => crate::ui::db_panel::query_tab(db),
+        CenterTab::Database => crate::ui::db_panel::query_tab(db, cloud_sql_creds),
         CenterTab::Claude(tid) => claude_view(
             panes, tid, active_terminal, pending_prompt, prompt_source,
         ),
     };
 
-    let body = Column::new()
-        .spacing(0)
-        .height(Length::Fill)
-        .push(tab_bar(active_tab, panes, renaming))
-        .push(tab_content);
-
-    // The "+ Agent" dropdown floats over the editor body when open. A
-    // transparent backdrop fills the pane so a click anywhere outside the menu
-    // dismisses it; the menu itself sits on top, anchored just under the tab
-    // bar on the right where its button lives.
-    if !agent_menu_open {
-        return body.into();
-    }
-    let backdrop = mouse_area(
-        container(text(""))
-            .width(Length::Fill)
-            .height(Length::Fill),
-    )
-    .on_press(Message::AgentMenuToggled);
-
-    stack![body, backdrop, agent_menu()].into()
-}
-
-/// The floating list of agent kinds shown when the "+ Agent" button is open.
-/// Anchored top-right (under the button) as a small popup card.
-fn agent_menu<'a>() -> Element<'a, Message> {
-    let mut items = Column::new().spacing(2);
-    for &kind in AgentKind::ALL {
-        items = items.push(
-            button(text(kind.menu_label()).font(UI_FONT).size(buttons::TEXT_SIZE))
-                .on_press(Message::AgentAdded(kind))
-                .width(Length::Fill)
-                .padding(buttons::PADDING)
-                .style(buttons::menu_item),
-        );
-    }
-    let card = container(items)
-        .padding(4)
-        .width(Length::Fixed(180.0))
-        .style(menu_card_bg);
-
-    // Anchored under the "+ Agent" button, which is pinned just after the
-    // Editor/Database tabs. The left inset approximates those two tabs' combined
-    // width so the menu drops straight down from the button.
-    container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .align_x(Alignment::Start)
-        .padding(iced::Padding::ZERO.top(40.0).left(168.0))
-        .into()
-}
-
-fn menu_card_bg(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color::from_rgb8(34, 34, 44))),
-        border:     Border { color: Color::from_rgb8(70, 70, 86), width: 1.0, radius: 6.0.into() },
-        ..Default::default()
-    }
-}
-
-fn editor_view<'a>(state: &'a EditorState) -> Element<'a, Message> {
-    let filename = state
-        .path
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| String::from("No file open"));
-
-    let preview_kind = state.preview_kind();
-    let showing_preview = preview_kind.is_some() && state.preview_active;
-
-    let mut header = row![text(filename).size(13)]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-    if preview_kind.is_some() {
-        let label = if showing_preview { "Code" } else { "Preview" };
-        let toggle = button(text(label).font(UI_FONT).size(buttons::TEXT_SIZE))
-            .on_press(Message::EditorTogglePreview)
-            .padding(buttons::PADDING)
-            .style(buttons::toggle(showing_preview));
-        header = header.push(toggle);
-
-        if preview_kind == Some(PreviewKind::Html) && showing_preview {
-            let refresh = button(text("Refresh").font(UI_FONT).size(buttons::TEXT_SIZE))
-                .on_press(Message::EditorRefreshPreview)
-                .padding(buttons::PADDING)
-                .style(buttons::secondary);
-            header = header.push(refresh);
-        }
-    }
-
-    let body: Element<'_, Message> = match (preview_kind, state.preview_active) {
-        (Some(PreviewKind::Markdown), true) => {
-            crate::ui::preview::markdown(&state.content.text())
-        }
-        (Some(PreviewKind::Html), true) => html_preview(state),
-        _ => text_editor(&state.content)
-            .on_action(Message::EditorAction)
-            .font(Font::MONOSPACE)
-            .height(Length::Fill)
-            .into(),
-    };
-
     Column::new()
-        .spacing(4)
-        .height(Length::Fill)
-        .push(container(header).padding([8, 8]))
-        .push(container(body).padding([0, 8]).height(Length::Fill))
-        .into()
-}
-
-/// Claude tab body: the terminal canvas, optionally split with a permission-
-/// prompt response panel docked to the right of the terminal.
-fn claude_view<'a>(
-    panes:           &'a [AgentPane],
-    tid:             TerminalId,
-    active_terminal: TerminalId,
-    pending_prompt:  Option<&'a PendingPrompt>,
-    prompt_source:   Option<TerminalId>,
-) -> Element<'a, Message> {
-    let Some(pane) = panes.iter().find(|p| p.id() == tid) else {
-        return container(text("Agent not found").size(13))
-            .padding(16).width(Length::Fill).height(Length::Fill).into();
-    };
-    // Research/Chat panes render the native chat UI instead of a terminal.
-    if let Some(chat) = pane.as_chat() {
-        return chat_view(chat);
-    }
-    let Some(t) = pane.as_terminal() else {
-        return container(text("Agent not found").size(13))
-            .padding(16).width(Length::Fill).height(Length::Fill).into();
-    };
-    let term = crate::ui::terminal::view(
-        tid,
-        t.grid.clone(),
-        t.master(),
-        active_terminal == tid,
-        false,
-        TerminalFontScale::default(),
-        t.selection,
-    );
-    let term_bordered = container(term)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(4);
-
-    let show_prompt = pending_prompt.is_some() && prompt_source == Some(tid);
-    if show_prompt {
-        row![
-            container(term_bordered).width(Length::FillPortion(2)).height(Length::Fill),
-            container(crate::ui::prompt_response::view(pending_prompt))
-                .width(Length::FillPortion(1))
-                .height(Length::Fill),
-        ]
-        .spacing(4)
-        .height(Length::Fill)
-        .into()
-    } else {
-        term_bordered.into()
-    }
-}
-
-/// Native chat pane body (Research / Chat): a scrollable transcript above a
-/// message input box. No PTY — replies stream in from the Messages API.
-fn chat_view(chat: &ChatPane) -> Element<'_, Message> {
-    let id = chat.id;
-
-    let mut transcript = column![]
-        .spacing(10)
-        .padding([8, 8])
-        .width(Length::Fill);
-    if chat.messages.is_empty() && !chat.streaming {
-        transcript = transcript.push(
-            text(format!("{} — start the conversation below.", chat.kind.label()))
-                .font(UI_FONT)
-                .size(12),
-        );
-    }
-    for m in &chat.messages {
-        transcript = transcript.push(chat_bubble(m.role, &m.text));
-    }
-    if chat.streaming {
-        let body = if chat.pending.is_empty() { "…" } else { chat.pending.as_str() };
-        transcript = transcript.push(chat_bubble(ChatRole::Assistant, body));
-    }
-
-    let history = scrollable(transcript)
-        .width(Length::Fill)
-        .height(Length::Fill);
-
-    let mut col = Column::new()
         .spacing(0)
         .height(Length::Fill)
-        .push(container(history).height(Length::Fill).width(Length::Fill));
-
-    if let Some(err) = &chat.error {
-        col = col.push(
-            container(text(format!("Error: {err}")).size(12))
-                .padding([6, 10])
-                .width(Length::Fill),
-        );
-    }
-
-    let input = text_input("Message Claude…", &chat.input)
-        .id(app::chat_input_id(id))
-        .on_input(move |s| Message::ChatInputEdited(id, s))
-        .on_submit(Message::ChatSubmitted(id))
-        .padding(8)
-        .size(13)
-        .width(Length::Fill);
-    let send = button(text("Send").font(UI_FONT).size(buttons::TEXT_SIZE))
-        .on_press(Message::ChatSubmitted(id))
-        .padding(buttons::PADDING)
-        .style(buttons::primary);
-    let input_row = row![input, send]
-        .spacing(6)
-        .padding([8, 8])
-        .align_y(Alignment::Center);
-
-    col.push(input_row).into()
-}
-
-/// One transcript turn, tinted and labelled by author.
-fn chat_bubble(role: ChatRole, body: &str) -> Element<'static, Message> {
-    let label = match role {
-        ChatRole::User      => "You",
-        ChatRole::Assistant => "Claude",
-    };
-    let inner = column![
-        text(label).font(UI_FONT).size(11),
-        text(body.to_string()).size(13),
-    ]
-    .spacing(3);
-
-    container(inner)
-        .padding([8, 10])
-        .width(Length::Fill)
-        .style(move |_theme| chat_bubble_style(role))
+        .push(tab_bar(active_tab, panes, renaming, strip_overflow))
+        .push(tab_content)
         .into()
-}
-
-fn chat_bubble_style(role: ChatRole) -> container::Style {
-    let bg = match role {
-        ChatRole::User      => Color::from_rgb8(40, 44, 60),
-        ChatRole::Assistant => Color::from_rgb8(30, 30, 38),
-    };
-    container::Style {
-        background: Some(Background::Color(bg)),
-        border:     Border { color: Color::from_rgb8(55, 55, 68), width: 1.0, radius: 6.0.into() },
-        text_color: Some(Color::from_rgb(0.90, 0.90, 0.93)),
-        ..Default::default()
-    }
 }
 
 fn tab_bar<'a>(
     active:    CenterTab,
     panes:     &'a [AgentPane],
     renaming:  &'a Option<(TerminalId, String)>,
+    overflow:  bool,
 ) -> Element<'a, Message> {
     // The Editor/Database tabs stay pinned on the left; the agent tabs (and
     // the "New Agent" button that follows them) live in their own strip below.
@@ -326,7 +105,7 @@ fn tab_bar<'a>(
                 .unwrap_or_else(|| format!("{} {}", p.kind().label(), i + 1));
             // Only offer a close button when more than one Claude tab exists —
             // a session always keeps at least one (see `close_claude_terminal`).
-            claude_tab_button(label, selected, p.id(), panes.len() > 1, p.waiting_on_user())
+            claude_tab_button(label, selected, p.id(), panes.len() > 1, p.needs_attention(), i)
         };
         claude_tabs = claude_tabs.push(tab);
     }
@@ -336,45 +115,89 @@ fn tab_bar<'a>(
     // there are many sessions or the pane is shrunk. The scrollbar only
     // materialises when the content is wider than the available space, so the
     // common (few-tabs) case looks exactly as before. Mirrors ui::session_bar.
+    //
+    // Iced paints a horizontal scrollbar *over* the bottom of the content, so
+    // when there is one the tabs reserve a blank gutter under themselves — the
+    // bar can then stay chunky enough to grab without covering half of every
+    // tab label. When everything fits there's no bar to dodge, so the gutter
+    // goes away rather than leaving the tabs stranded at the top of a
+    // too-tall callout. `overflow` comes from the strip's own last report;
+    // see `Frms::refresh_agent_strip_overflow`.
+    let gutter = if overflow { AGENT_SCROLLBAR_GUTTER } else { 0.0 };
+    let claude_tabs = container(claude_tabs)
+        .padding(iced::Padding::default().bottom(gutter));
+
     let claude_strip = scrollable(claude_tabs)
+        .id(agent_strip_id())
+        .on_scroll(Message::AgentStripViewport)
         .width(Length::Fill)
         .direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new().width(4).scroller_width(4),
+            scrollable::Scrollbar::new()
+                .width(10)
+                .scroller_width(10)
+                .margin(2),
         ));
 
-    // "+ Agent" opens a dropdown menu (see `agent_menu`) to start a Build
-    // (Claude Code PTY), Research (Opus chat), or Chat (Sonnet chat) pane. It's
-    // a *tool* button — grouped with the Editor/Database tabs on the left, not
-    // an agent session itself — and pinned just after the Database tab so the
-    // dropdown can anchor reliably beneath it.
-    let add_agent = button(
-        text("+ Agent").font(UI_FONT).size(buttons::TEXT_SIZE),
+    // ❮ ❯ (U+276E/U+276F) rather than ‹ › — the bundled Noto Sans Symbols 2
+    // has no General Punctuation, so the guillemets rendered as tofu boxes.
+    //
+    // Each button carries the strip's scrollbar gutter as bottom padding too,
+    // so it centers on the row of tabs rather than on the tabs-plus-gutter and
+    // drifting low.
+    let nudge = move |glyph: &'static str, forward: bool, tip: &'a str| -> Element<'a, Message> {
+        container(crate::ui::with_tip(
+            button(text(glyph).font(ICON_FONT).size(13))
+                .on_press(Message::AgentTabsNudged { forward })
+                .padding([2, 6])
+                .style(buttons::secondary),
+            tip,
+        ))
+        .padding(iced::Padding::default().bottom(gutter))
+        .into()
+    };
+
+    let claude_strip = row![
+        nudge("\u{276E}", false, "Scroll agent tabs left"),   // ❮
+        claude_strip,
+        nudge("\u{276F}", true,  "Scroll agent tabs right"),  // ❯
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+
+    // "Agents" opens the one dialog that manages this project's AI sessions:
+    // start a new one, retarget open ones at another model, or close one that's
+    // done with. It replaced a "+ Agent" dropdown and a separate "Model" button
+    // — two entry points for one subject. It's a *tool* button, grouped with
+    // the Editor/Database tabs rather than being an agent session itself.
+    let manage_agents = button(
+        text("Agents").font(UI_FONT).size(buttons::TEXT_SIZE),
     )
-    .on_press(Message::AgentMenuToggled)
+    .on_press(Message::AgentsDialogOpened)
     .padding(buttons::PADDING)
     .style(buttons::primary);
 
-    // Group just the open agent tabs inside a bordered callout with a subtle
-    // header so the AI agent sessions read as their own region rather than
-    // blending into the Editor/Database/+ Agent tool buttons on the left.
-    let agent_callout = container(
-        column![
-            text("AI AGENT SESSIONS")
-                .font(UI_FONT)
-                .size(9)
-                .style(agent_callout_label),
-            claude_strip,
-        ]
-        .spacing(3),
-    )
+    // Group just the open agent tabs inside a bordered callout so the AI agent
+    // sessions read as their own region rather than blending into the
+    // Editor/Database/+ Agent tool buttons on the left. The outline alone says
+    // that — the old "AI AGENT SESSIONS" heading spent a line of height on it,
+    // and that line now goes to the tab strip's scrollbar gutter instead.
+    let agent_callout = container(claude_strip)
     .padding([5, 9])
     .width(Length::Fill)
     .style(agent_callout_bg);
 
     let bar = row![
-        tab_button("Editor",   active == CenterTab::Editor,   CenterTab::Editor),
-        tab_button("Database", active == CenterTab::Database, CenterTab::Database),
-        add_agent,
+        tab_button("Editor", active == CenterTab::Editor, CenterTab::Editor, None),
+        tab_button(
+            "Database",
+            active == CenterTab::Database,
+            CenterTab::Database,
+            Some("Open the Database tool (Ctrl+Shift+D)"),
+        ),
+        crate::ui::with_tip(
+            manage_agents,
+            "Add, switch models, or close agent sessions (Ctrl+Shift+M)",
+        ),
         agent_callout,
     ]
     .spacing(8)
@@ -387,12 +210,21 @@ fn tab_bar<'a>(
         .into()
 }
 
-fn tab_button(label: &str, selected: bool, tab: CenterTab) -> Element<'static, Message> {
-    button(text(label.to_string()).font(UI_FONT).size(buttons::TEXT_SIZE))
+fn tab_button(
+    label:    &str,
+    selected: bool,
+    tab:      CenterTab,
+    tip:      Option<&'static str>,
+) -> Element<'static, Message> {
+    let btn = button(text(label.to_string()).font(UI_FONT).size(buttons::TEXT_SIZE))
         .on_press(Message::CenterTabSelected(tab))
         .padding(buttons::PADDING)
-        .style(buttons::toggle(selected))
-        .into()
+        .style(buttons::toggle(selected));
+    // A tooltip only where there's something to say — the keyboard shortcut.
+    match tip {
+        Some(tip) => crate::ui::with_tip(btn, tip),
+        None      => btn.into(),
+    }
 }
 
 /// Tab containing the Claude terminal name + an inline ✎ to start renaming and
@@ -402,12 +234,16 @@ fn tab_button(label: &str, selected: bool, tab: CenterTab) -> Element<'static, M
 ///
 /// When `waiting` is true the tab turns amber and gains a ● badge — Claude has
 /// stopped on a question and is waiting for the user to answer.
+///
+/// `index` is the pane's position in the strip, which doubles as its
+/// Ctrl+Shift+<digit> shortcut for the first nine.
 fn claude_tab_button(
     label:    String,
     selected: bool,
     tid:      TerminalId,
     closable: bool,
     waiting:  bool,
+    index:    usize,
 ) -> Element<'static, Message> {
     let fg = if selected {
         Color::from_rgb(0.96, 0.95, 0.93)
@@ -423,6 +259,20 @@ fn claude_tab_button(
         .spacing(4)
         .align_y(Alignment::Center);
 
+    // Ctrl+Shift+1…9 jumps straight to an agent pane, so label each tab with
+    // its digit — the same badge `ui::session_bar` puts on project tabs for
+    // Ctrl+1…9. Only the first nine have a shortcut; later tabs get no badge,
+    // rather than a number that promises a chord which doesn't exist.
+    if index < 9 {
+        inner = inner.push(
+            text(format!("{}", index + 1))
+                .font(UI_FONT)
+                .size(buttons::TEXT_SIZE - 1)
+                .style(move |_: &Theme| iced::widget::text::Style {
+                    color: Some(Color { a: 0.55, ..fg }),
+                }),
+        );
+    }
     if waiting {
         inner = inner.push(text("●").font(ICON_FONT).size(11));
     }
@@ -476,12 +326,34 @@ fn agent_callout_bg(theme: &Theme) -> container::Style {
     }
 }
 
-/// Header label inside the agent callout — tinted with the theme's primary
-/// accent so it stays in line with the selected profile theme.
-fn agent_callout_label(theme: &Theme) -> iced::widget::text::Style {
-    iced::widget::text::Style {
-        color: Some(theme.extended_palette().primary.base.color),
-    }
+/// Image files are shown as a scaled-to-fit preview with no code view.
+fn image_preview(state: &EditorState) -> Element<'_, Message> {
+    let body: Element<'_, Message> = if let Some(handle) = state.preview_handle.clone() {
+        // `Contain` scales down to the pane and leaves smaller images at their
+        // natural size, so a 16px icon doesn't blow up to fill the pane.
+        image(handle)
+            .content_fit(ContentFit::Contain)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else if let Some(err) = state.preview_error.as_deref() {
+        column![
+            text("Could not open image").size(14),
+            text(err.to_string()).size(11),
+        ]
+        .spacing(6)
+        .into()
+    } else {
+        text("No image open").size(13).into()
+    };
+
+    container(body)
+        .padding(8)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
 }
 
 fn html_preview(state: &EditorState) -> Element<'_, Message> {
@@ -492,8 +364,7 @@ fn html_preview(state: &EditorState) -> Element<'_, Message> {
             .height(Length::Fill)
             .into();
     }
-    if let Some(bytes) = state.preview_image.as_deref() {
-        let handle = image::Handle::from_bytes(bytes.to_vec());
+    if let Some(handle) = state.preview_handle.clone() {
         return scrollable(image(handle))
             .width(Length::Fill)
             .height(Length::Fill)

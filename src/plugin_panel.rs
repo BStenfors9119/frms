@@ -16,6 +16,7 @@
 pub enum PluginTab {
     Profile,
     Notes,
+    Docs,
     Terminals,
     Receivers,
 }
@@ -24,6 +25,7 @@ impl PluginTab {
     pub const ALL: &'static [PluginTab] = &[
         PluginTab::Profile,
         PluginTab::Notes,
+        PluginTab::Docs,
         PluginTab::Terminals,
         PluginTab::Receivers,
     ];
@@ -32,6 +34,9 @@ impl PluginTab {
         match self {
             PluginTab::Profile   => "Profile",
             PluginTab::Notes     => "Notes",
+            // The project's own written material (`_specs` / `_docs`), as
+            // opposed to the user-authored "Notes" plugin beside it.
+            PluginTab::Docs      => "Docs",
             PluginTab::Terminals => "Terminals",
             // The "Receivers" inventory is exposed under the generic "SSH" name:
             // it started as TSR-receiver-specific but will host other SSH
@@ -60,6 +65,10 @@ pub enum PluginSlot {
 #[derive(Clone, Debug)]
 pub struct PluginPanel {
     pub visible:    bool,
+    /// When true (and `visible`), the panel takes the whole width and the main
+    /// working area (editor / database / agents) is hidden — the mirror image
+    /// of hiding the panel to give the main area full width.
+    pub expanded:   bool,
     /// Which window edge the panel docks against.
     pub dock:       DockSide,
     /// Active tab for the top (or only) slot.
@@ -80,6 +89,10 @@ pub struct PluginPanel {
     pub hidden:     Vec<PluginTab>,
     /// Transient: the `+` add-plugin picker is open. Not persisted.
     pub adding:     bool,
+    /// Transient: the `⋯` panel-controls overflow menu (dock / split / expand /
+    /// close) is open. Kept off the tab bar so those actions stay usable at any
+    /// panel width. Not persisted.
+    pub controls_menu: bool,
 }
 
 pub const DEFAULT_WIDTH:      f32 = 480.0;
@@ -92,6 +105,7 @@ impl Default for PluginPanel {
     fn default() -> Self {
         Self {
             visible:    false,
+            expanded:   false,
             dock:       DockSide::Right,
             active_tab: PluginTab::Profile,
             bottom_tab: PluginTab::Terminals,
@@ -100,6 +114,7 @@ impl Default for PluginPanel {
             width:      DEFAULT_WIDTH,
             hidden:     Vec::new(),
             adding:     false,
+            controls_menu: false,
         }
     }
 }
@@ -170,6 +185,30 @@ impl PluginPanel {
         }
     }
 
+    /// Advance the top slot's active tab to the next/previous shown plugin,
+    /// wrapping around. Drives the Ctrl+Shift+PageUp/PageDown toolbox cycle.
+    /// A no-op when fewer than two plugins are shown.
+    pub fn cycle_tab(&mut self, forward: bool) {
+        let shown: Vec<PluginTab> = self.shown_tabs().collect();
+        if shown.len() < 2 {
+            return;
+        }
+        let cur = shown.iter().position(|t| *t == self.active_tab).unwrap_or(0);
+        let n = shown.len();
+        let next = if forward { (cur + 1) % n } else { (cur + n - 1) % n };
+        self.active_tab = shown[next];
+    }
+
+    /// Toggle full-width expansion. Expanding implies the panel is visible, so
+    /// switch it on together — otherwise the toggle would hide the main area
+    /// while showing nothing in its place.
+    pub fn toggle_expanded(&mut self) {
+        self.expanded = !self.expanded;
+        if self.expanded {
+            self.visible = true;
+        }
+    }
+
     /// Toggle the dock side between the two window edges.
     pub fn toggle_dock(&mut self) {
         self.dock = match self.dock {
@@ -205,13 +244,13 @@ mod tests {
         assert!(!p.is_shown(PluginTab::Profile));
         // Active moved off the now-hidden plugin to the first still-shown one.
         assert_eq!(p.active_tab, PluginTab::Notes);
-        assert_eq!(p.shown_count(), 3);
+        assert_eq!(p.shown_count(), PluginTab::ALL.len() - 1);
     }
 
     #[test]
     fn last_shown_plugin_cannot_be_hidden() {
         let mut p = PluginPanel::default();
-        for t in [PluginTab::Notes, PluginTab::Terminals, PluginTab::Receivers] {
+        for t in [PluginTab::Notes, PluginTab::Docs, PluginTab::Terminals, PluginTab::Receivers] {
             p.hide_tab(t);
         }
         assert_eq!(p.shown_count(), 1);

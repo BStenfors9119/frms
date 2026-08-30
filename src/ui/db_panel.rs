@@ -4,10 +4,12 @@ use iced::widget::{
     button, column, combo_box, container, mouse_area, pick_list, row, scrollable, text, text_editor,
     text_input, Column, Row, Space,
 };
+use iced::keyboard;
 use iced::{Alignment, Background, Border, Color, Element, Font, Length, Theme};
 
 use crate::app::Message;
-use crate::db::{DbEngine, DbProvider, QueryResult, RoutineRef};
+use crate::cloud_sql::ProxyState;
+use crate::db::{CopyFormat, DbEngine, DbProvider, QueryResult, RoutineRef};
 use crate::db_panel::{ColRef, ConnState, DbPanel, Filter, FilterOp};
 use crate::fonts::{ICON_FONT, UI_FONT};
 use crate::ui::buttons;
@@ -153,6 +155,211 @@ fn connected_view(panel: &DbPanel) -> Element<'_, Message> {
     .into()
 }
 
+// ── GCP Cloud SQL Auth Proxy ──────────────────────────────────────────────────
+
+/// "Credentials file" as a browse control rather than a text field: a button
+/// that opens the shared file picker, showing the chosen key's name (its parent
+/// folder too, since `auth.json` is rarely a distinguishing name), plus a Clear
+/// button that hands the proxy back to gcloud's Application Default
+/// Credentials. Nobody has to type or remember a path.
+fn credentials_browse(configured: &str) -> Element<'_, Message> {
+    let chosen = configured.trim();
+    let label = if chosen.is_empty() {
+        String::from("Choose auth.json\u{2026}")
+    } else {
+        let path = std::path::Path::new(chosen);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        let dir  = path.parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        match (dir, name) {
+            (Some(d), Some(n)) => format!("{d}/{n}"),
+            (None,    Some(n)) => n,
+            _                  => chosen.to_string(),
+        }
+    };
+
+    let mut controls = row![
+        button(text(label).font(UI_FONT).size(buttons::TEXT_SIZE))
+            .on_press(Message::DbProxyCredentialsPick)
+            .padding(buttons::PADDING)
+            .style(buttons::secondary)
+            .width(Length::Fill),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    if chosen.is_empty() {
+        // Nothing chosen is a valid state, not an error — say what it means.
+        controls = controls.push(
+            text("gcloud ADC").font(UI_FONT).size(10).color(Color::from_rgb8(140, 140, 152)),
+        );
+    } else {
+        controls = controls.push(
+            button(text("Clear").font(UI_FONT).size(buttons::TEXT_SIZE))
+                .on_press(Message::DbProxyCredentialsCleared)
+                .padding(buttons::PADDING)
+                .style(buttons::secondary),
+        );
+    }
+
+    controls.into()
+}
+
+/// The call to action shown when there is no proxy on the machine — and
+/// nothing at all when there is one.
+///
+/// Where the binary lives is frms' problem: `frms-setup-cloud-sql-proxy`
+/// installs it and [`crate::cloud_sql::detect_binary`] finds it, so in the
+/// normal case the user is never asked, told, or reminded about it. The only
+/// moment it becomes their business is when it isn't installed yet, and then
+/// the answer is one button, not a path.
+fn install_prompt() -> Option<Element<'static, Message>> {
+    if crate::cloud_sql::detect_binary().is_some() {
+        return None;
+    }
+    Some(
+        row![
+            text("The Cloud SQL Proxy isn't installed yet.")
+                .font(UI_FONT)
+                .size(11)
+                .color(Color::from_rgb8(239, 68, 68)),
+            Space::with_width(Length::Fill),
+            button(text("Install").font(UI_FONT).size(buttons::TEXT_SIZE))
+                .on_press(Message::DbProxyInstall)
+                .padding(buttons::PADDING)
+                .style(buttons::primary),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into(),
+    )
+}
+
+/// Collapsible "Cloud SQL Proxy" block, shown inside the Connection section
+/// whenever the provider is GCP Cloud SQL.
+///
+/// Everything the proxy needs is editable here: the instance connection name
+/// (per connection, with typed history), and the paths to the proxy binary and
+/// the service-account key (machine-level, saved straight to prefs). Start
+/// brings the listener up on loopback and points Host/Port at it; pressing
+/// Connect with the proxy down starts it first.
+fn cloud_sql_section<'a>(panel: &'a DbPanel, credentials: &'a str) -> Element<'a, Message> {
+    let collapsed = panel.proxy_collapsed;
+    let chevron = if collapsed { "\u{25B8}" } else { "\u{25BE}" }; // ▸ / ▾
+
+    let (status, status_color) = match &panel.proxy {
+        ProxyState::Stopped     => ("Stopped".to_string(), Color::from_rgb8(160, 160, 172)),
+        ProxyState::Starting    => ("Starting…".to_string(), Color::from_rgb8(160, 160, 172)),
+        ProxyState::Running(p)  => (
+            format!("Listening on {}:{} (pid {})", p.spec.address, p.spec.port, p.pid),
+            Color::from_rgb8(74, 222, 128),
+        ),
+        ProxyState::Failed(_)   => ("Failed".to_string(), Color::from_rgb8(239, 68, 68)),
+    };
+
+    let header = button(
+        row![
+            text(chevron).font(ICON_FONT).size(11),
+            text("Cloud SQL Proxy").font(UI_FONT).size(12),
+            text(status).font(UI_FONT).size(11).color(status_color),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::DbProxyToggleCollapsed)
+    .padding(buttons::PADDING)
+    .style(buttons::secondary)
+    .width(Length::Fill);
+
+    let mut col = Column::new().spacing(8).width(Length::Fill).push(header);
+    if collapsed {
+        return col.into();
+    }
+
+    let instance_field = labeled_field(
+        "Instance connection name",
+        combo_box(
+            &panel.instance_combo,
+            "project:region:instance",
+            Some(&panel.config.cloud_sql_instance),
+            Message::DbInstanceEdited,
+        )
+        .on_input(Message::DbInstanceEdited)
+        .font(UI_FONT)
+        .size(12.0)
+        .width(Length::Fill)
+        .into(),
+    );
+
+    // Start while stopped/failed, Stop while running; neither is pressable
+    // mid-start, so a second click can't spawn a competing proxy.
+    let action: Element<'_, Message> = match &panel.proxy {
+        ProxyState::Starting => button(text("Starting…").font(UI_FONT).size(buttons::TEXT_SIZE))
+            .padding(buttons::PADDING)
+            .style(buttons::secondary)
+            .width(Length::Fill)
+            .into(),
+        ProxyState::Running(_) => button(text("Stop").font(UI_FONT).size(buttons::TEXT_SIZE))
+            .on_press(Message::DbProxyStop)
+            .padding(buttons::PADDING)
+            .style(buttons::danger)
+            .width(Length::Fill)
+            .into(),
+        _ => button(text("Start").font(UI_FONT).size(buttons::TEXT_SIZE))
+            .on_press(Message::DbProxyStart { then_connect: false })
+            .padding(buttons::PADDING)
+            .style(buttons::primary)
+            .width(Length::Fill)
+            .into(),
+    };
+
+    let creds_field = labeled_field("Credentials file", credentials_browse(credentials));
+
+    let row1 = row![
+        container(instance_field).width(Length::FillPortion(3)),
+        container(labeled_field("", action)).width(Length::FillPortion(1)),
+    ]
+    .spacing(8)
+    .width(Length::Fill);
+    col = col.push(row1).push(creds_field);
+    if let Some(prompt) = install_prompt() {
+        col = col.push(prompt);
+    }
+
+    match &panel.proxy {
+        // The exact command that was run — copyable into a shell when the
+        // proxy misbehaves and the user wants to reproduce it outside frms.
+        ProxyState::Running(p) => {
+            col = col.push(
+                text(p.spec.command_line())
+                    .font(UI_FONT)
+                    .size(10)
+                    .color(Color::from_rgb8(140, 140, 152)),
+            );
+        }
+        ProxyState::Failed(err) => {
+            col = col.push(
+                text(err.clone())
+                    .font(UI_FONT)
+                    .size(11)
+                    .color(Color::from_rgb8(239, 68, 68)),
+            );
+        }
+        _ => {
+            col = col.push(
+                text("Start binds the instance to 127.0.0.1 and points Host/Port at it. \
+                      Connect starts it for you if it isn't already up.")
+                    .font(UI_FONT)
+                    .size(10)
+                    .color(Color::from_rgb8(140, 140, 152)),
+            );
+        }
+    }
+
+    col.into()
+}
+
 fn section_title(label: &str) -> Element<'static, Message> {
     container(text(label.to_string()).font(UI_FONT).size(12))
         .padding([4, 0])
@@ -162,12 +369,12 @@ fn section_title(label: &str) -> Element<'static, Message> {
 /// The full database tool, rendered in the per-project Database center tab:
 /// a collapsible Connection section on top, then the builder grid (Row 1:
 /// tables | fields | query) over the results table (Row 2).
-pub fn query_tab(panel: &DbPanel) -> Element<'_, Message> {
+pub fn query_tab<'a>(panel: &'a DbPanel, cloud_sql_creds: &'a str) -> Element<'a, Message> {
     let mut body = Column::new()
         .spacing(8)
         .width(Length::Fill)
         .height(Length::Fill)
-        .push(connection_section(panel));
+        .push(connection_section(panel, cloud_sql_creds));
 
     if matches!(panel.conn_state, ConnState::Connected) {
         body = body.push(builder_and_results(panel));
@@ -184,7 +391,7 @@ pub fn query_tab(panel: &DbPanel) -> Element<'_, Message> {
 /// Collapsible "Connection" section: a clickable header showing the current
 /// connection status, with the connection form (disconnected) or a compact
 /// connected banner tucked beneath it when expanded.
-fn connection_section(panel: &DbPanel) -> Element<'_, Message> {
+fn connection_section<'a>(panel: &'a DbPanel, credentials: &'a str) -> Element<'a, Message> {
     let collapsed = panel.form_collapsed;
     let chevron = if collapsed { "\u{25B8}" } else { "\u{25BE}" }; // ▸ / ▾
 
@@ -217,15 +424,37 @@ fn connection_section(panel: &DbPanel) -> Element<'_, Message> {
     .style(buttons::secondary)
     .width(Length::Fill);
 
-    let mut col = Column::new().spacing(8).width(Length::Fill).push(header);
+    // Always reachable, in every connection state — this is the way out when a
+    // connect never comes back or the server drops the connection mid-query and
+    // the panel is left waiting on replies that will never arrive.
+    let reset = button(text("Reset").font(UI_FONT).size(buttons::TEXT_SIZE))
+        .on_press(Message::DbReset)
+        .padding(buttons::PADDING)
+        .style(buttons::danger);
+
+    let header_row = row![header, reset]
+        .spacing(6)
+        .width(Length::Fill)
+        .align_y(Alignment::Center);
+
+    let mut col = Column::new().spacing(8).width(Length::Fill).push(header_row);
 
     if !collapsed {
         let inner: Element<'_, Message> = match &panel.conn_state {
             ConnState::Disconnected | ConnState::Failed(_) => connection_form(panel),
-            ConnState::Connecting => container(text("Connecting…").size(13)).padding(8).into(),
+            ConnState::Connecting => container(
+                text("Connecting… (Reset if it doesn't come back)").font(UI_FONT).size(12),
+            )
+            .padding(8)
+            .into(),
             ConnState::Connected  => connected_view(panel),
         };
         col = col.push(container(inner).padding([0, 4]));
+        // Below the form in every connection state — a running proxy has to
+        // stay stoppable after the connection is up.
+        if panel.show_cloud_sql() {
+            col = col.push(container(cloud_sql_section(panel, credentials)).padding([0, 4]));
+        }
     }
 
     col.into()
@@ -331,6 +560,21 @@ fn sql_editor_row(panel: &DbPanel) -> Element<'_, Message> {
 
     let editor = text_editor(&panel.sql_input)
         .on_action(Message::DbSqlAction)
+        // Route copy/cut/paste through the app's subprocess clipboard instead of
+        // iced's built-in one, whose synchronous read freezes the app on Wayland
+        // (see crate::clipboard). This is why pasting SQL used to hang the app.
+        .key_binding(|kp| match kp.key.as_ref() {
+            keyboard::Key::Character("c") if kp.modifiers.command() => {
+                Some(text_editor::Binding::Custom(Message::DbSqlCopy))
+            }
+            keyboard::Key::Character("x") if kp.modifiers.command() => {
+                Some(text_editor::Binding::Custom(Message::DbSqlCut))
+            }
+            keyboard::Key::Character("v") if kp.modifiers.command() && !kp.modifiers.alt() => {
+                Some(text_editor::Binding::Custom(Message::DbSqlPaste))
+            }
+            _ => text_editor::Binding::from_key_press(kp),
+        })
         .font(Font::MONOSPACE)
         .size(12)
         .height(Length::Fill);
@@ -782,7 +1026,8 @@ fn group_col(panel: &DbPanel) -> Element<'_, Message> {
 }
 
 /// Col 5 — the live generated SQL, a reorderable list of the picked fields, and
-/// the Run / Reset actions.
+/// the Run / Clear actions. (Clear empties the builder; resetting the connection
+/// itself lives in the Connection header.)
 fn query_col(panel: &DbPanel) -> Element<'_, Message> {
     let sql = panel.build_select().unwrap_or_else(|| "—".to_string());
 
@@ -800,7 +1045,7 @@ fn query_col(panel: &DbPanel) -> Element<'_, Message> {
         .on_press_maybe((!panel.query_running).then_some(Message::DbRunQuery))
         .padding(buttons::PADDING)
         .style(buttons::primary),
-        button(text("Reset").font(UI_FONT).size(buttons::TEXT_SIZE))
+        button(text("Clear").font(UI_FONT).size(buttons::TEXT_SIZE))
             .on_press(Message::DbResetTables)
             .padding(buttons::PADDING)
             .style(buttons::danger),
@@ -848,7 +1093,9 @@ fn selected_fields_list(panel: &DbPanel) -> Element<'_, Message> {
             .style(buttons::danger);
 
         let row_inner = row![
-            text("\u{2195}").font(ICON_FONT).size(12), // ↕ drag handle
+            // ⬍ (U+2B0D), not ↕ (U+2195): the bundled Noto Sans Symbols 2 has
+            // no Arrows block, so ↕ drew as a tofu box.
+            text("\u{2B0D}").font(ICON_FONT).size(12), // drag handle
             text(label).font(UI_FONT).size(11).width(Length::Fill),
             remove,
         ]
@@ -934,13 +1181,39 @@ fn results_section(panel: &DbPanel) -> Element<'_, Message> {
     .padding(buttons::PADDING)
     .style(buttons::secondary);
 
-    let header = row![
-        section_title(&title),
-        Space::with_width(Length::Fill),
-        refresh,
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
+    // Copy the whole result set — header row included — in the picked format.
+    // The same format drives the per-record copy buttons in the table's gutter.
+    let has_rows = panel
+        .query_result
+        .as_ref()
+        .is_some_and(|r| !r.columns.is_empty() && !r.rows.is_empty());
+    let format_pick = pick_list(
+        &CopyFormat::ALL[..],
+        Some(panel.copy_format),
+        Message::DbCopyFormatChanged,
+    )
+    .text_size(11)
+    .font(UI_FONT)
+    .padding([2, 6]);
+    let copy_all = button(text("Copy all").font(UI_FONT).size(buttons::TEXT_SIZE))
+        .on_press_maybe(has_rows.then_some(Message::DbCopyResults))
+        .padding(buttons::PADDING)
+        .style(buttons::secondary);
+
+    let mut header = row![section_title(&title)].spacing(6).align_y(Alignment::Center);
+    if let Some(notice) = &panel.copy_notice {
+        header = header.push(
+            text(notice.clone())
+                .font(UI_FONT)
+                .size(11)
+                .color(Color::from_rgb8(74, 222, 128)),
+        );
+    }
+    let header = header
+        .push(Space::with_width(Length::Fill))
+        .push(format_pick)
+        .push(copy_all)
+        .push(refresh);
 
     container(
         column![header, body]
@@ -1006,6 +1279,9 @@ fn routine_source_view<'a>(panel: &'a DbPanel, routine: &'a RoutineRef) -> Eleme
 /// reached by scrolling horizontally rather than being squeezed unreadable.
 const RESULT_COL_WIDTH: f32 = 180.0;
 
+/// Width of the leading gutter column holding each row's copy-record button.
+const RESULT_GUTTER_WIDTH: f32 = 34.0;
+
 /// Render the result set as a grid that scrolls in both directions. Every column
 /// is a fixed width, so when the columns together exceed the pane the table
 /// overflows and a horizontal scrollbar appears; each cell carries a hairline
@@ -1014,7 +1290,16 @@ const RESULT_COL_WIDTH: f32 = 180.0;
 fn results_table(result: &QueryResult) -> Element<'static, Message> {
     let id_cols: Vec<bool> = result.columns.iter().map(|c| is_id_column(c)).collect();
 
+    // Frozen header row, kept outside the vertical scroll so the column titles
+    // stay visible while the rows scroll beneath them. It opens with an empty
+    // cell over the per-record copy gutter so the columns stay aligned.
     let mut header = Row::new().spacing(0);
+    header = header.push(
+        container(text("").font(UI_FONT).size(11))
+            .width(Length::Fixed(RESULT_GUTTER_WIDTH))
+            .padding([3, 6])
+            .style(header_cell_box),
+    );
     for c in &result.columns {
         header = header.push(
             container(text(c.clone()).font(UI_FONT).size(11))
@@ -1023,25 +1308,70 @@ fn results_table(result: &QueryResult) -> Element<'static, Message> {
                 .style(header_cell_box),
         );
     }
-    // Shrink width so the grid takes only the columns' combined width — letting
-    // it overflow the pane (and thus scroll) instead of being compressed to fit.
-    let mut grid = Column::new().spacing(0).width(Length::Shrink).push(header);
+    // The header scrolls horizontally too, but only ever driven programmatically
+    // to match the body (see `DbResultsScrolled`); its own scrollbar is hidden so
+    // the body owns the single visible horizontal bar.
+    let header_scroll = scrollable(container(header).width(Length::Shrink))
+        .id(results_header_scroll_id())
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new().width(0).scroller_width(0),
+        ))
+        .width(Length::Fill);
 
-    for row_vals in &result.rows {
+    // Body: the data rows only. Shrink width so the grid takes just the columns'
+    // combined width — letting it overflow the pane (and thus scroll) instead of
+    // being compressed to fit.
+    let mut grid = Column::new().spacing(0).width(Length::Shrink);
+    for (row_idx, row_vals) in result.rows.iter().enumerate() {
         let mut r = Row::new().spacing(0).align_y(Alignment::Center);
+        r = r.push(row_copy_cell(row_idx));
         for (i, v) in row_vals.iter().enumerate() {
             r = r.push(result_cell(v, id_cols.get(i).copied().unwrap_or(false)));
         }
         grid = grid.push(r);
     }
 
-    scrollable(grid)
+    let body_scroll = scrollable(grid)
+        .id(results_body_scroll_id())
+        .on_scroll(Message::DbResultsScrolled)
         .direction(scrollable::Direction::Both {
             vertical:   scrollable::Scrollbar::new(),
             horizontal: scrollable::Scrollbar::new(),
         })
         .width(Length::Fill)
+        .height(Length::Fill);
+
+    column![header_scroll, body_scroll]
+        .spacing(0)
+        .width(Length::Fill)
         .height(Length::Fill)
+        .into()
+}
+
+/// Scrollable id for the frozen results header (offset-synced to the body).
+pub fn results_header_scroll_id() -> scrollable::Id {
+    scrollable::Id::new("db-results-header")
+}
+
+/// Scrollable id for the results body (owns the visible scrollbars).
+pub fn results_body_scroll_id() -> scrollable::Id {
+    scrollable::Id::new("db-results-body")
+}
+
+/// The gutter cell leading each data row: a button that copies that one record
+/// — labelled by the column names — in the format picked in the Results header.
+fn row_copy_cell(row_idx: usize) -> Element<'static, Message> {
+    // ❐ — the drop-shadowed square reads as "copy"; it is one of the few such
+    // glyphs the bundled Noto Sans Symbols 2 actually carries.
+    let copy = button(text("\u{2750}").font(ICON_FONT).size(10))
+        .on_press(Message::DbCopyRow(row_idx))
+        .padding([1, 4])
+        .style(buttons::secondary);
+
+    container(copy)
+        .width(Length::Fixed(RESULT_GUTTER_WIDTH))
+        .padding([3, 6])
+        .style(cell_box)
         .into()
 }
 
