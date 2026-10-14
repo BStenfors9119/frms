@@ -8,8 +8,8 @@
 #
 #   curl -fsSL <url>/add-sp-frms-repo.sh | bash      # or download + run
 #
-# Fedora users do NOT use this — install the .rpm from GitHub Releases instead
-# (there is no self-hosted dnf repo).
+# Fedora users: use _tooling/add-sp-frms-dnf-repo.sh instead (self-hosted DNF
+# repo at dnf.sodapopsystems.com).
 #
 # Keyring flow — modern (deb822 .sources + Signed-By):
 #   The legacy `apt-key` is removed on Debian 12 / Ubuntu 24.04, and the old

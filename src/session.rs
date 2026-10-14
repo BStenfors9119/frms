@@ -178,10 +178,11 @@ impl Session {
         // Unspawned: the CLI starts the first time the user opens this tab.
         let panes = vec![
             AgentPane::Pending(PendingPane {
-                id:    first_term,
-                tool:  pane0_tool,
-                model: *pane0_tool.default_model(),
-                name:  None,
+                id:      first_term,
+                tool:    pane0_tool,
+                model:   *pane0_tool.default_model(),
+                name:    None,
+                stopped: false,
             }),
         ];
         let mut file_browser = FileBrowserState::new();
@@ -239,14 +240,31 @@ impl Session {
     /// pane that drives the `claude` CLI headless. Neither starts a process
     /// here. `tool` is ignored for the chat kinds, which are Claude-only; they
     /// keep `model` as an override on the model their kind implies.
-    pub fn add_agent(&mut self, id: TerminalId, kind: AgentKind, tool: AiTool, model: ToolModel) -> TerminalId {
+    ///
+    /// `name` is the tab name the user typed when starting the agent; `None`
+    /// (or blank) leaves the pane on its positional label ("Build 2"), which
+    /// the tab bar derives, and the ✎ rename still applies afterwards either way.
+    pub fn add_agent(
+        &mut self,
+        id:    TerminalId,
+        kind:  AgentKind,
+        tool:  AiTool,
+        model: ToolModel,
+        name:  Option<String>,
+    ) -> TerminalId {
+        let name = name
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty());
         if kind.is_agentic() {
-            self.panes.push(AgentPane::Pending(PendingPane { id, tool, model, name: None }));
+            self.panes.push(AgentPane::Pending(PendingPane {
+                id, tool, model, name, stopped: false,
+            }));
         } else {
             let mut chat = crate::agent::ChatPane::new(id, kind);
             // Chat panes are Claude-only, so a Claude model carries over as an
             // override; anything else leaves them on their kind's own model.
             chat.model = model;
+            chat.name  = name;
             self.panes.push(AgentPane::Chat(chat));
         }
         id
@@ -263,6 +281,60 @@ impl Session {
     ///
     /// Already-live and chat panes are a no-op, so callers can fire this at any
     /// pane that has come on screen without checking what it is first.
+    /// Stop the CLI behind Build pane `id` while **keeping its tab**.
+    ///
+    /// This is the Agents dialog's Stop: the process is killed and the pane
+    /// reverts to [`AgentPane::Pending`], so the tab, its name, its position,
+    /// its tool and its model all stay exactly where they were — only the
+    /// running CLI and its memory go away. Deleting a tab is a separate action,
+    /// and lives on the tab's own ✕ ([`Session::close_claude_terminal`]).
+    ///
+    /// The pane is marked `stopped` so it isn't immediately relaunched by the
+    /// on-screen spawner; the user restarts it from the pane body.
+    ///
+    /// Returns false when `id` isn't a running Build pane — a chat pane owns no
+    /// process between turns, and an unstarted one has nothing to stop.
+    pub fn stop_agent(&mut self, id: TerminalId) -> bool {
+        let Some(pos) = self.panes.iter().position(|p| p.id() == id) else {
+            return false;
+        };
+        if !self.panes[pos].can_stop() {
+            return false;
+        }
+        let tool  = self.panes[pos].tool();
+        let model = self.panes[pos].model_choice();
+        let name  = self.panes[pos].name().map(str::to_owned);
+
+        if let Some(t) = self.panes[pos].as_terminal_mut() {
+            if let Ok(mut c) = t.child.lock() {
+                let _ = c.kill();
+            }
+        }
+        self.panes[pos] = AgentPane::Pending(PendingPane {
+            id, tool, model, name, stopped: true,
+        });
+
+        // A question the stopped CLI had raised can never be answered now.
+        if self.prompt_source_terminal == Some(id) {
+            self.clear_prompt();
+        }
+        true
+    }
+
+    /// Let a stopped pane start again. Clearing the flag is all it takes — the
+    /// on-screen spawner picks it up on the same update, exactly as it would a
+    /// tab being opened for the first time.
+    pub fn restart_agent(&mut self, id: TerminalId) -> bool {
+        let Some(pos) = self.panes.iter().position(|p| p.id() == id) else {
+            return false;
+        };
+        let AgentPane::Pending(p) = &mut self.panes[pos] else {
+            return false;
+        };
+        p.stopped = false;
+        true
+    }
+
     pub fn spawn_pending(&mut self, id: TerminalId) -> bool {
         let Some(pos) = self.panes.iter().position(|p| p.id() == id) else {
             return false;
@@ -385,5 +457,51 @@ impl Session {
     /// The chat state for `id`, when that pane is a Research/Chat pane.
     pub fn chat(&self, id: TerminalId) -> Option<&crate::agent::ChatPane> {
         self.panes.iter().find(|p| p.id() == id).and_then(|p| p.as_chat())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::AiTool;
+
+    fn session() -> Session {
+        Session::new(
+            1,
+            Some("proj".into()),
+            SessionKind::Terminal,
+            1,
+            std::env::temp_dir(),
+            AiTool::Claude,
+        )
+    }
+
+    /// Naming an agent as it is started is the whole point of the dialog's name
+    /// field — it has to reach the pane itself, not just the message, and it has
+    /// to reach a chat pane as well as a Build one.
+    #[test]
+    fn a_new_agent_keeps_the_name_it_was_started_under() {
+        let mut s = session();
+        let model = *AiTool::Claude.default_model();
+
+        s.add_agent(2, AgentKind::Build, AiTool::Claude, model, Some("infra".into()));
+        assert_eq!(s.panes[1].name(), Some("infra"));
+
+        s.add_agent(3, AgentKind::Chat, AiTool::Claude, model, Some("  spec  ".into()));
+        assert_eq!(s.panes[2].name(), Some("spec"), "surrounding space is not part of the name");
+    }
+
+    /// Naming stays optional: a blank field leaves the tab on the positional
+    /// label the tab bar derives, exactly as before the field existed.
+    #[test]
+    fn an_unnamed_agent_falls_back_to_its_positional_label() {
+        let mut s = session();
+        let model = *AiTool::Claude.default_model();
+
+        s.add_agent(2, AgentKind::Build, AiTool::Claude, model, None);
+        assert_eq!(s.panes[1].name(), None);
+
+        s.add_agent(3, AgentKind::Build, AiTool::Claude, model, Some("   ".into()));
+        assert_eq!(s.panes[2].name(), None, "a field of spaces is no name");
     }
 }

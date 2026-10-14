@@ -9,6 +9,7 @@ mod browser;
 mod clipboard;
 mod dirs;
 mod fs;
+mod notify;
 mod proc;
 mod shell;
 mod transfer;

@@ -50,6 +50,17 @@ fn mix_white(c: Color, t: f32) -> Color {
     }
 }
 
+/// Linear interpolate `a` toward `b`. `t = 0.0` returns `a`; `t = 1.0` returns `b`.
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a,
+    }
+}
+
 fn contrast_text(bg: Color) -> Color {
     let luminance = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b;
     if luminance > 0.55 {
@@ -59,10 +70,13 @@ fn contrast_text(bg: Color) -> Color {
     }
 }
 
-/// Glassy beveled button. Three-stop vertical gradient — bright highlight at
-/// the top, the deepened base in the body, fading toward black at the bottom —
-/// with a soft hairline edge and a drop shadow.
-fn glass_style(base: Color, status: button::Status) -> button::Style {
+/// Where the glass body stop sits — the highlight fades into the body by here,
+/// and the body fades toward black from here to the bottom edge.
+const GLASS_BODY_STOP: f32 = 0.18;
+
+/// The three gradient shades of a glass fill over `base`: top highlight, body,
+/// and bottom edge.
+fn glass_shades(base: Color, status: button::Status) -> (Color, Color, Color) {
     // Push the base toward black so the colored fill reads deep, not bright.
     let deep = mix_black(base, 0.30);
 
@@ -73,15 +87,25 @@ fn glass_style(base: Color, status: button::Status) -> button::Style {
         _                        => (0.16,  0.0,  0.50, 0.92),
     };
 
-    let highlight = with_alpha(lighten(deep, lift_top), alpha);
-    let body      = with_alpha(lighten(deep, lift_mid), alpha);
-    let bottom    = with_alpha(mix_black(deep, sink_bot), alpha);
+    (
+        with_alpha(lighten(deep, lift_top), alpha),
+        with_alpha(lighten(deep, lift_mid), alpha),
+        with_alpha(mix_black(deep, sink_bot), alpha),
+    )
+}
+
+/// Glassy beveled button. Three-stop vertical gradient — bright highlight at
+/// the top, the deepened base in the body, fading toward black at the bottom —
+/// with a soft hairline edge and a drop shadow.
+fn glass_style(base: Color, status: button::Status) -> button::Style {
+    let deep = mix_black(base, 0.30);
+    let (highlight, body, bottom) = glass_shades(base, status);
 
     let bg = Background::Gradient(Gradient::Linear(
         Linear::new(Radians(std::f32::consts::PI))
-            .add_stop(0.0,  highlight)
-            .add_stop(0.18, body)
-            .add_stop(1.0,  bottom),
+            .add_stop(0.0,             highlight)
+            .add_stop(GLASS_BODY_STOP, body)
+            .add_stop(1.0,             bottom),
     ));
 
     // Hairline outer edge — slightly brighter than the highlight to suggest a
@@ -142,14 +166,15 @@ pub fn success(theme: &Theme, status: button::Status) -> button::Style {
     glass_style(theme.extended_palette().success.base.color, status)
 }
 
-/// Default highlight violet for git-submodule directories, used when the user
-/// hasn't picked their own in the Profile tab. Distinct from the primary color
-/// so a submodule project reads as clearly separate from the parent repo's own
-/// folders; fixed regardless of theme so it stands out in light and dark.
-pub const SUBMODULE: Color = Color { r: 0.55, g: 0.44, b: 0.86, a: 1.0 };
+/// Default accent violet, used when the user hasn't picked their own in the
+/// Profile tab. It is the app's one user-chosen highlight — submodule folders,
+/// note categories, and doc folders all wear it — so it is deliberately
+/// distinct from the theme's primary color and fixed regardless of theme,
+/// standing out in light and dark alike.
+pub const ACCENT_TINT: Color = Color { r: 0.55, g: 0.44, b: 0.86, a: 1.0 };
 
-/// File-browser row style. `submodule` carries the user's chosen highlight
-/// color for submodule directories; `None` (a normal folder/file) falls back to
+/// File-browser row style. `submodule` carries the user's chosen accent tint
+/// for submodule directories; `None` (a normal folder/file) falls back to
 /// the theme's primary color. Same glass look either way, just a different base.
 pub fn file_row(submodule: Option<Color>)
     -> impl Fn(&Theme, button::Status) -> button::Style + Copy
@@ -163,12 +188,12 @@ pub fn file_row(submodule: Option<Color>)
 
 // ── Notes plugin: folders vs. the notes inside them ───────────────────────────
 //
-// Categories borrow the file browser's submodule highlight — the same color the
+// Categories borrow the file browser's accent tint — the same color the
 // user picks in Profile for "a container of other things", so folders read the
 // same way in both panels. The notes filed inside them are shades of the active
 // theme's primary, bright enough to sit clearly on top of the folder bar:
 //
-//   folder header   — the submodule tint (deepened when collapsed)
+//   folder header   — the accent tint (deepened when collapsed)
 //   note (filed)    — theme primary, lightly tinted toward white
 //   note (selected) — theme primary, tinted much further: the brightest row
 //
@@ -180,8 +205,8 @@ const FOLDER_SINK: (f32, f32) = (0.0, 0.35);
 /// How far a note row is tinted toward white, unselected vs. selected.
 const NOTE_TINT:   (f32, f32) = (0.30, 0.72);
 
-/// Category (folder) row in the Notes list. `folder` is the user's submodule
-/// highlight color (see [`SUBMODULE`]); a collapsed folder sinks toward black —
+/// Category (folder) row in the Notes list. `folder` is the user's accent tint
+/// (see [`ACCENT_TINT`]); a collapsed folder sinks toward black —
 /// put away, but still recognisably the same color as when open.
 pub fn note_category(folder: Color, collapsed: bool)
     -> impl Fn(&Theme, button::Status) -> button::Style + Copy
@@ -229,6 +254,52 @@ pub fn attention_tab(selected: bool) -> impl Fn(&Theme, button::Status) -> butto
     }
 }
 
+// ── the "you are here" tab ────────────────────────────────────────────────────
+//
+// The attention style says "this tab wants you" by wearing a color no other tab
+// has. The active project tab and the active agent tab want the same cue at a
+// much lower volume: they are where the user already is, so they should read as
+// current at a glance without competing with an amber tab two seats over.
+//
+// So it is kept deliberately quiet: the tab is the ordinary glass fill in the
+// theme's active color, and only below the label does a gradient rise out of
+// that fill into the palette's companion color (`ThemeColors::current`) — a
+// light yellow, or mint on the Yellows palette — at the bottom edge. No rim, no
+// glow. It reads as a lit edge without ever reading as a tab asking for
+// attention. Inactive tabs are left exactly as they were.
+
+/// Where the band's gradient starts, as a fraction of the button's height from
+/// the top. The start sits below the label: both tabs are ~34–36 px tall (a
+/// 12 px label, 13–14 px icon buttons, 7 px of tab padding), and their text —
+/// descenders included — ends around 0.69, so a band starting any higher runs
+/// through the lettering.
+const BAND_START: f32 = 0.74;
+
+/// Glass fill for the tab the user is standing on — the normal [`glass_style`]
+/// over `base`, with a gradient along the bottom that brightens into `band` at
+/// the bottom edge, and no border.
+fn glass_active(base: Color, band: Color, status: button::Status) -> button::Style {
+    let mut style = glass_style(base, status);
+    let (highlight, body, bottom) = glass_shades(base, status);
+
+    // The tab's own fill where the band begins — sampled from the glass's
+    // body → bottom fade, so the gradient rises out of the tab seamlessly.
+    let start = mix(body, bottom, (BAND_START - GLASS_BODY_STOP) / (1.0 - GLASS_BODY_STOP));
+    // The gradient ends at the band's full color, not glass-deepened like the
+    // rest of the tab: the point is an edge brighter than the fill above it.
+    let edge = with_alpha(band, body.a);
+
+    style.background = Some(Background::Gradient(Gradient::Linear(
+        Linear::new(Radians(std::f32::consts::PI))
+            .add_stop(0.0,             highlight)
+            .add_stop(GLASS_BODY_STOP, body)
+            .add_stop(BAND_START,      start)
+            .add_stop(1.0,             edge),
+    )));
+    style.border.width = 0.0;
+    style
+}
+
 /// Toggle-style button — `selected` picks primary (active) vs secondary
 /// (inactive) without changing size.
 pub fn toggle(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style + Copy {
@@ -245,20 +316,44 @@ pub fn toggle(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Styl
 
 /// Tab-style button driven by an explicit primary/secondary/tertiary triple
 /// (used by the session tab bar so the active tab clearly stands out).
-pub fn tab(active: Color, inactive: Color, hover: Color, selected: bool)
+///
+/// The selected tab keeps its [`glass_active`] band through hover too — the
+/// point of the band is "this is the one you're in", and swapping it for the
+/// hover color under the pointer would take that away exactly when the user is
+/// about to click something else.
+pub fn tab(active: Color, inactive: Color, hover: Color, band: Color, selected: bool)
     -> impl Fn(&Theme, button::Status) -> button::Style
 {
     move |_theme, status| {
+        if selected {
+            return glass_active(active, band, status);
+        }
         let base = match status {
             button::Status::Hovered => hover,
-            _ => if selected { active } else { inactive },
+            _                       => inactive,
         };
         glass_style(base, status)
     }
 }
 
-/// The same text color the `tab` style chooses for its label — exposed so
-/// embedded icon buttons inside a tab can match.
+/// Agent-session tab in the center bar. Mirrors [`toggle`] — theme primary when
+/// selected, secondary when not — except the selected tab wears the same
+/// bottom band the active project tab does, so "the project I'm in" and "the
+/// agent I'm in" are marked the same way in both bars.
+pub fn agent_tab(band: Color, selected: bool)
+    -> impl Fn(&Theme, button::Status) -> button::Style + Copy
+{
+    move |theme, status| {
+        let palette = theme.extended_palette();
+        if selected {
+            return glass_active(palette.primary.base.color, band, status);
+        }
+        glass_style(palette.secondary.base.color, status)
+    }
+}
+
+/// The same text color the `tab` / `agent_tab` styles choose for their label —
+/// exposed so embedded icon buttons inside a tab can match.
 pub fn tab_text_color(active: Color, inactive: Color, selected: bool) -> Color {
     let base = if selected { active } else { inactive };
     contrast_text(mix_black(base, 0.30))

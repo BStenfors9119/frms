@@ -135,18 +135,37 @@ fn push_container<'a>(
     recvs.sort_by_key(|r| node_sort_key(&r.name));
     for r in recvs {
         let selected = rs.selected_receiver == Some(r.id);
+        // A ● at the end of the row flags this receiver's SSH state: green when
+        // a session is live, amber when one exists but its ssh process exited
+        // (still shown so the failure output stays readable). No dot when there
+        // is no session. Colors mirror the detail pane's connected/disconnected
+        // labels; the glyph comes from ICON_FONT (UI_FONT is Latin-only).
+        let mut content = row![
+            // 🖧 networked-device glyph stands in for a receiver.
+            text("\u{1F5A7}").font(ICON_FONT).size(buttons::TEXT_SIZE),
+            text(r.name.clone()).font(UI_FONT).size(buttons::TEXT_SIZE),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        if let Some(ssh) = rs.ssh.iter().find(|s| s.receiver == r.id) {
+            let dot = if ssh.exited {
+                iced::Color::from_rgb8(210, 140, 110)
+            } else {
+                iced::Color::from_rgb8(120, 200, 120)
+            };
+            content = content
+                .push(Space::with_width(Length::Fill))
+                .push(
+                    text("\u{25CF}") // ●
+                        .font(ICON_FONT)
+                        .size(buttons::TEXT_SIZE)
+                        .color(dot),
+                );
+        }
         out.push(
             row![
                 Space::with_width(Length::Fixed((depth + 1) as f32 * 12.0 + 8.0)),
-                button(
-                    row![
-                        // 🖧 networked-device glyph stands in for a receiver.
-                        text("\u{1F5A7}").font(ICON_FONT).size(buttons::TEXT_SIZE),
-                        text(r.name.clone()).font(UI_FONT).size(buttons::TEXT_SIZE),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center)
-                )
+                button(content)
                     .on_press(Message::ReceiverSelect(r.id))
                     .padding(buttons::PADDING)
                     .style(buttons::toggle(selected))

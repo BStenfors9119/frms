@@ -34,20 +34,15 @@ pub struct EditorState {
     /// Last save failure, shown in the header until the next successful save.
     pub save_error: Option<String>,
     pub preview_active: bool,
-    /// HTML preview render state — populated by an async headless render.
-    pub preview_loading: bool,
+    /// Last image-open failure, shown in the image preview instead of the image.
     pub preview_error:   Option<String>,
-    /// The rendered preview currently on screen: an open image file's bytes, or
-    /// the screenshot an HTML render produced.
+    /// An open image file's decoded bytes, ready to draw.
     ///
-    /// Held as a `Handle` rather than a `Vec<u8>` so it is built exactly once —
-    /// at open, or when a render lands. `Handle::from_bytes` stamps a fresh
-    /// `Id::unique()` on every call, so building it per-frame in `view()` would
-    /// defeat the renderer's texture cache and re-decode plus re-upload the
-    /// image on every redraw.
+    /// Held as a `Handle` rather than a `Vec<u8>` so it is built exactly once, at
+    /// open. `Handle::from_bytes` stamps a fresh `Id::unique()` on every call, so
+    /// building it per-frame in `view()` would defeat the renderer's texture
+    /// cache and re-decode plus re-upload the image on every redraw.
     pub preview_handle: Option<iced::widget::image::Handle>,
-    /// Path `preview_handle` was built for (used to detect staleness).
-    pub preview_image_path: Option<PathBuf>,
 }
 
 impl EditorState {
@@ -58,10 +53,8 @@ impl EditorState {
             dirty: false,
             save_error: None,
             preview_active: false,
-            preview_loading: false,
             preview_error:   None,
             preview_handle:  None,
-            preview_image_path: None,
         }
     }
 
@@ -69,10 +62,8 @@ impl EditorState {
         self.dirty = false;
         self.save_error = None;
         // Opening a different file invalidates any cached preview.
-        self.preview_handle     = None;
-        self.preview_image_path = None;
-        self.preview_error      = None;
-        self.preview_loading    = false;
+        self.preview_handle = None;
+        self.preview_error  = None;
 
         if is_image_path(&path) {
             // Images have no text buffer — `read_to_string` on a PNG would only
@@ -84,7 +75,6 @@ impl EditorState {
             match fs::read(&path) {
                 Ok(bytes) => {
                     self.preview_handle = Some(iced::widget::image::Handle::from_bytes(bytes));
-                    self.preview_image_path = Some(path.clone());
                 }
                 Err(err) => self.preview_error = Some(err.to_string()),
             }

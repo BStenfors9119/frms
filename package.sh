@@ -13,6 +13,8 @@
 #                                     before building, so the artifacts + GitHub
 #                                     tag use the new number
 #   ./package.sh <fmt> --skip-build   reuse an already-built binary
+#   ./package.sh rpm --deploy          scp the .rpm to the self-hosted DNF repo
+#                                     (10.24.3.9) and auto-regen repodata
 #   ./package.sh rpm --publish        also publish the built artifacts to a
 #                                     GitHub Release (the Fedora .rpm + Windows
 #                                     .zip download channel)
@@ -39,11 +41,13 @@ FMT="${1:-}"
 shift || true
 SKIP_BUILD=0
 PUBLISH=0
+DEPLOY=0
 BUMP=""
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
         --publish)    PUBLISH=1 ;;
+        --deploy)     DEPLOY=1 ;;
         --bump=*)     BUMP="${arg#--bump=}" ;;
         *) echo "unknown option: $arg"; exit 1 ;;
     esac
@@ -379,16 +383,51 @@ publish_github() {
             --notes "frms $VERSION (amd64 / x86_64).
 
 * Fedora: install the .rpm with \`sudo dnf install ./<file>.rpm\`.
-* Windows: unzip and run \`_scripts\\install-frms.ps1\`.
+* Windows: \`winget install SodaPopSystems.frms\` — or unzip and run \`_scripts\\install-frms.ps1\`.
 * Debian/Ubuntu/Mint: add the SodaPop apt repo, or grab the .deb (see README)."
     fi
     echo "  → $(gh release view "$tag" --json url -q .url 2>/dev/null || echo "$tag")"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Deploy the built .rpm to the self-hosted DNF repo on the Fraiser box.
+# Reads credentials from ~/dev/sp/.env (FRAISER_UNAME / FRAISER_PWD).
+deploy_dnf() {
+    local env_file="$SCRIPT_DIR/../sp/.env"
+    if [ ! -f "$env_file" ]; then
+        env_file="$HOME/dev/sp/.env"
+    fi
+    [ -f "$env_file" ] || { echo "  ✗ credentials file not found ($env_file)."; return 1; }
+    source "$env_file"
+    local user="${FRAISER_UNAME:?FRAISER_UNAME not set in $env_file}"
+    local pass="${FRAISER_PWD:?FRAISER_PWD not set in $env_file}"
+    local server="${DNF_SERVER:-10.24.3.9}"
+    local remote_dir="${DNF_REPO_PATH:-/home/spuser/containers/dnf-repo/data/frms}"
+
+    local rpm; rpm="$(ls -t "$DIST/latest"/frms_*_amd64.rpm 2>/dev/null | head -1)"
+    [ -n "$rpm" ] || { echo "  ✗ no .rpm in dist/latest/ — build first."; return 1; }
+
+    command -v sshpass >/dev/null 2>&1 || {
+        echo "  ✗ sshpass not found.  Install:  sudo dnf install -y sshpass"; return 1; }
+
+    echo "── Deploying $(basename "$rpm") → $server:$remote_dir ────"
+    local rpmname; rpmname="$(basename "$rpm")"
+    sshpass -p "$pass" scp -o StrictHostKeyChecking=accept-new "$rpm" \
+        "$user@$server:/tmp/$rpmname"
+    sshpass -p "$pass" ssh -o StrictHostKeyChecking=accept-new "$user@$server" \
+        "echo '${pass}' | sudo -S sh -c 'cp /tmp/$rpmname $remote_dir/ && \
+         chown spuser:spuser $remote_dir/$rpmname && \
+         rm /tmp/$rpmname && \
+         sudo -u spuser createrepo_c --update $remote_dir'"
+    echo "  ✓ uploaded + repodata updated"
+    echo "  repo: http://$server:8090/frms/"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 [ "$need_rpm" = 1 ] && build_rpm
 [ "$need_exe" = 1 ] && build_exe
 
+[ "$DEPLOY"  = 1 ] && deploy_dnf
 [ "$PUBLISH" = 1 ] && publish_github
 
 echo

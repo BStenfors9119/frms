@@ -3,11 +3,11 @@ use iced::{Alignment, Element, Font, Length};
 use iced::widget::{button, column, row, scrollable, text, text_input, Space};
 
 use crate::app::Message;
-use crate::fonts::{ICON_FONT, UI_FONT};
+use crate::fonts::{ICON_FONT, RESET_FONT, UI_FONT};
 use crate::file_browser::{DirEdit, Entry, FileBrowserState};
 use crate::ui::buttons;
 
-pub fn view(state: &FileBrowserState, submodule_color: iced::Color) -> Element<'_, Message> {
+pub fn view(state: &FileBrowserState, accent_tint: iced::Color) -> Element<'_, Message> {
     let full_path = state.current_dir.display().to_string();
 
     // Big, bold name of the current directory (just its final component;
@@ -27,6 +27,13 @@ pub fn view(state: &FileBrowserState, submodule_color: iced::Color) -> Element<'
         .padding([2, 6])
         .style(buttons::secondary);
 
+    // ↻ re-reads the current directory. The glyph lives in RESET_FONT —
+    // ICON_FONT (Noto Sans Symbols 2) has no Arrows block, so it would tofu.
+    let refresh_btn = button(text("\u{21BB}").font(RESET_FONT).size(13))
+        .on_press(Message::FileBrowserRefresh)
+        .padding([2, 6])
+        .style(buttons::secondary);
+
     // ◀ collapses the file-browser pane, reclaiming its width for the editor.
     let collapse_btn = button(text("◀").font(ICON_FONT).size(13))
         .on_press(Message::FileBrowserToggleCollapsed)
@@ -36,6 +43,7 @@ pub fn view(state: &FileBrowserState, submodule_color: iced::Color) -> Element<'
     let heading_row = row![
         dir_heading,
         Space::with_width(Length::Fill),
+        crate::ui::with_tip(refresh_btn, "Refresh directory listing"),
         new_folder_btn,
         crate::ui::with_tip(collapse_btn, "Hide the file explorer (Ctrl+Shift+E)"),
     ]
@@ -102,7 +110,7 @@ pub fn view(state: &FileBrowserState, submodule_color: iced::Color) -> Element<'
             _ => {}
         }
 
-        list = list.push(entry_row(entry, submodule_color));
+        list = list.push(entry_row(entry, accent_tint));
     }
 
     let mut body = column![heading_row, dir_label].spacing(4);
@@ -125,7 +133,7 @@ pub fn view(state: &FileBrowserState, submodule_color: iced::Color) -> Element<'
 
 /// One listing row. Directories get inline ✎ rename and ✕ delete buttons
 /// after the navigation button; files are just the open button.
-fn entry_row(entry: &Entry, submodule_color: iced::Color) -> Element<'static, Message> {
+fn entry_row(entry: &Entry, accent_tint: iced::Color) -> Element<'static, Message> {
     // Submodules get a double-chevron so they read as a nested project even at
     // a glance; other folders keep the plain "> " chevron. (Stick to Latin-1 —
     // the label's Liberation Sans is Latin-only and tofus anything beyond it.)
@@ -144,7 +152,7 @@ fn entry_row(entry: &Entry, submodule_color: iced::Color) -> Element<'static, Me
     let main = button(text(label).size(buttons::TEXT_SIZE))
         .on_press(msg)
         .padding(buttons::PADDING)
-        .style(buttons::file_row(entry.is_submodule.then_some(submodule_color)))
+        .style(buttons::file_row(entry.is_submodule.then_some(accent_tint)))
         .width(Length::Fill);
 
     // 📋 puts this entry's full path on the clipboard.

@@ -154,3 +154,14 @@ pub mod window {
         <Sys as Window>::configure(settings)
     }
 }
+
+/// Desktop notifications. Neutral wrapper over the OS impl.
+pub mod notify {
+    use super::api::Notify;
+    use super::imp::Sys;
+
+    /// Raise a best-effort desktop notification (see [`Notify`](super::api::Notify)).
+    pub fn send(summary: &str, body: &str) {
+        <Sys as Notify>::send(summary, body)
+    }
+}

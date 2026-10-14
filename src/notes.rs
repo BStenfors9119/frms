@@ -83,6 +83,19 @@ pub struct Note {
     /// User-assigned category within the project (e.g. a submodule name), used
     /// to group the notes list. `None`/empty = uncategorized.
     pub category: Option<String>,
+    /// The id of the BookStack page this note is tied to, if the optional sync
+    /// ([`crate::bookstack`]) has run. `None` until then; a note that already has
+    /// one is reconciled with that page instead of creating a duplicate.
+    pub bookstack_page_id: Option<u64>,
+    /// The page's `updated_at`, and a [`crate::bookstack::content_hash`] of the
+    /// note's title+body, both recorded at the last successful sync. Together
+    /// they let the two-way sync tell which side changed: the page moved remotely
+    /// when its current `updated_at` differs from `bookstack_synced_at`, and the
+    /// note changed locally when its current hash differs from
+    /// `bookstack_synced_hash`. `None` until the note has synced (or for notes
+    /// pushed by the earlier one-way sync).
+    pub bookstack_synced_at:   Option<String>,
+    pub bookstack_synced_hash: Option<u64>,
 }
 
 impl Note {
@@ -128,6 +141,28 @@ pub struct NotesState {
     /// key for the uncategorized ("General") group. Persisted in `notes.json`
     /// so the list reopens the way the user left it.
     pub collapsed_categories: Vec<String>,
+    /// True while a BookStack sync ([`crate::bookstack`]) is in flight, so the
+    /// Notes tab can show progress and refuse a second concurrent run.
+    /// Transient — not persisted.
+    pub bookstack_syncing: bool,
+    /// Last BookStack sync result line (success summary or error), shown under
+    /// the notes list. Transient — cleared on relaunch.
+    pub bookstack_status:  Option<String>,
+    /// Notes that changed on both sides in the last sync, awaiting the user's
+    /// choice ([`crate::bookstack::Conflict`]). Transient — a re-sync regenerates
+    /// them, so there is no point persisting the (possibly stale) remote text.
+    pub bookstack_conflicts: Vec<crate::bookstack::Conflict>,
+    /// The note id whose conflict diff is open in the editor pane, if any.
+    /// Transient.
+    pub bookstack_conflict_open: Option<u64>,
+    /// BookStack pages that no note points at, offered for the user to import as
+    /// new notes rather than created automatically — so a sync never silently
+    /// floods the list. Transient (re-generated each sync).
+    pub bookstack_pending_imports: Vec<crate::bookstack::PulledNote>,
+    /// BookStack page ids the user dismissed from the import list. Persisted, and
+    /// fed back into the sync so a dismissed page isn't offered again. (Clearing
+    /// notes.json, or re-importing, is the way back.)
+    pub bookstack_declined_pages: Vec<u64>,
     next_id:             u64,
     /// Where `save()` writes. The real `notes.json` path in the running app;
     /// `None` in unit tests so mutating tests never touch the user's real file.
@@ -136,7 +171,7 @@ pub struct NotesState {
 
 impl NotesState {
     pub fn load() -> Self {
-        let (notes, collapsed_categories) = read_from_disk().unwrap_or_default();
+        let (notes, collapsed_categories, declined_pages) = read_from_disk().unwrap_or_default();
         let next_id = notes.iter().map(|n| n.id).max().unwrap_or(0) + 1;
         let selected = notes.first().map(|n| n.id);
         let title_input = selected
@@ -159,6 +194,12 @@ impl NotesState {
             category_input: String::new(),
             search: String::new(),
             collapsed_categories,
+            bookstack_syncing: false,
+            bookstack_status:  None,
+            bookstack_conflicts: Vec::new(),
+            bookstack_conflict_open: None,
+            bookstack_pending_imports: Vec::new(),
+            bookstack_declined_pages: declined_pages,
             next_id,
             persist_path: notes_path(),
         }
@@ -175,10 +216,14 @@ impl NotesState {
             "body":     n.body,
             "project":  n.project,
             "category": n.category,
+            "bookstack_page_id":   n.bookstack_page_id,
+            "bookstack_synced_at": n.bookstack_synced_at,
+            "bookstack_synced_hash": n.bookstack_synced_hash,
         })).collect();
         let doc = json!({
             "notes": v,
             "collapsed_categories": self.collapsed_categories,
+            "bookstack_declined_pages": self.bookstack_declined_pages,
         });
         if let Ok(bytes) = serde_json::to_vec_pretty(&doc) {
             let _ = std::fs::write(&path, bytes);
@@ -206,6 +251,9 @@ impl NotesState {
             body:  String::new(),
             project,
             category,
+            bookstack_page_id: None,
+            bookstack_synced_at: None,
+            bookstack_synced_hash: None,
         });
         self.selected     = Some(id);
         self.title_input  = String::from("Untitled");
@@ -229,6 +277,9 @@ impl NotesState {
             body:  body.to_string(),
             project,
             category: None,
+            bookstack_page_id: None,
+            bookstack_synced_at: None,
+            bookstack_synced_hash: None,
         });
         self.selected     = Some(id);
         self.title_input  = title;
@@ -565,7 +616,224 @@ impl NotesState {
         self.perform(Action::Select(Motion::WordLeft));
     }
 
-    fn flush_buffers(&mut self) {
+    /// Notes to push to BookStack, with each note's project and category
+    /// resolved to the book and chapter names the sync files it under: the
+    /// project's directory basename (or `"Global"`), and the category (or the
+    /// `"General"` label). Call [`NotesState::flush_buffers`] first so the
+    /// in-progress note's edits are included.
+    pub fn notes_for_bookstack(&self) -> Vec<crate::bookstack::NoteForSync> {
+        self.notes.iter().map(|n| crate::bookstack::NoteForSync {
+            id:    n.id,
+            title: if n.title.trim().is_empty() { String::from("Untitled") } else { n.title.clone() },
+            body:  n.body.clone(),
+            project_name: n.project.as_deref().map(project_book_name)
+                .unwrap_or_else(|| crate::bookstack::GLOBAL_BOOK.to_string()),
+            category: n.category.clone().unwrap_or_else(|| UNCATEGORIZED_LABEL.to_string()),
+            page_id:  n.bookstack_page_id,
+            synced_at:   n.bookstack_synced_at.clone(),
+            synced_hash: n.bookstack_synced_hash,
+        }).collect()
+    }
+
+    /// Apply a completed two-way [`crate::bookstack::reconcile`]: record the new
+    /// baselines on pushed notes, overwrite notes with newer remote content, stash
+    /// any conflicts, and hold pages authored in BookStack as pending imports for
+    /// the user to review (rather than creating them automatically). Returns the
+    /// status line.
+    pub fn apply_reconcile(&mut self, out: crate::bookstack::Outcome) -> String {
+        let mut summary = out.summary();
+
+        // Pushed notes: record the post-sync baseline so the next run sees them
+        // as in sync.
+        for r in &out.synced {
+            if let Some(n) = self.notes.iter_mut().find(|n| n.id == r.note_id) {
+                n.bookstack_page_id     = Some(r.page_id);
+                n.bookstack_synced_at   = Some(r.synced_at.clone());
+                n.bookstack_synced_hash = Some(r.synced_hash);
+            }
+        }
+
+        // Pulled updates: newer remote content wins over the (unchanged) local
+        // note. Refresh the live buffers if the note is on screen.
+        for u in &out.remote_updates {
+            if let Some(n) = self.notes.iter_mut().find(|n| n.id == u.note_id) {
+                n.title    = u.title.clone();
+                n.body     = u.body.clone();
+                n.category = category_from_chapter(&u.category);
+                n.bookstack_synced_at   = Some(u.synced_at.clone());
+                n.bookstack_synced_hash = Some(u.synced_hash);
+            }
+            if self.selected == Some(u.note_id) {
+                self.title_input  = u.title.clone();
+                self.body_content = text_editor::Content::with_text(&u.body);
+            }
+        }
+
+        // Pages authored in BookStack are *offered*, not auto-created — a sync
+        // must never silently flood the list. They wait in the import list until
+        // the user imports or dismisses each one.
+        self.bookstack_pending_imports = out.new_notes;
+        if !self.bookstack_pending_imports.is_empty() {
+            summary.push_str(&format!(
+                ", {} new page(s) to import", self.bookstack_pending_imports.len()));
+        }
+
+        self.bookstack_conflicts = out.conflicts;
+        self.save();
+        summary
+    }
+
+    /// The page ids the user has dismissed, in the form the sync consumes so a
+    /// dismissed page is never offered again.
+    pub fn bookstack_declined(&self) -> std::collections::HashSet<u64> {
+        self.bookstack_declined_pages.iter().copied().collect()
+    }
+
+    /// Import one pending BookStack page as a new note, pinned under `project`
+    /// when its book maps to one. Removes it from the pending list.
+    pub fn import_pending(&mut self, page_id: u64, project: Option<&str>) {
+        let Some(pos) = self.bookstack_pending_imports.iter().position(|p| p.page_id == page_id)
+        else { return; };
+        let p = self.bookstack_pending_imports.remove(pos);
+        self.create_from_pulled(&p, project);
+        self.save();
+    }
+
+    /// Import every pending BookStack page as a new note.
+    pub fn import_all_pending(&mut self, project: Option<&str>) {
+        let pending = std::mem::take(&mut self.bookstack_pending_imports);
+        if pending.is_empty() { return; }
+        for p in &pending {
+            self.create_from_pulled(p, project);
+        }
+        self.save();
+    }
+
+    /// Dismiss one pending BookStack page: drop it from the list and remember not
+    /// to offer it again.
+    pub fn dismiss_pending(&mut self, page_id: u64) {
+        self.bookstack_pending_imports.retain(|p| p.page_id != page_id);
+        if !self.bookstack_declined_pages.contains(&page_id) {
+            self.bookstack_declined_pages.push(page_id);
+        }
+        self.save();
+    }
+
+    /// Dismiss every pending BookStack page at once.
+    pub fn dismiss_all_pending(&mut self) {
+        let pending = std::mem::take(&mut self.bookstack_pending_imports);
+        for p in pending {
+            if !self.bookstack_declined_pages.contains(&p.page_id) {
+                self.bookstack_declined_pages.push(p.page_id);
+            }
+        }
+        self.save();
+    }
+
+    /// Turn a pulled BookStack page into a new local note, mapping its book name
+    /// back to a project path (via the projects the current notes use, plus the
+    /// active `project`) and its chapter back to a category.
+    fn create_from_pulled(&mut self, p: &crate::bookstack::PulledNote, project: Option<&str>) {
+        let note_project = if p.project_name == crate::bookstack::GLOBAL_BOOK {
+            None
+        } else {
+            self.book_to_project_map(project).get(&p.project_name).cloned()
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        self.notes.push(Note {
+            id,
+            title: p.title.clone(),
+            body:  p.body.clone(),
+            project: note_project,
+            category: category_from_chapter(&p.category),
+            bookstack_page_id:     Some(p.page_id),
+            bookstack_synced_at:   Some(p.synced_at.clone()),
+            bookstack_synced_hash: Some(p.synced_hash),
+        });
+    }
+
+    /// Reverse map of BookStack book name → full project path, drawn from the
+    /// projects the current notes are pinned to (plus the active project), so a
+    /// pulled page is filed under the right project.
+    fn book_to_project_map(&self, project: Option<&str>) -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        for n in &self.notes {
+            if let Some(p) = &n.project {
+                map.entry(project_book_name(p)).or_insert_with(|| p.clone());
+            }
+        }
+        if let Some(p) = project {
+            map.entry(project_book_name(p)).or_insert_with(|| p.to_string());
+        }
+        map
+    }
+
+    /// The conflict currently open in the editor pane, if any.
+    pub fn open_conflict(&self) -> Option<&crate::bookstack::Conflict> {
+        let id = self.bookstack_conflict_open?;
+        self.bookstack_conflicts.iter().find(|c| c.note_id == id)
+    }
+
+    /// Open a conflict's diff view in the editor pane.
+    pub fn show_conflict(&mut self, note_id: u64) {
+        self.bookstack_conflict_open = Some(note_id);
+    }
+
+    /// Close the conflict diff view, returning to the normal editor.
+    pub fn close_conflict(&mut self) {
+        self.bookstack_conflict_open = None;
+    }
+
+    /// Resolve a conflict by keeping the BookStack version: overwrite the local
+    /// note with the remote content and baseline it, so the next sync sees both
+    /// sides in agreement.
+    pub fn resolve_conflict_use_remote(&mut self, note_id: u64) {
+        let Some(c) = self.bookstack_conflicts.iter().find(|c| c.note_id == note_id).cloned() else {
+            return;
+        };
+        let hash = crate::bookstack::content_hash(&c.remote_title, &c.remote_body);
+        if let Some(n) = self.notes.iter_mut().find(|n| n.id == note_id) {
+            n.title    = c.remote_title.clone();
+            n.body     = c.remote_body.clone();
+            n.category = category_from_chapter(&c.remote_category);
+            n.bookstack_synced_at   = Some(c.remote_synced_at.clone());
+            n.bookstack_synced_hash = Some(hash);
+        }
+        if self.selected == Some(note_id) {
+            self.title_input  = c.remote_title.clone();
+            self.body_content = text_editor::Content::with_text(&c.remote_body);
+        }
+        self.clear_conflict(note_id);
+    }
+
+    /// Resolve a conflict by keeping the local version: leave the note untouched
+    /// but mark the remote side as "seen" (baseline its `updated_at` and drop the
+    /// content hash), so the next sync no longer reports a remote change and
+    /// pushes the local note up instead.
+    pub fn resolve_conflict_keep_local(&mut self, note_id: u64) {
+        let Some(c) = self.bookstack_conflicts.iter().find(|c| c.note_id == note_id).cloned() else {
+            return;
+        };
+        if let Some(n) = self.notes.iter_mut().find(|n| n.id == note_id) {
+            n.bookstack_synced_at   = Some(c.remote_synced_at.clone());
+            // Clearing the hash forces "local changed" next sync, so the local
+            // note is pushed up to overwrite the remote page.
+            n.bookstack_synced_hash = None;
+        }
+        self.clear_conflict(note_id);
+    }
+
+    /// Drop a resolved conflict from the pending list and close its view if open.
+    fn clear_conflict(&mut self, note_id: u64) {
+        self.bookstack_conflicts.retain(|c| c.note_id != note_id);
+        if self.bookstack_conflict_open == Some(note_id) {
+            self.bookstack_conflict_open = None;
+        }
+        self.save();
+    }
+
+    pub fn flush_buffers(&mut self) {
         if let Some(id) = self.selected {
             let title = self.title_input.clone();
             let body  = self.body_content.text();
@@ -597,6 +865,12 @@ mod tests {
             category_input:  String::new(),
             search:       String::new(),
             collapsed_categories: Vec::new(),
+            bookstack_syncing: false,
+            bookstack_status:  None,
+            bookstack_conflicts: Vec::new(),
+            bookstack_conflict_open: None,
+            bookstack_pending_imports: Vec::new(),
+            bookstack_declined_pages: Vec::new(),
             next_id:      1,
             // None → save() is a no-op, so mutating tests never write to the
             // user's real ~/.frms/notes.json.
@@ -695,8 +969,8 @@ mod tests {
 
     #[test]
     fn note_visibility_scopes_to_project() {
-        let global = Note { id: 1, title: "g".into(), body: String::new(), project: None, category: None };
-        let pinned = Note { id: 2, title: "p".into(), body: String::new(), project: Some("/a".into()), category: None };
+        let global = Note { id: 1, title: "g".into(), body: String::new(), project: None, category: None, bookstack_page_id: None, bookstack_synced_at: None, bookstack_synced_hash: None };
+        let pinned = Note { id: 2, title: "p".into(), body: String::new(), project: Some("/a".into()), category: None, bookstack_page_id: None, bookstack_synced_at: None, bookstack_synced_hash: None };
         // Global notes show everywhere; pinned ones only in their project.
         assert!(global.visible_in(Some("/a")));
         assert!(global.visible_in(None));
@@ -712,6 +986,9 @@ mod tests {
             body: String::new(),
             project: project.map(String::from),
             category: category.map(String::from),
+            bookstack_page_id: None,
+            bookstack_synced_at: None,
+            bookstack_synced_hash: None,
         }
     }
 
@@ -722,6 +999,9 @@ mod tests {
             body: body.to_string(),
             project: None,
             category: None,
+            bookstack_page_id: None,
+            bookstack_synced_at: None,
+            bookstack_synced_hash: None,
         }
     }
 
@@ -856,6 +1136,165 @@ mod tests {
         s.apply_format(NoteFormat::Quote);
         assert_eq!(s.body_content.text().trim_end(), "> one\n> two");
     }
+
+    #[test]
+    fn category_from_chapter_maps_general_to_uncategorized() {
+        assert_eq!(category_from_chapter("General"), None);
+        assert_eq!(category_from_chapter("   "), None);
+        assert_eq!(category_from_chapter("core"), Some("core".to_string()));
+    }
+
+    #[test]
+    fn apply_reconcile_records_baseline_on_pushed_notes() {
+        use crate::bookstack::{Outcome, SyncedRef};
+        let mut s = state_with_body("");
+        s.notes = vec![note_with_text(1, "t", "b")];
+        let out = Outcome {
+            created: 1,
+            synced: vec![SyncedRef { note_id: 1, page_id: 42, synced_at: "T1".into(), synced_hash: 99 }],
+            ..Default::default()
+        };
+        s.apply_reconcile(out);
+        let n = &s.notes[0];
+        assert_eq!(n.bookstack_page_id, Some(42));
+        assert_eq!(n.bookstack_synced_at.as_deref(), Some("T1"));
+        assert_eq!(n.bookstack_synced_hash, Some(99));
+    }
+
+    #[test]
+    fn apply_reconcile_overwrites_note_with_remote_update() {
+        use crate::bookstack::{Outcome, RemoteUpdate};
+        let mut s = state_with_body("");
+        s.notes = vec![note_with_category(1, Some("/a"), None)];
+        let out = Outcome {
+            pulled_updated: 1,
+            remote_updates: vec![RemoteUpdate {
+                note_id: 1, title: "New".into(), body: "fresh".into(),
+                category: "core".into(), synced_at: "T2".into(), synced_hash: 7,
+            }],
+            ..Default::default()
+        };
+        s.apply_reconcile(out);
+        let n = &s.notes[0];
+        assert_eq!(n.title, "New");
+        assert_eq!(n.body, "fresh");
+        assert_eq!(n.category.as_deref(), Some("core"));
+        assert_eq!(n.bookstack_synced_at.as_deref(), Some("T2"));
+    }
+
+    /// Pages authored in BookStack are held for review, not auto-created, and
+    /// importing one files it under the project whose basename matches its book.
+    #[test]
+    fn remote_pages_are_staged_then_imported() {
+        use crate::bookstack::{Outcome, PulledNote};
+        let mut s = state_with_body("");
+        s.next_id = 5;
+        let out = Outcome {
+            pulled_new: 1,
+            new_notes: vec![PulledNote {
+                page_id: 88, title: "Away note".into(), body: "wrote on phone".into(),
+                project_name: "frms".into(), category: "General".into(),
+                synced_at: "T3".into(), synced_hash: 3,
+            }],
+            ..Default::default()
+        };
+        s.apply_reconcile(out);
+        // Nothing created yet — it waits in the import list.
+        assert!(s.notes.is_empty());
+        assert_eq!(s.bookstack_pending_imports.len(), 1);
+
+        s.import_pending(88, Some("/home/me/dev/frms"));
+        assert!(s.bookstack_pending_imports.is_empty());
+        let n = s.notes.iter().find(|n| n.bookstack_page_id == Some(88)).unwrap();
+        assert_eq!(n.title, "Away note");
+        assert_eq!(n.project.as_deref(), Some("/home/me/dev/frms"));
+        assert_eq!(n.category, None); // "General" → uncategorized
+    }
+
+    /// A global page (book "Global") imports as a global note.
+    #[test]
+    fn imported_global_page_becomes_a_global_note() {
+        use crate::bookstack::{Outcome, PulledNote};
+        let mut s = state_with_body("");
+        let out = Outcome {
+            new_notes: vec![PulledNote {
+                page_id: 90, title: "g".into(), body: String::new(),
+                project_name: crate::bookstack::GLOBAL_BOOK.into(), category: "General".into(),
+                synced_at: "T".into(), synced_hash: 1,
+            }],
+            ..Default::default()
+        };
+        s.apply_reconcile(out);
+        s.import_all_pending(Some("/home/me/dev/frms"));
+        let n = s.notes.iter().find(|n| n.bookstack_page_id == Some(90)).unwrap();
+        assert_eq!(n.project, None);
+    }
+
+    /// Dismissing a pending page drops it and records it as declined so the sync
+    /// won't offer it again.
+    #[test]
+    fn dismissing_a_pending_page_declines_it() {
+        use crate::bookstack::{Outcome, PulledNote};
+        let mut s = state_with_body("");
+        let out = Outcome {
+            new_notes: vec![PulledNote {
+                page_id: 42, title: "orphan".into(), body: String::new(),
+                project_name: crate::bookstack::GLOBAL_BOOK.into(), category: "General".into(),
+                synced_at: "T".into(), synced_hash: 1,
+            }],
+            ..Default::default()
+        };
+        s.apply_reconcile(out);
+        s.dismiss_pending(42);
+        assert!(s.bookstack_pending_imports.is_empty());
+        assert!(s.notes.is_empty());
+        assert!(s.bookstack_declined().contains(&42));
+    }
+
+    #[test]
+    fn resolve_conflict_use_remote_overwrites_and_clears() {
+        use crate::bookstack::Conflict;
+        let mut s = state_with_body("");
+        s.notes = vec![note_with_text(1, "mine", "local")];
+        s.bookstack_conflicts = vec![Conflict {
+            note_id: 1,
+            local_title: "mine".into(), local_body: "local".into(),
+            remote_title: "theirs".into(), remote_body: "remote".into(),
+            remote_category: "General".into(), remote_synced_at: "T9".into(),
+        }];
+        s.resolve_conflict_use_remote(1);
+        assert!(s.bookstack_conflicts.is_empty());
+        let n = &s.notes[0];
+        assert_eq!(n.title, "theirs");
+        assert_eq!(n.body, "remote");
+        assert_eq!(n.bookstack_synced_at.as_deref(), Some("T9"));
+        // Baseline hash matches the adopted remote content, so the next sync
+        // sees no local change.
+        assert_eq!(n.bookstack_synced_hash, Some(crate::bookstack::content_hash("theirs", "remote")));
+    }
+
+    #[test]
+    fn resolve_conflict_keep_local_marks_remote_seen_and_forces_push() {
+        use crate::bookstack::Conflict;
+        let mut s = state_with_body("");
+        s.notes = vec![note_with_text(1, "mine", "local")];
+        s.bookstack_conflicts = vec![Conflict {
+            note_id: 1,
+            local_title: "mine".into(), local_body: "local".into(),
+            remote_title: "theirs".into(), remote_body: "remote".into(),
+            remote_category: "General".into(), remote_synced_at: "T9".into(),
+        }];
+        s.resolve_conflict_keep_local(1);
+        assert!(s.bookstack_conflicts.is_empty());
+        let n = &s.notes[0];
+        // Local content is untouched…
+        assert_eq!(n.title, "mine");
+        assert_eq!(n.body, "local");
+        // …the remote side is marked seen, and the hash is cleared so the next
+        // sync counts the note as locally changed and pushes it.
+        assert_eq!(n.bookstack_synced_at.as_deref(), Some("T9"));
+        assert_eq!(n.bookstack_synced_hash, None);
+    }
 }
 
 /// Strip one indent step from the front of `line` — a single leading tab, or
@@ -890,7 +1329,32 @@ fn notes_path() -> Option<PathBuf> {
     Some(crate::port::dirs::config()?.join("notes.json"))
 }
 
-fn read_from_disk() -> Option<(Vec<Note>, Vec<String>)> {
+/// The BookStack book name for a project-pinned note: the working directory's
+/// basename (e.g. `/home/me/dev/frms` → `frms`), which reads far better as a
+/// book title than the full path. Falls back to the raw string if it has no
+/// final component.
+fn project_book_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// The note category a BookStack chapter name maps back to: the `"General"`
+/// chapter (and any empty name) is our uncategorized bucket, so it becomes
+/// `None`; every other chapter is a named category.
+fn category_from_chapter(chapter: &str) -> Option<String> {
+    let c = chapter.trim();
+    if c.is_empty() || c == UNCATEGORIZED_LABEL {
+        None
+    } else {
+        Some(c.to_string())
+    }
+}
+
+fn read_from_disk() -> Option<(Vec<Note>, Vec<String>, Vec<u64>)> {
     let path  = notes_path()?;
     let bytes = std::fs::read(&path).ok()?;
     let v: Value = serde_json::from_slice(&bytes).ok()?;
@@ -910,6 +1374,13 @@ fn read_from_disk() -> Option<(Vec<Note>, Vec<String>)> {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(String::from),
+                // Missing (never synced, or a pre-sync file) = no page yet.
+                bookstack_page_id: n.get("bookstack_page_id").and_then(Value::as_u64),
+                // Missing (pre-two-way-sync files) = no baseline; the first
+                // reconcile adopts one (see [`crate::bookstack::reconcile`]).
+                bookstack_synced_at: n.get("bookstack_synced_at")
+                    .and_then(|v| v.as_str()).map(String::from),
+                bookstack_synced_hash: n.get("bookstack_synced_hash").and_then(Value::as_u64),
             })
         })
         .collect();
@@ -918,5 +1389,10 @@ fn read_from_disk() -> Option<(Vec<Note>, Vec<String>)> {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    Some((notes, collapsed))
+    // Missing (pre-import-review files) = nothing dismissed.
+    let declined = v.get("bookstack_declined_pages")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    Some((notes, collapsed, declined))
 }

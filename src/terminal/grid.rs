@@ -134,6 +134,13 @@ pub struct Grid {
     /// paste mode, pasted text must be wrapped with `\e[200~` / `\e[201~`
     /// so it isn't interpreted as typed input. Toggled by `CSI ?2004 h/l`.
     pub bracketed_paste: bool,
+    /// DECTCEM (`CSI ?25 h/l`) — whether the terminal cursor is shown. TUIs
+    /// like Claude (Ink-based) hide the real cursor while they repaint, park it
+    /// at the top-left, and draw their own cursor inside their input box; if we
+    /// ignored the hide we'd paint a phantom block at the parked position (the
+    /// top line) even though the program means the cursor to be invisible there.
+    /// Defaults to shown, per the terminal's power-on state.
+    pub cursor_visible: bool,
     /// Containers this terminal's shell has entered, outermost first — pushed
     /// and popped by the OSC 777 notifications in [`Grid::osc_dispatch`].
     /// Empty means the shell is on the host.
@@ -145,6 +152,10 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// A grid at the default 80×24. Panes spawn via [`Grid::with_size`] at the
+    /// real pane size instead (see `terminal::spawn_size`); this stays for tests
+    /// that don't care about dimensions.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::with_size(COLS, ROWS)
     }
@@ -163,6 +174,7 @@ impl Grid {
             cursor_col:    0,
             saved_cursor:  (0, 0),
             bracketed_paste: false,
+            cursor_visible:  true,
             containers:    Vec::new(),
             cur_fg:        DEFAULT_FG,
             cur_bg:        DEFAULT_BG,
@@ -195,7 +207,13 @@ impl Grid {
         }
 
         // Height: spill the top into scrollback when shrinking, pad the bottom
-        // when growing.
+        // when growing. Deliberately *not* pulling rows back out of scrollback
+        // on grow: a full-screen TUI (Claude is Ink-based) repaints on SIGWINCH
+        // by erasing only the lines it laid down itself, not the whole screen,
+        // so any rows we resurrect onto the top would sit there untouched —
+        // stale content behind its logo — until some larger change forced a
+        // clean repaint. Padding blanks at the bottom leaves the TUI free to
+        // redraw into the new size with nothing of ours left over.
         if rows < self.cells.len() {
             let excess = self.cells.len() - rows;
             for _ in 0..excess {
@@ -332,9 +350,13 @@ impl Grid {
         self.scroll_offset = bottom_top.saturating_sub(want_top).min(self.scrollback.len());
     }
 
-    /// Where the cursor sits in viewport coordinates. `None` when scrolled
-    /// far enough that the cursor's row is below the visible window.
+    /// Where the cursor sits in viewport coordinates. `None` when the program
+    /// has hidden the cursor (DECTCEM), or when it's scrolled far enough that
+    /// the cursor's row is below the visible window.
     pub fn cursor_view_pos(&self) -> Option<(usize, usize)> {
+        if !self.cursor_visible {
+            return None;
+        }
         let r = self.scroll_offset + self.cursor_row;
         (r < self.rows).then_some((r, self.cursor_col))
     }
@@ -554,9 +576,17 @@ impl Perform for Grid {
             // IL / DL — insert / delete whole lines at the cursor row.
             'L' => self.insert_lines(Self::p1(params, 1) as usize),
             'M' => self.delete_lines(Self::p1(params, 1) as usize),
-            // DECSC / DECRC via CSI — save / restore the cursor position.
-            's' => self.saved_cursor = (self.cursor_row, self.cursor_col),
-            'u' => {
+            // SCOSC / SCORC — save / restore the cursor position. Only the
+            // bare forms: `CSI ? u` and `CSI < u` are Kitty keyboard-protocol
+            // requests (push/pop/query the keyboard flags), not cursor restores,
+            // and Claude emits them during startup. Matching them here restored
+            // the cursor to wherever `ESC 7` last saved it — (0,0) at launch —
+            // yanking it to the top line and throwing off every relative move
+            // that followed. The `?`/`<`/`>` marker arrives as an intermediate,
+            // so requiring none keeps those sequences out of this arm.
+            's' if intermediates.is_empty() =>
+                self.saved_cursor = (self.cursor_row, self.cursor_col),
+            'u' if intermediates.is_empty() => {
                 self.cursor_row = self.saved_cursor.0.min(self.rows - 1);
                 self.cursor_col = self.saved_cursor.1.min(self.cols - 1);
             }
@@ -600,8 +630,12 @@ impl Perform for Grid {
             'h' | 'l' if intermediates.first() == Some(&b'?') => {
                 let enable = c == 'h';
                 for sub in params.iter() {
-                    if sub.first().copied() == Some(2004) {
-                        self.bracketed_paste = enable;
+                    match sub.first().copied() {
+                        // DECTCEM — cursor visibility.
+                        Some(25)   => self.cursor_visible = enable,
+                        // Bracketed paste.
+                        Some(2004) => self.bracketed_paste = enable,
+                        _ => {}
                     }
                 }
             }
@@ -803,10 +837,60 @@ mod tests {
     }
 
     #[test]
+    fn dectcem_hides_and_shows_the_cursor() {
+        // Power-on default: cursor shown, reported at its position.
+        let mut grid = fed(b"ab");
+        assert!(grid.cursor_visible);
+        assert_eq!(grid.cursor_view_pos(), Some((0, 2)));
+
+        // CSI ?25l hides it — the canvas then paints no cursor block, even
+        // though the program has parked the real cursor somewhere (here, home)
+        // to redraw. This is what stops the phantom block at the top line.
+        let mut parser = Parser::new();
+        for &b in b"\x1b[?25l\x1b[H" {
+            parser.advance(&mut grid, b);
+        }
+        assert!(!grid.cursor_visible);
+        assert_eq!(grid.cursor_view_pos(), None);
+
+        // CSI ?25h shows it again.
+        for &b in b"\x1b[?25h" {
+            parser.advance(&mut grid, b);
+        }
+        assert!(grid.cursor_visible);
+        assert_eq!(grid.cursor_view_pos(), Some((0, 0)));
+    }
+
+    #[test]
     fn cursor_save_restore_roundtrips() {
         // Write "ab", save, move away and scribble, restore, overwrite "X".
         // The 'X' must land where the cursor was saved (column 2).
         let out = render(b"ab\x1b7\x1b[10Gzzz\x1b8X");
         assert_eq!(&out[..3], "abX");
+    }
+
+    #[test]
+    fn kitty_keyboard_queries_dont_restore_the_cursor() {
+        // `ESC 7` saves the cursor at home, then we move it down to row 5. The
+        // Kitty keyboard-protocol sequences Claude emits at startup — `CSI ? u`
+        // (query flags) and `CSI < u` (pop flags) — share the final byte with
+        // SCORC (`CSI u`, restore cursor) but carry a `?`/`<` marker. They must
+        // NOT move the cursor; only the bare `CSI u` restores it. Regression for
+        // the cursor snapping to the top line behind Claude's logo.
+        let mut grid = fed(b"\x1b7\x1b[6;3H"); // save at (0,0); cursor to row 5, col 2
+        assert_eq!((grid.cursor_row, grid.cursor_col), (5, 2));
+
+        let mut parser = Parser::new();
+        for &b in b"\x1b[?u\x1b[<u\x1b[>1u" {
+            parser.advance(&mut grid, b);
+        }
+        assert_eq!((grid.cursor_row, grid.cursor_col), (5, 2),
+            "keyboard-protocol `u` sequences must leave the cursor put");
+
+        // The bare SCORC still restores to the saved home position.
+        for &b in b"\x1b[u" {
+            parser.advance(&mut grid, b);
+        }
+        assert_eq!((grid.cursor_row, grid.cursor_col), (0, 0));
     }
 }

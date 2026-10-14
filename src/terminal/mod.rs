@@ -2,6 +2,7 @@ pub mod grid;
 
 use std::io::{Read, Write};
 use iced::futures::SinkExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -10,6 +11,35 @@ use vte::Parser;
 pub use grid::{Container, Grid, COLS, ROWS};
 
 pub type TerminalId = u64;
+
+/// The most recent on-screen size (cols, rows) a terminal canvas computed from
+/// its pane bounds — see [`spawn_size`]. The canvas records it on every draw
+/// with real bounds; a freshly spawned PTY then opens at this size instead of
+/// the 80×24 default.
+///
+/// Why it matters: a CLI like Claude reads the pty window size (`TIOCGWINSZ`)
+/// the instant it starts and lays its whole UI — logo, input box, cursor —
+/// against it. Spawning at 80×24 and only reconciling to the real (usually
+/// taller) pane on the first post-spawn `draw()` meant Claude painted that first
+/// frame too small and didn't re-lay-out until our resize reached it a few
+/// frames later, so the cursor sat pinned to the top, behind the logo, until it
+/// settled. Opening the pty at the pane's actual size closes that race: the
+/// child reads the right dimensions up front and never paints the cramped frame.
+static LAST_COLS: AtomicUsize = AtomicUsize::new(COLS);
+static LAST_ROWS: AtomicUsize = AtomicUsize::new(ROWS);
+
+/// Record the on-screen size of a terminal pane. Called by the canvas each time
+/// it lays out against real bounds.
+pub fn remember_spawn_size(cols: usize, rows: usize) {
+    LAST_COLS.store(cols.max(1), Ordering::Relaxed);
+    LAST_ROWS.store(rows.max(1), Ordering::Relaxed);
+}
+
+/// The size a freshly spawned pty should open at — the last on-screen terminal
+/// size, or the 80×24 default before any pane has been drawn.
+pub fn spawn_size() -> (usize, usize) {
+    (LAST_COLS.load(Ordering::Relaxed), LAST_ROWS.load(Ordering::Relaxed))
+}
 
 /// How long a question menu must stay off the screen before the attention
 /// flag drops. Long enough to outlast a CLI's repaint (which briefly erases
@@ -274,9 +304,13 @@ impl TerminalPane {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let pty_system = native_pty_system();
 
+        // Open the pty at the last on-screen pane size, not the 80×24 default,
+        // so the child (e.g. Claude) reads realistic dimensions at startup and
+        // lays its UI out correctly on the very first frame. See [`spawn_size`].
+        let (cols, rows) = spawn_size();
         let pair = pty_system.openpty(PtySize {
-            rows: ROWS as u16,
-            cols: COLS as u16,
+            rows: rows as u16,
+            cols: cols as u16,
             pixel_width: 0,
             pixel_height: 0,
         })?;
@@ -310,7 +344,7 @@ impl TerminalPane {
         Ok(Self {
             id,
             name:      None,
-            grid:      Arc::new(Mutex::new(Grid::new())),
+            grid:      Arc::new(Mutex::new(Grid::with_size(cols, rows))),
             selection: None,
             find:      None,
             waiting_on_user: false,

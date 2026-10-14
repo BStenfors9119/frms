@@ -138,3 +138,16 @@ pub trait Window {
     /// `.desktop` launcher; a no-op on other platforms.
     fn configure(settings: &mut iced::window::Settings);
 }
+
+/// Desktop notifications — the OS toast/banner frms raises when an agent needs
+/// the user's attention while frms isn't the focused window.
+///
+/// Like the clipboard and networking seams, this shells out rather than linking
+/// a notification library: `notify-send` (libnotify) on unix. It is best-effort
+/// and fire-and-forget — a missing backend is silently a no-op, never an error
+/// the caller has to handle.
+pub trait Notify {
+    /// Raise a notification titled `summary` with detail `body`. Returns
+    /// immediately; the delivery happens off the UI thread.
+    fn send(summary: &str, body: &str);
+}

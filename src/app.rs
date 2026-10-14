@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use iced::widget::{column, container, image, pane_grid, scrollable, text_editor, text_input};
+use iced::widget::{column, container, pane_grid, scrollable, text_editor, text_input};
 use iced::widget::pane_grid::Configuration;
 use iced::{Element, Length, Subscription, Task, Theme, window};
 use iced::keyboard::{self, key};
@@ -152,9 +152,10 @@ pub struct UsageBreakdown {
     pub data:   Option<crate::stats::ModelBreakdown>,
 }
 
-/// State of the "Change model" dialog — retarget one or many of a project's
-/// running AI sessions at a different model without closing and recreating
-/// them. Opened from the agent strip's "Model" button (or Ctrl+Shift+M).
+/// State of the Agents dialog — start a named AI session, and retarget one or
+/// many of a project's running ones at a different model without closing and
+/// recreating them. Opened from the agent strip's "Agents" button (or
+/// Ctrl+Shift+M).
 pub struct AgentsDialog {
     /// Session whose agent panes are being retargeted, captured when the
     /// dialog opened so switching projects behind it can't move the goalposts.
@@ -165,6 +166,10 @@ pub struct AgentsDialog {
     /// The model the user picked, with the tool whose list it came from.
     /// `None` until they choose one — Apply stays disabled meanwhile.
     pub choice:     Option<(crate::agent::AiTool, crate::agent::ToolModel)>,
+    /// Which tool's models the MODEL list is currently showing. Only the view
+    /// tab — the actual pick lives in `choice`, which carries its own tool, so
+    /// switching tabs never disturbs a selection. Starts on the default tool.
+    pub model_tool: crate::agent::AiTool,
     /// Result of the last Apply, shown in the dialog: how many panes switched
     /// in place, how many were restarted, and how many were skipped.
     pub outcome:    Option<ModelChangeOutcome>,
@@ -172,6 +177,17 @@ pub struct AgentsDialog {
     /// ends a running CLI, so it asks first — inline in the row rather than as
     /// a second overlay stacked on this one.
     pub confirming: Option<TerminalId>,
+    /// Name for the agent about to be started, typed in the NEW row. Naming a
+    /// session up front beats starting it as "Build 3" and renaming it after,
+    /// which is the only way a name could be set before. Blank keeps the
+    /// positional label. Cleared once an agent is created.
+    pub name:       String,
+    /// A model requery ([`crate::models`]) is in flight — the Refresh button is
+    /// disabled and reads "Refreshing…" until [`Message::ModelsRefreshed`] lands.
+    pub refreshing: bool,
+    /// Result of the last requery, shown under the MODEL header ("Loaded N Claude
+    /// models" or a short failure reason). `None` until one has been attempted.
+    pub models_status: Option<String>,
 }
 
 /// Tally of what an Apply actually did, per delivery method.
@@ -219,6 +235,11 @@ pub struct Frms {
     /// while that stop is the current focus so the next cycle steps off it.
     pub pane_focus_toolbox:      bool,
     pub split_view:              Option<SplitView>,
+    /// Whether the frms window currently has OS focus. Updated from the
+    /// window-event listener; starts `true` because the window comes up
+    /// focused. Gates background notifications — an agent that finishes while
+    /// this is `true` and its pane is on screen needs no toast.
+    pub window_focused:          bool,
     /// `Some` while the receiver file-copy picker overlay is on screen.
     pub file_picker:             Option<FilePicker>,
     /// `Some` while the close-confirmation dialog is on screen.
@@ -230,6 +251,10 @@ pub struct Frms {
     pub renaming_session:        Option<(usize, String)>,
     /// Inline rename for a Claude terminal tab — `(terminal_id, draft)`.
     pub renaming_claude:         Option<(TerminalId, String)>,
+    /// A Profile-tab color picker's hex field while it holds text that isn't a
+    /// complete color yet, tagged with which picker. `None` shows each
+    /// picker's current color.
+    pub color_draft:             Option<(crate::prefs::PickedColor, String)>,
     /// `true` while the "+ Agent" button's dropdown menu is open.
     /// `true` while the agent-tab strip is wider than the space it has, i.e.
     /// while a horizontal scrollbar is actually drawn over it. The strip only
@@ -374,6 +399,8 @@ pub enum Message {
     OpenFile(PathBuf),
     /// Copy the file browser's current directory path to the clipboard.
     CopyPath(String),
+    /// Re-read the current directory in the file browser.
+    FileBrowserRefresh,
     /// Hide/show the active session's file-browser pane.
     FileBrowserToggleCollapsed,
     /// Begin an inline create/rename/delete on a directory.
@@ -389,8 +416,8 @@ pub enum Message {
     /// Write the active editor buffer back to its file (Ctrl+S / Save button).
     EditorSave,
     EditorTogglePreview,
-    EditorRefreshPreview,
-    EditorPreviewReady(usize, PathBuf, Result<Vec<u8>, String>),
+    /// Show/hide the editor's line-number gutter (a global editor preference).
+    EditorToggleLineNumbers,
     // Terminals
     TerminalData(TerminalId, Vec<u8>),
     /// The child process behind a terminal exited (e.g. the user typed
@@ -439,7 +466,11 @@ pub enum Message {
     /// The `AiTool` chooses which CLI a `Build` pane runs; the `ToolModel` picks
     /// its model (`--model`). Chat panes are Claude-only, so they ignore the
     /// tool and take the model as an override on their kind's default.
-    AgentAdded(AgentKind, crate::agent::AiTool, crate::agent::ToolModel),
+    ///
+    /// The trailing name is what the user typed in the Agents dialog's name
+    /// field before pressing the button — `None`/blank leaves the new tab on
+    /// its positional label, which is what the quick shortcut sends.
+    AgentAdded(AgentKind, crate::agent::AiTool, crate::agent::ToolModel, Option<String>),
     /// Add a Build pane using the user's default tool at its default model
     /// (the Ctrl+Shift+T quick shortcut). Resolved to [`Message::AgentAdded`] in
     /// `update`, where the prefs are reachable.
@@ -455,6 +486,9 @@ pub enum Message {
     /// The window changed size — panes (and so the agent-tab strip) got
     /// re-laid-out. Nothing to update beyond re-measuring what now fits.
     WindowResized,
+    /// The window gained (`true`) or lost (`false`) OS focus. Tracked so
+    /// background notifications only fire when the user isn't looking at frms.
+    WindowFocusChanged(bool),
     /// Toggle the find bar on whichever agent pane is in front (Ctrl+Shift+L).
     /// Resolved to [`Message::FindOpened`] in `update`, where the active
     /// session's front tab is known.
@@ -479,14 +513,27 @@ pub enum Message {
     AgentsDialogSelectAll(bool),
     /// Pick the model to switch the ticked panes to, from `AiTool`'s list.
     AgentsDialogModelPicked(crate::agent::AiTool, crate::agent::ToolModel),
+    /// Switch the MODEL list to another tool's tab (view only — the current
+    /// pick in `choice` is left alone).
+    AgentsDialogModelToolSelected(crate::agent::AiTool),
+    /// Typed into the NEW row's name field — the name the next agent starts under.
+    AgentsDialogNameEdited(String),
     /// Apply the picked model to every ticked pane.
     AgentsDialogApplied,
-    /// ✕ on an agent row — arm the inline "close this one?" confirmation.
-    AgentsDialogPaneCloseRequested(TerminalId),
+    /// Requery Claude's available models from the API (the MODEL "Refresh"
+    /// button), so a newly-shipped model shows up without restarting frms.
+    AgentsDialogRefreshModels,
+    /// A model requery finished — `Ok` swaps the fetched list into the picker,
+    /// `Err` carries a short reason shown in the dialog.
+    ModelsRefreshed(crate::models::Refresh),
+    /// Stop on an agent row — arm the inline "stop this one?" confirmation.
+    AgentsDialogPaneStopRequested(TerminalId),
     /// Back out of that confirmation.
-    AgentsDialogPaneCloseCancelled,
-    /// Confirmed — close the pane and stop its CLI.
-    AgentsDialogPaneClosed(TerminalId),
+    AgentsDialogPaneStopCancelled,
+    /// Confirmed — kill the pane's CLI, keeping its tab.
+    AgentsDialogPaneStopped(TerminalId),
+    /// Start a stopped pane's CLI again, from the pane body.
+    AgentRestarted(TerminalId),
     /// Edited the draft input of a chat (Research/Chat) pane.
     ChatInputAction(TerminalId, text_editor::Action),
     /// Interaction with a completed transcript bubble (the `usize` indexes
@@ -659,8 +706,8 @@ pub enum Message {
     /// Shift+Tab in the note body editor — strip one indent step.
     NotesOutdent,
     /// Send the highlighted selection (or the whole note if nothing is
-    /// highlighted) to the active session's active Claude terminal.
-    NotesSendToClaude,
+    /// highlighted) to the active session's active agent pane.
+    NotesPromptAgent,
     /// Toggle a note between pinned-to-this-project and global.
     NotesPinToggled(u64),
     /// Move keyboard focus from the note Title field into the body editor —
@@ -678,6 +725,31 @@ pub enum Message {
     /// Collapse/expand a category group in the notes list. Empty string is the
     /// uncategorized ("General") group.
     NotesCategoryToggleCollapsed(String),
+    /// Two-way sync every note with the configured BookStack instance
+    /// ([`crate::bookstack`]) — push local edits, pull remote ones, surface
+    /// conflicts. Only reachable once BookStack is set up in the Profile tab.
+    NotesSyncToBookStack,
+    /// Result of a BookStack sync — what was pushed/pulled and any conflicts, or
+    /// the error that stopped it.
+    NotesBookStackSynced(Result<crate::bookstack::Outcome, String>),
+    /// Open the diff view for the conflicted note with this id.
+    NotesConflictShow(u64),
+    /// Close the conflict diff view, back to the normal editor.
+    NotesConflictClose,
+    /// Resolve a conflict by keeping the local note (pushed up on the next sync).
+    NotesConflictKeepLocal(u64),
+    /// Resolve a conflict by taking the BookStack version (overwrites the note).
+    NotesConflictUseRemote(u64),
+    /// Import one BookStack page (by page id) from the pending-import list as a
+    /// new note.
+    NotesImportPage(u64),
+    /// Import every pending BookStack page as new notes.
+    NotesImportAll,
+    /// Dismiss one pending BookStack page (by page id) — and remember not to
+    /// offer it again.
+    NotesDismissImport(u64),
+    /// Dismiss every pending BookStack page.
+    NotesDismissAllImports,
     /// Install an AI CLI tool from the Profile tab: opens a Terminals-plugin
     /// shell running the tool's one-shot install command, then drops the user
     /// into a shell to sign in.
@@ -889,10 +961,26 @@ pub enum Message {
     PrefsModeChanged(Mode),
     PrefsFontScaleChanged(FontScale),
     PrefsTerminalFontScaleChanged(TerminalFontScale),
-    /// Profile-tab picker for the file-browser submodule highlight color.
-    PrefsSubmoduleColorChanged(iced::Color),
+    /// A Profile-tab color picker (accent tint / active color) moved by a
+    /// slider drag. Applied live; [`Message::PrefsColorCommitted`] saves on the
+    /// slider's release, once per drag.
+    PrefsColorChanged(crate::prefs::PickedColor, iced::Color),
+    /// A color picker slider was released — persist the color picked.
+    PrefsColorCommitted,
+    /// A color picker's hex field was edited, possibly to a partial value.
+    PrefsColorHexEdited(crate::prefs::PickedColor, String),
+    /// Return a picked color to its default.
+    PrefsColorReset(crate::prefs::PickedColor),
     /// Profile-tab toggle for anonymous usage telemetry.
     PrefsTelemetryToggled(bool),
+    /// Profile tab: turn background desktop notifications on/off.
+    PrefsNotificationsToggled(bool),
+    /// Profile-tab BookStack sync config edits (optional feature; empty until
+    /// the user opts in). URL, both token halves, and the shelf name.
+    PrefsBookStackUrlEdited(String),
+    PrefsBookStackTokenIdEdited(String),
+    PrefsBookStackTokenSecretEdited(String),
+    PrefsBookStackShelfEdited(String),
     /// Profile-tab picker for the default AI tool new Build panes launch.
     PrefsDefaultToolChanged(crate::agent::AiTool),
     /// Profile-tab toggle: hide tools not on `PATH` from the "+ Agent" picker.
@@ -910,6 +998,9 @@ pub enum Message {
     /// First-run NDA gate — `true` accepts (and proceeds), `false` declines and
     /// exits the app.
     NdaChoice(bool),
+    /// Dismiss the "What's New" overlay — stamps the current version so it
+    /// won't reappear until the next upgrade.
+    WhatsNewDismissed,
     /// Tick from the per-frame theme-crossfade subscription.
     ThemeAnimTick,
     /// Collapse / expand the top header panel.
@@ -985,6 +1076,7 @@ impl Frms {
             active_session:           0,
             pane_focus_toolbox:       false,
             split_view:               None,
+            window_focused:           true,
             pending_close:            None,
             creating_session:         true,
             new_session_name:         String::new(),
@@ -992,6 +1084,7 @@ impl Frms {
             new_session_file_browser: new_session_browser,
             renaming_session:         None,
             renaming_claude:          None,
+            color_draft:              None,
             agent_strip_overflow:     false,
             agent_strip_sig:          0,
             agents_dialog:             None,
@@ -1041,10 +1134,15 @@ impl Frms {
         app.telemetry.record(crate::telemetry::Event::Launch);
         let init_stats = Task::perform(stats::load(), Message::StatsLoaded);
         let init_procs = Task::perform(stats::load_procs(), Message::ProcsLoaded);
+        // Refresh the model catalogue at launch (best-effort, silent): a model
+        // that shipped since last time is then already in the picker, no button
+        // press needed. The Agents dialog's Refresh button covers doing it again
+        // mid-session, so a mid-session release shows up without a restart.
+        let init_models = Task::perform(crate::models::refresh(), Message::ModelsRefreshed);
         // Start maximized: grab the freshly-opened window and maximize it.
         let maximize = window::get_latest()
             .and_then(|id| window::maximize(id, true));
-        (app, Task::batch([init_stats, init_procs, maximize]))
+        (app, Task::batch([init_stats, init_procs, init_models, maximize]))
     }
 
     /// Re-create sessions from `~/.frms/sessions.json` (written on every
@@ -1099,6 +1197,7 @@ impl Frms {
                     session.panes[0] = AgentPane::Chat(chat);
                 } else {
                     session.panes[0] = AgentPane::Pending(crate::agent::PendingPane {
+                        stopped: false,
                         id: first_term, tool, model, name: None,
                     });
                 }
@@ -1111,7 +1210,7 @@ impl Frms {
                 self.next_terminal_id += 1;
                 let kind  = ps.claude_kinds.get(i).copied().unwrap_or_default();
                 let (tool, model) = resolve_tool_model(i);
-                session.add_agent(tid, kind, tool, model);
+                session.add_agent(tid, kind, tool, model, None);
             }
             // Restore per-tab user-assigned names.
             for (i, p) in session.panes.iter_mut().enumerate() {
@@ -1606,6 +1705,9 @@ impl Frms {
             Message::BrowseDir(path) => {
                 self.sessions[self.active_session].file_browser.navigate(path);
             }
+            Message::FileBrowserRefresh => {
+                self.sessions[self.active_session].file_browser.refresh();
+            }
             Message::OpenFile(path) => {
                 let s = &mut self.sessions[self.active_session];
                 s.editor.open(path);
@@ -1662,64 +1764,23 @@ impl Frms {
                 self.sessions[self.active_session].editor.save();
             }
             Message::EditorTogglePreview => {
-                let s = &mut self.sessions[self.active_session];
-                let sid = s.id;
-                let e = &mut s.editor;
+                // Markdown and HTML both render natively in `ui::preview` from the
+                // live buffer, so toggling is all this does now — no async render.
+                let e = &mut self.sessions[self.active_session].editor;
                 e.preview_active = !e.preview_active;
-                if e.preview_active && e.preview_kind() == Some(crate::editor::PreviewKind::Html) {
-                    if let Some(path) = e.path.clone() {
-                        let needs_render = e.preview_handle.is_none()
-                            || e.preview_image_path.as_deref() != Some(path.as_path());
-                        if needs_render {
-                            e.preview_loading = true;
-                            e.preview_error   = None;
-                            return Task::perform(
-                                render_html_preview(sid, path),
-                                |(sid, path, r)| Message::EditorPreviewReady(sid, path, r),
-                            );
-                        }
-                    }
-                }
             }
-            Message::EditorRefreshPreview => {
-                let s = &mut self.sessions[self.active_session];
-                let sid = s.id;
-                let e = &mut s.editor;
-                if let Some(path) = e.path.clone() {
-                    if e.preview_kind() == Some(crate::editor::PreviewKind::Html) {
-                        e.preview_loading = true;
-                        e.preview_error   = None;
-                        return Task::perform(
-                            render_html_preview(sid, path),
-                            |(sid, path, r)| Message::EditorPreviewReady(sid, path, r),
-                        );
-                    }
-                }
-            }
-            Message::EditorPreviewReady(session_id, path, result) => {
-                if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                    let e = &mut s.editor;
-                    // Drop stale results from a previously-open file.
-                    if e.path.as_deref() != Some(path.as_path()) {
-                        return Task::none();
-                    }
-                    e.preview_loading = false;
-                    match result {
-                        Ok(bytes) => {
-                            // Built here, once, rather than per-frame in view().
-                            e.preview_handle     = Some(image::Handle::from_bytes(bytes));
-                            e.preview_image_path = Some(path);
-                            e.preview_error      = None;
-                        }
-                        Err(err) => {
-                            e.preview_error = Some(err);
-                        }
-                    }
-                }
+            Message::EditorToggleLineNumbers => {
+                // A global editor preference — flip it and persist so the choice
+                // sticks across sessions and launches.
+                self.prefs.show_line_numbers = !self.prefs.show_line_numbers;
+                self.prefs.save();
             }
 
             // ── terminals (any session) ───────────────────────────────────────
             Message::TerminalData(id, bytes) => {
+                // Set when this chunk is what first stopped Claude on a question
+                // (false→true on `waiting_on_user`), so we notify once per stop.
+                let mut newly_waiting = false;
                 if let Some(s) = self.session_for_terminal_mut(id) {
                     if let Some(t) = s.terminal_mut(id) {
                         t.process(&bytes);
@@ -1727,10 +1788,12 @@ impl Frms {
                         // the tab/session attention highlight tracks reality.
                         // Runs for background sessions too — that's the point:
                         // alert the user about sessions they aren't watching.
+                        let was_waiting = t.waiting_on_user;
                         let menu_up = t.grid.lock()
                             .map(|g| claude_prompt::is_waiting_on_user(&g))
                             .unwrap_or(false);
                         t.note_menu_on_screen(menu_up);
+                        newly_waiting = !was_waiting && t.waiting_on_user;
                     }
                     Self::reconcile_prompt(s, id);
                 } else if let Some(s) = self.session_for_plugin_terminal_mut(id) {
@@ -1739,6 +1802,11 @@ impl Frms {
                     }
                 } else if let Some(t) = self.receivers.ssh_mut(id) {
                     t.pane.process(&bytes);
+                }
+                // Borrows above are released; raise the background toast when
+                // this chunk is the one that stopped Claude on a question.
+                if newly_waiting {
+                    self.notify_attention(id, "Claude is waiting on your input");
                 }
             }
             Message::TerminalExited(id) => {
@@ -1824,6 +1892,9 @@ impl Frms {
             // Handled entirely by `refresh_agent_strip_overflow` in the `update`
             // wrapper — the window's new size is iced's business, not ours.
             Message::WindowResized => {}
+            Message::WindowFocusChanged(focused) => {
+                self.window_focused = focused;
+            }
             Message::AgentsDialogOpened => {
                 let s = &self.sessions[self.active_session];
                 // Start on the agent that's in front: the common case is
@@ -1840,9 +1911,17 @@ impl Frms {
                     session_id: s.id,
                     selected,
                     choice:     None,
+                    model_tool: self.prefs.default_tool,
                     outcome:    None,
                     confirming: None,
+                    name:       String::new(),
+                    refreshing: false,
+                    models_status: None,
                 });
+                // Drop the caret straight into the name field: opening this
+                // dialog to start a *named* agent is the flow that needed it,
+                // and every other control here is a click anyway.
+                return iced::widget::text_input::focus(ui::agents_dialog::name_input_id());
             }
             Message::AgentsDialogClosed => {
                 self.agents_dialog = None;
@@ -1877,6 +1956,16 @@ impl Frms {
                     d.outcome = None;
                 }
             }
+            Message::AgentsDialogModelToolSelected(tool) => {
+                if let Some(d) = &mut self.agents_dialog {
+                    d.model_tool = tool;
+                }
+            }
+            Message::AgentsDialogNameEdited(name) => {
+                if let Some(d) = &mut self.agents_dialog {
+                    d.name = name;
+                }
+            }
             Message::AgentsDialogApplied => {
                 let Some(d) = &self.agents_dialog else { return Task::none(); };
                 let Some((tool, model)) = d.choice else { return Task::none(); };
@@ -1896,38 +1985,80 @@ impl Frms {
                     d.outcome  = Some(outcome);
                 }
             }
-            Message::AgentsDialogPaneCloseRequested(tid) => {
+            Message::AgentsDialogRefreshModels => {
+                if let Some(d) = &mut self.agents_dialog {
+                    if d.refreshing {
+                        return Task::none();
+                    }
+                    d.refreshing = true;
+                    d.models_status = Some("Refreshing…".to_string());
+                }
+                return Task::perform(crate::models::refresh(), Message::ModelsRefreshed);
+            }
+            Message::ModelsRefreshed(result) => {
+                let status = match result {
+                    Ok(entries) => {
+                        let n = crate::agent::set_claude_models(&entries);
+                        format!("Loaded {n} Claude model{}", if n == 1 { "" } else { "s" })
+                    }
+                    Err(reason) => {
+                        self.telemetry.record(crate::telemetry::Event::Error {
+                            kind:   "models_refresh",
+                            detail: reason.clone(),
+                        });
+                        format!("Couldn't refresh models — {reason}")
+                    }
+                };
+                // Only reflect it in the dialog if one is open — the launch-time
+                // refresh runs with no dialog and just swaps the list silently.
+                if let Some(d) = &mut self.agents_dialog {
+                    d.refreshing = false;
+                    d.models_status = Some(status);
+                }
+            }
+            Message::AgentsDialogPaneStopRequested(tid) => {
                 if let Some(d) = &mut self.agents_dialog {
                     d.confirming = Some(tid);
                 }
             }
-            Message::AgentsDialogPaneCloseCancelled => {
+            Message::AgentsDialogPaneStopCancelled => {
                 if let Some(d) = &mut self.agents_dialog {
                     d.confirming = None;
                 }
             }
-            Message::AgentsDialogPaneClosed(tid) => {
+            Message::AgentsDialogPaneStopped(tid) => {
                 // Act on the session the dialog captured at open time, so a
-                // session switch behind the overlay can't redirect the close.
+                // session switch behind the overlay can't redirect the stop.
+                // The tab survives — only the CLI behind it goes.
                 let sid = self.agents_dialog.as_ref().map(|d| d.session_id);
                 if let Some(s) = sid.and_then(|sid| self.sessions.iter_mut().find(|s| s.id == sid)) {
-                    if s.close_claude_terminal(tid) {
+                    if s.stop_agent(tid) {
                         self.save_persisted();
                     }
                 }
                 if let Some(d) = &mut self.agents_dialog {
                     d.confirming = None;
-                    d.selected.retain(|id| *id != tid);
-                    // The tally described a selection that no longer exists.
+                    // Still a tab, still tickable — a stopped pane takes a new
+                    // model just as well, and starts on it.
                     d.outcome = None;
                 }
+            }
+            Message::AgentRestarted(tid) => {
+                if let Some(s) = self.session_for_terminal_mut(tid) {
+                    s.restart_agent(tid);
+                }
+                // `spawn_visible_panes` runs after this update and starts it,
+                // the same path a first-time tab open takes.
             }
             Message::NewDefaultAgent => {
                 let tool = self.prefs.default_tool;
                 let model = *tool.default_model();
-                return self.update(Message::AgentAdded(AgentKind::Build, tool, model));
+                // The quick shortcut is quick: no dialog, so no name to carry —
+                // the tab takes its positional label and the ✎ is there if the
+                // user wants one.
+                return self.update(Message::AgentAdded(AgentKind::Build, tool, model, None));
             }
-            Message::AgentAdded(kind, tool, model) => {
+            Message::AgentAdded(kind, tool, model, name) => {
                 // Adding from the Agents dialog focuses the new pane, so the
                 // dialog has served its purpose — get out of the way of it.
                 self.agents_dialog = None;
@@ -1935,7 +2066,7 @@ impl Frms {
                 self.next_terminal_id += 1;
                 self.pane_focus_toolbox = false;
                 let s = &mut self.sessions[self.active_session];
-                s.add_agent(new_id, kind, tool, model);
+                s.add_agent(new_id, kind, tool, model, name);
                 s.active_terminal = new_id;
                 s.center_tab      = crate::session::CenterTab::Claude(new_id);
                 self.telemetry.record(crate::telemetry::Event::AgentCreated { kind: kind.as_str() });
@@ -2098,6 +2229,7 @@ impl Frms {
                 // (and its session tab), the same alert Build panes get when
                 // Claude stops on a question.
                 let offscreen = !self.pane_on_screen(id);
+                let errored   = result.is_err();
                 if let Some(s) = self.session_for_terminal_mut(id) {
                     if let Some(c) = s.chat_mut(id) {
                         c.streaming = false;
@@ -2128,6 +2260,11 @@ impl Frms {
                 if let Some(event) = tel {
                     self.telemetry.record(event);
                 }
+                // Same off-screen/unfocused alert the Build panes get: tell the
+                // user a reply landed on a conversation they aren't watching.
+                // `errored` tailors the toast; the borrow above has ended.
+                let body = if errored { "Reply failed" } else { "Reply ready" };
+                self.notify_attention(id, body);
                 // Final snap so the completed answer is fully in view.
                 return self.pin_chat_tail(id);
             }
@@ -3110,11 +3247,72 @@ impl Frms {
             Message::NotesCategoryToggleCollapsed(key) => {
                 self.notes.toggle_category_collapsed(&key);
             }
-            Message::NotesSendToClaude => {
+            Message::NotesSyncToBookStack => {
+                // Guard against a double-run and against being reached without a
+                // config (the button is hidden without one, but be defensive).
+                if self.notes.bookstack_syncing {
+                    return Task::none();
+                }
+                if !self.prefs.bookstack_configured() {
+                    self.notes.bookstack_status =
+                        Some("Set your BookStack URL and API token in Profile first.".into());
+                    return Task::none();
+                }
+                // Commit the note currently being edited so its latest text is
+                // part of what gets pushed.
+                self.notes.flush_buffers();
+                let notes = self.notes.notes_for_bookstack();
+                if notes.is_empty() {
+                    self.notes.bookstack_status = Some("No notes to sync.".into());
+                    return Task::none();
+                }
+                let cfg = self.prefs.bookstack_config();
+                self.notes.bookstack_syncing = true;
+                self.notes.bookstack_status  = Some(format!("Syncing {} notes…", notes.len()));
+                let declined = self.notes.bookstack_declined();
+                return Task::perform(
+                    crate::bookstack::reconcile_async(cfg, notes, declined),
+                    Message::NotesBookStackSynced,
+                );
+            }
+            Message::NotesBookStackSynced(result) => {
+                self.notes.bookstack_syncing = false;
+                self.notes.bookstack_status = Some(match result {
+                    Ok(outcome) => self.notes.apply_reconcile(outcome),
+                    Err(e) => format!("Sync failed: {e}"),
+                });
+            }
+            Message::NotesConflictShow(id) => {
+                self.notes.show_conflict(id);
+            }
+            Message::NotesConflictClose => {
+                self.notes.close_conflict();
+            }
+            Message::NotesConflictKeepLocal(id) => {
+                self.notes.resolve_conflict_keep_local(id);
+            }
+            Message::NotesConflictUseRemote(id) => {
+                self.notes.resolve_conflict_use_remote(id);
+            }
+            Message::NotesImportPage(page_id) => {
+                let project = self.active_project();
+                self.notes.import_pending(page_id, project.as_deref());
+            }
+            Message::NotesImportAll => {
+                let project = self.active_project();
+                self.notes.import_all_pending(project.as_deref());
+            }
+            Message::NotesDismissImport(page_id) => {
+                self.notes.dismiss_pending(page_id);
+            }
+            Message::NotesDismissAllImports => {
+                self.notes.dismiss_all_pending();
+            }
+            Message::NotesPromptAgent => {
                 // Prefer the highlighted selection; fall back to the whole note
                 // body when nothing is highlighted so the button is never a
                 // surprising no-op. The text is pasted (not submitted) into the
-                // active Claude terminal so the user can review before sending.
+                // active agent pane so the user can review before sending.
                 let text = self.notes.body_content.selection()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| self.notes.body_content.text());
@@ -3122,8 +3320,6 @@ impl Frms {
                 if !text.is_empty() {
                     let sess = &mut self.sessions[self.active_session];
                     let active = sess.active_terminal;
-                    // The toolbox can send a note to an agent tab the user has
-                    // never opened — start it so the paste has somewhere to go.
                     sess.spawn_pending(active);
                     if let Some(t) = sess.terminal_mut(active) {
                         let bracketed = t.grid.lock()
@@ -3131,6 +3327,8 @@ impl Frms {
                             .unwrap_or(false);
                         if let Ok(mut g) = t.grid.lock() { g.snap_to_bottom(); }
                         t.write_input(paste_payload(&text, bracketed).as_bytes());
+                    } else if let Some(c) = sess.chat_mut(active) {
+                        c.input = text_editor::Content::with_text(&text);
                     }
                 }
             }
@@ -4303,11 +4501,26 @@ impl Frms {
                 self.prefs.terminal_font_scale = f;
                 self.prefs.save();
             }
-            Message::PrefsSubmoduleColorChanged(c) => {
-                if self.prefs.submodule_color != c {
-                    self.prefs.submodule_color = c;
-                    self.prefs.save();
+            Message::PrefsColorChanged(which, c) => {
+                // Live while dragging; the release saves.
+                self.prefs.set_picked_color(which, Some(c));
+                self.color_draft = None;
+            }
+            Message::PrefsColorCommitted => self.prefs.save(),
+            Message::PrefsColorHexEdited(which, s) => {
+                match crate::prefs::color_from_hex(&s) {
+                    Some(c) => {
+                        self.prefs.set_picked_color(which, Some(c));
+                        self.color_draft = None;
+                        self.prefs.save();
+                    }
+                    None => self.color_draft = Some((which, s)),
                 }
+            }
+            Message::PrefsColorReset(which) => {
+                self.prefs.set_picked_color(which, None);
+                self.color_draft = None;
+                self.prefs.save();
             }
             Message::PrefsDefaultToolChanged(t) => {
                 if self.prefs.default_tool != t {
@@ -4349,6 +4562,28 @@ impl Frms {
                 // running either way so install/launch counts still report.
                 self.telemetry.set_optional(on);
             }
+            Message::PrefsNotificationsToggled(on) => {
+                self.prefs.notifications = on;
+                self.prefs.save();
+                // Applies immediately: the next agent to need attention while
+                // frms is in the background honours the new setting.
+            }
+            Message::PrefsBookStackUrlEdited(s) => {
+                self.prefs.bookstack_url = s;
+                self.prefs.save();
+            }
+            Message::PrefsBookStackTokenIdEdited(s) => {
+                self.prefs.bookstack_token_id = s;
+                self.prefs.save();
+            }
+            Message::PrefsBookStackTokenSecretEdited(s) => {
+                self.prefs.bookstack_token_secret = s;
+                self.prefs.save();
+            }
+            Message::PrefsBookStackShelfEdited(s) => {
+                self.prefs.bookstack_shelf = s;
+                self.prefs.save();
+            }
             Message::NdaChoice(accepted) => {
                 if accepted {
                     self.prefs.nda_accepted = true;
@@ -4366,6 +4601,10 @@ impl Frms {
                 // disclosed by the notice as always-on, and were already sent
                 // by `new`. Same path as the Profile toggle.
                 self.telemetry.set_optional(keep_on);
+            }
+            Message::WhatsNewDismissed => {
+                self.prefs.last_seen_version = Some(crate::version::VERSION.to_string());
+                self.prefs.save();
             }
             Message::ThemeAnimTick => {
                 if matches!(&self.theme_anim, Some(a) if a.finished()) {
@@ -4398,6 +4637,12 @@ impl Frms {
         // before any data is sent. No telemetry fires until acknowledged.
         if !self.prefs.telemetry_notice_ack {
             return ui::telemetry_notice::view(colors);
+        }
+
+        // "What's New" after an upgrade — shown once per version bump, after the
+        // first-run gates are settled so we know the user is onboarded.
+        if ui::whats_new::has_news(self.prefs.last_seen_version.as_deref()) {
+            return ui::whats_new::view(colors);
         }
 
         // Claude Code is required to run agents. If the `claude` CLI isn't on
@@ -4532,13 +4777,19 @@ impl Frms {
                 .into();
         }
 
-        // "Change model" dialog floats over the IDE, scoped to the session it
-        // was opened for (which stays put even if the active session changes).
+        // The Agents dialog floats over the IDE, scoped to the session it was
+        // opened for (which stays put even if the active session changes).
         if let Some(dialog) = &self.agents_dialog {
             if let Some(session) = self.sessions.iter().find(|s| s.id == dialog.session_id) {
                 return iced::widget::stack![
                     base,
-                    ui::agents_dialog::overlay(dialog, &session.panes, colors),
+                    ui::agents_dialog::overlay(
+                        dialog,
+                        &session.panes,
+                        self.prefs.default_tool,
+                        self.prefs.filter_tools_to_installed,
+                        colors,
+                    ),
                 ]
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -4609,7 +4860,7 @@ impl Frms {
         let pending      = session.pending_prompt.as_ref();
         let prompt_src   = session.prompt_source_terminal;
         let center_tab   = session.center_tab;
-        let submodule_color = self.prefs.submodule_color;
+        let accent_tint = self.prefs.accent_tint;
         // The one Cloud SQL setting the user owns: their service-account key.
         // Where the proxy binary lives is frms' problem, not theirs.
         let cloud_sql_creds = &self.prefs.cloud_sql_credentials;
@@ -4634,11 +4885,11 @@ impl Frms {
                 pending,
                 prompt_src,
                 &self.renaming_claude,
-                self.agent_menu_open,
-                self.prefs.default_tool,
-                self.prefs.filter_tools_to_installed,
                 self.agent_strip_overflow,
                 cloud_sql_creds,
+                colors.current,
+                self.prefs.terminal_font_scale,
+                self.prefs.show_line_numbers,
             );
             let editor_bordered = iced::widget::container(editor_el)
                 .width(Length::Fill)
@@ -4655,7 +4906,7 @@ impl Frms {
         } else {
             pane_grid::PaneGrid::new(panes, move |_pane, kind, _maximized| {
                 let content = match kind {
-                    PaneKind::FileBrowser => ui::file_browser::view(file_browser, submodule_color),
+                    PaneKind::FileBrowser => ui::file_browser::view(file_browser, accent_tint),
                     PaneKind::Editor  => {
                         ui::editor::view(
                             editor,
@@ -4666,11 +4917,11 @@ impl Frms {
                             pending,
                             prompt_src,
                             &self.renaming_claude,
-                            self.agent_menu_open,
-                            self.prefs.default_tool,
-                            self.prefs.filter_tools_to_installed,
                             self.agent_strip_overflow,
                             cloud_sql_creds,
+                            colors.current,
+                            self.prefs.terminal_font_scale,
+                            self.prefs.show_line_numbers,
                         )
                     }
                     PaneKind::Browser => {
@@ -4710,6 +4961,7 @@ impl Frms {
                 session.db_panel.client.is_some(),
                 &session.db_panel.tables,
                 self.prefs.telemetry,
+                self.color_draft.as_ref(),
             );
             // Expanded: the panel swallows the whole width and the main working
             // area is hidden — the mirror of hiding the panel for a full-width
@@ -4794,8 +5046,14 @@ impl Frms {
         // `listen_with` takes a fn pointer (no captures), so when splash is
         // up we swap in a dedicated listener that only forwards Enter →
         // `SplashDismissed` and drops everything else.
+        let whats_new_showing = self.prefs.nda_accepted
+            && self.prefs.telemetry_notice_ack
+            && ui::whats_new::has_news(self.prefs.last_seen_version.as_deref());
+
         let keyboard = if self.showing_splash {
             iced::event::listen_with(splash_key_listener)
+        } else if whats_new_showing {
+            iced::event::listen_with(whats_new_key_listener)
         } else {
             iced::event::listen_with(main_key_listener)
         };
@@ -4869,6 +5127,39 @@ impl Frms {
         }
     }
 
+    /// A short name for agent pane `tid`, for notification text: the tab's
+    /// user-assigned name if it has one, otherwise the project (session) name
+    /// that owns it. Empty string if the pane can't be found.
+    fn agent_display_name(&self, tid: TerminalId) -> String {
+        for s in &self.sessions {
+            if let Some(p) = s.panes.iter().find(|p| p.id() == tid) {
+                return p.name().map(str::to_owned).unwrap_or_else(|| s.name.clone());
+            }
+        }
+        String::new()
+    }
+
+    /// Raise a desktop notification that agent pane `tid` needs attention —
+    /// but only when the user can't already see it (frms unfocused, or the
+    /// pane isn't the one on screen) and notifications are enabled. `body` is
+    /// the one-line reason ("Claude is waiting on your input", "reply ready").
+    /// Fire-and-forget; see [`crate::port::notify`].
+    fn notify_attention(&self, tid: TerminalId, body: &str) {
+        if !self.prefs.notifications {
+            return;
+        }
+        if self.window_focused && self.pane_on_screen(tid) {
+            return;
+        }
+        let name = self.agent_display_name(tid);
+        let summary = if name.is_empty() {
+            "frms".to_owned()
+        } else {
+            format!("frms — {name}")
+        };
+        crate::port::notify::send(&summary, body);
+    }
+
     /// Launch the CLI for any agent pane that is now on screen but hasn't
     /// started yet.
     ///
@@ -4887,7 +5178,9 @@ impl Frms {
         // borrows it mutably.
         let pending: Vec<(usize, TerminalId)> = self.sessions.iter().enumerate()
             .flat_map(|(i, s)| s.panes.iter()
-                .filter(|p| p.is_pending())
+                // A stopped pane is deliberately processless — only tabs that
+                // have never been opened start themselves.
+                .filter(|p| p.is_pending() && !p.is_stopped())
                 .map(move |p| (i, p.id())))
             .collect();
         for (i, tid) in pending {
@@ -5555,6 +5848,20 @@ fn splash_key_listener(
     None
 }
 
+fn whats_new_key_listener(
+    event:   iced::Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter),
+        ..
+    }) = event {
+        return Some(Message::WhatsNewDismissed);
+    }
+    None
+}
+
 /// `listen_with` listener active only while a plugin-panel resize drag is in
 /// progress. Forwards cursor motion and mouse-release events to the update
 /// loop so width tracking continues outside the drag handle.
@@ -5575,7 +5882,8 @@ fn plugin_panel_drag_listener(
 /// Always-on listener that turns the window-manager close request (the
 /// title-bar X) into `Message::Quit`, so it runs through our hard-shutdown
 /// path instead of iced's default graceful exit (which hangs on Windows).
-/// It also forwards resizes, which change how much room the agent-tab strip has.
+/// It also forwards resizes, which change how much room the agent-tab strip
+/// has, and focus gain/loss, which gates background notifications.
 fn window_close_listener(
     event:   iced::Event,
     _status: iced::event::Status,
@@ -5584,6 +5892,8 @@ fn window_close_listener(
     match event {
         iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Quit),
         iced::Event::Window(iced::window::Event::Resized(_))     => Some(Message::WindowResized),
+        iced::Event::Window(iced::window::Event::Focused)   => Some(Message::WindowFocusChanged(true)),
+        iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::WindowFocusChanged(false)),
         _ => None,
     }
 }
@@ -5997,18 +6307,6 @@ fn named_key_bytes(key: &key::Named) -> Option<String> {
 }
 
 // ── HTML preview render ───────────────────────────────────────────────────────
-
-/// Render an HTML file via headless chromium/firefox and return the PNG bytes.
-/// Reuses the same multi-fallback path as the browser pane's screenshot
-/// pipeline so that whatever's installed on the system will work.
-async fn render_html_preview(
-    session_id: usize,
-    path:       PathBuf,
-) -> (usize, PathBuf, Result<Vec<u8>, String>) {
-    let url = format!("file://{}", path.display());
-    let (sid, result) = take_screenshot(session_id, url).await;
-    (sid, path, result)
-}
 
 // ── URL normalization ─────────────────────────────────────────────────────────
 

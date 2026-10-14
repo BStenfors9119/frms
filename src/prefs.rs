@@ -33,10 +33,17 @@ pub struct Prefs {
     /// the first-run NDA modal blocks the app (declining exits). This is the
     /// cross-format acceptance that replaced the deb-only debconf gate.
     pub nda_accepted:        bool,
-    /// Highlight color for "a container of other things" — git-submodule
-    /// directories in the file browser and note categories in the Notes plugin.
-    /// User-chosen in the Profile tab; defaults to the built-in violet.
-    pub submodule_color:     Color,
+    /// User-chosen accent for things that want to stand apart from the
+    /// palette: submodule directories in the file browser, and note and doc
+    /// categories. It started as the submodule-folder color. Chosen in the
+    /// Profile tab; defaults to the built-in violet.
+    pub accent_tint:         Color,
+    /// The "you are here" color: the gradient along the bottom of the selected
+    /// project / agent tab, and the label of every agent tab whose tool is
+    /// running. `None` follows the theme ([`ThemeColors::current`] — light
+    /// yellow, or mint on Yellows); a color picked in the Profile tab
+    /// overrides it for every theme. Applied in [`Prefs::colors`].
+    pub active_color:        Option<Color>,
     /// Which AI CLI a new Build agent pane uses by default — the quick "New
     /// Agent" shortcut launches this tool, and the "+ Agent" picker lists it
     /// first. Chosen in the Profile tab; defaults to Claude Code.
@@ -76,6 +83,40 @@ pub struct Prefs {
     /// (`auth.json`). Empty means the proxy falls back to Application Default
     /// Credentials. Stored here, not in a script, so it is never hard-coded.
     pub cloud_sql_credentials: String,
+    /// The app version the user last dismissed the "What's New" screen on.
+    /// `None` for a fresh install (no screen shown until an upgrade).
+    pub last_seen_version:   Option<String>,
+    /// Root URL of the user's BookStack instance (e.g. `https://wiki.example.com`)
+    /// for the optional notes sync. Empty when the user hasn't set one up — the
+    /// whole feature is off until this and the token below are filled in, so a
+    /// user with no BookStack never touches it. See [`crate::bookstack`].
+    pub bookstack_url:          String,
+    /// The `id` half of the BookStack API token (`Token <id>:<secret>`). Stored
+    /// in plaintext in `prefs.json`, same as [`Prefs::cloud_sql_credentials`].
+    pub bookstack_token_id:     String,
+    /// The `secret` half of the BookStack API token.
+    pub bookstack_token_secret: String,
+    /// Name of the BookStack shelf frms files its books under. Defaults to
+    /// `frms`; the user can point the sync at an existing shelf instead.
+    pub bookstack_shelf:        String,
+    /// Whether the code editor shows a line-number gutter down its left edge.
+    /// A global editor preference, toggled from the editor header; off by
+    /// default so the plain buffer is what a fresh install shows.
+    pub show_line_numbers:      bool,
+    /// Whether frms raises a desktop notification when an agent needs attention
+    /// (a Build pane stops on a question, or a Research/Chat reply finishes)
+    /// while frms isn't the window the user is looking at. On by default; the
+    /// Profile tab's Notifications toggle is the opt-out.
+    pub notifications:          bool,
+}
+
+/// The Profile-tab colors set with the color picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickedColor {
+    /// [`Prefs::accent_tint`].
+    Accent,
+    /// [`Prefs::active_color`].
+    Active,
 }
 
 /// True when a container tool frms knows how to re-enter is installed. Only
@@ -108,16 +149,29 @@ impl Default for Prefs {
             telemetry:           true,
             telemetry_notice_ack: false,
             nda_accepted:        false,
-            submodule_color:     crate::ui::buttons::SUBMODULE,
-            default_tool:        crate::agent::AiTool::default(),
+            accent_tint:         crate::ui::buttons::ACCENT_TINT,
+            active_color:        None,
+            default_tool:       crate::agent::AiTool::default(),
             filter_tools_to_installed: false,
             chat_access:         crate::chat_api::ChatAccess::default(),
             ls_flags:            String::new(),
             immutable_system:    container_tool_installed(),
             cloud_sql_credentials: String::new(),
+            last_seen_version:   Some(crate::version::VERSION.to_string()),
+            bookstack_url:          String::new(),
+            bookstack_token_id:     String::new(),
+            bookstack_token_secret: String::new(),
+            bookstack_shelf:        DEFAULT_BOOKSTACK_SHELF.to_string(),
+            show_line_numbers:      false,
+            notifications:          true,
         }
     }
 }
+
+/// Default shelf name the notes sync files its books under. A first-run empty
+/// `bookstack_shelf` also resolves to this, so the feature works out of the box
+/// once the URL and token are set.
+pub const DEFAULT_BOOKSTACK_SHELF: &str = "frms";
 
 /// Keep only recognised flags, in [`LS_FLAGS`] order, without repeats. Applied
 /// on load as well as on every toggle, so a hand-edited `prefs.json` can't feed
@@ -131,7 +185,7 @@ fn normalize_ls_flags(raw: &str) -> String {
 
 /// Parse a `#RRGGBB` (or bare `RRGGBB`) hex string into a color. Returns `None`
 /// on any malformed input so callers can fall back to the default.
-fn color_from_hex(s: &str) -> Option<Color> {
+pub(crate) fn color_from_hex(s: &str) -> Option<Color> {
     let s = s.trim().strip_prefix('#').unwrap_or(s.trim());
     if s.len() != 6 {
         return None;
@@ -142,9 +196,9 @@ fn color_from_hex(s: &str) -> Option<Color> {
     Some(Color::from_rgb8(r, g, b))
 }
 
-/// Format a color as an uppercase `#RRGGBB` hex string (alpha dropped —
-/// submodule highlight colors are always opaque).
-fn color_to_hex(c: Color) -> String {
+/// Format a color as an uppercase `#RRGGBB` hex string (alpha dropped — the
+/// colors kept in prefs are always opaque).
+pub(crate) fn color_to_hex(c: Color) -> String {
     let ch = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02X}{:02X}{:02X}", ch(c.r), ch(c.g), ch(c.b))
 }
@@ -186,11 +240,19 @@ impl Prefs {
             telemetry_notice_ack: v.get("telemetry_notice_ack").and_then(Value::as_bool).unwrap_or(false),
             // Absent key → not yet accepted (show the NDA gate).
             nda_accepted: v.get("nda_accepted").and_then(Value::as_bool).unwrap_or(false),
-            // Absent/invalid → the built-in violet default.
-            submodule_color: v.get("submodule_color")
+            // Absent/invalid → the built-in violet default. `submodule_color`
+            // is the key this setting shipped under before it grew past
+            // submodule folders; still read so an older prefs file keeps the
+            // color the user picked (the next save writes the new key).
+            accent_tint: v.get("accent_tint")
+                .or_else(|| v.get("submodule_color"))
                 .and_then(Value::as_str)
                 .and_then(color_from_hex)
-                .unwrap_or(crate::ui::buttons::SUBMODULE),
+                .unwrap_or(crate::ui::buttons::ACCENT_TINT),
+            // Absent/invalid → follow the theme's own active color.
+            active_color: v.get("active_color")
+                .and_then(Value::as_str)
+                .and_then(color_from_hex),
             // Absent/unknown → Claude Code (the original single tool).
             default_tool: v.get("default_tool")
                 .and_then(Value::as_str)
@@ -219,6 +281,38 @@ impl Prefs {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_default(),
+            last_seen_version: v.get("last_seen_version")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            // All absent → the feature is simply off (empty config), which is
+            // the right default for anyone without a BookStack instance.
+            bookstack_url: v.get("bookstack_url")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default(),
+            bookstack_token_id: v.get("bookstack_token_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default(),
+            bookstack_token_secret: v.get("bookstack_token_secret")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default(),
+            // Absent/empty → the default shelf name.
+            bookstack_shelf: v.get("bookstack_shelf")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| DEFAULT_BOOKSTACK_SHELF.to_string()),
+            // Absent → off, i.e. the plain buffer with no gutter.
+            show_line_numbers: v.get("show_line_numbers")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            // Absent → on; notifications are a help, not a surprise, and the
+            // toggle is there to turn them off.
+            notifications: v.get("notifications")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
         }
     }
 
@@ -236,13 +330,21 @@ impl Prefs {
             "telemetry":           self.telemetry,
             "telemetry_notice_ack": self.telemetry_notice_ack,
             "nda_accepted":        self.nda_accepted,
-            "submodule_color":     color_to_hex(self.submodule_color),
+            "accent_tint":         color_to_hex(self.accent_tint),
+            "active_color":        self.active_color.map(color_to_hex),
             "default_tool":        self.default_tool.as_str(),
             "filter_tools_to_installed": self.filter_tools_to_installed,
             "chat_access":         self.chat_access.as_str(),
             "ls_flags":            self.ls_flags,
             "immutable_system":    self.immutable_system,
             "cloud_sql_credentials": self.cloud_sql_credentials,
+            "last_seen_version":    self.last_seen_version,
+            "bookstack_url":          self.bookstack_url,
+            "bookstack_token_id":     self.bookstack_token_id,
+            "bookstack_token_secret": self.bookstack_token_secret,
+            "bookstack_shelf":        self.bookstack_shelf,
+            "show_line_numbers":      self.show_line_numbers,
+            "notifications":          self.notifications,
         });
         if let Ok(bytes) = serde_json::to_vec_pretty(&v) {
             let _ = std::fs::write(&path, bytes);
@@ -260,8 +362,45 @@ impl Prefs {
         crate::port::dirs::home().unwrap_or_else(|| PathBuf::from("."))
     }
 
+    /// The theme's colors, with the user's [`Prefs::active_color`] (if they
+    /// picked one) in place of the theme's own.
     pub fn colors(&self) -> ThemeColors {
-        ThemeColors::for_theme(self.palette, self.mode)
+        let mut colors = ThemeColors::for_theme(self.palette, self.mode);
+        if let Some(c) = self.active_color {
+            colors.current = c;
+        }
+        colors
+    }
+
+    /// The color `which` currently resolves to — the user's pick, or its
+    /// default when they haven't made one.
+    pub fn picked_color(&self, which: PickedColor) -> Color {
+        match which {
+            PickedColor::Accent => self.accent_tint,
+            PickedColor::Active => self.colors().current,
+        }
+    }
+
+    /// Whether the user has moved `which` off its default — i.e. whether a
+    /// Reset has anything to undo. The accent is compared at `#RRGGBB`
+    /// precision, since that is what a stored pick round-trips through.
+    pub fn picked_color_is_custom(&self, which: PickedColor) -> bool {
+        match which {
+            PickedColor::Accent => {
+                color_to_hex(self.accent_tint) != color_to_hex(crate::ui::buttons::ACCENT_TINT)
+            }
+            PickedColor::Active => self.active_color.is_some(),
+        }
+    }
+
+    /// Set `which`; `None` returns it to its default.
+    pub fn set_picked_color(&mut self, which: PickedColor, color: Option<Color>) {
+        match which {
+            PickedColor::Accent => {
+                self.accent_tint = color.unwrap_or(crate::ui::buttons::ACCENT_TINT);
+            }
+            PickedColor::Active => self.active_color = color,
+        }
     }
 
     /// Whether the `ls` short option `flag` is switched on.
@@ -277,6 +416,27 @@ impl Prefs {
             raw.push(flag);
         }
         self.ls_flags = normalize_ls_flags(&raw);
+    }
+
+    /// Whether the optional BookStack notes sync is set up — a URL and both
+    /// halves of the API token. The Sync affordance stays hidden until this is
+    /// true, so a user without a BookStack instance never meets the feature.
+    pub fn bookstack_configured(&self) -> bool {
+        !self.bookstack_url.trim().is_empty()
+            && !self.bookstack_token_id.trim().is_empty()
+            && !self.bookstack_token_secret.trim().is_empty()
+    }
+
+    /// The connection config the sync engine needs. The shelf falls back to the
+    /// default name when the field was cleared.
+    pub fn bookstack_config(&self) -> crate::bookstack::Config {
+        let shelf = self.bookstack_shelf.trim();
+        crate::bookstack::Config {
+            base_url:     self.bookstack_url.trim().to_string(),
+            token_id:     self.bookstack_token_id.trim().to_string(),
+            token_secret: self.bookstack_token_secret.trim().to_string(),
+            shelf_name:   if shelf.is_empty() { DEFAULT_BOOKSTACK_SHELF.to_string() } else { shelf.to_string() },
+        }
     }
 
     /// The command a new shell should alias `ls` to — `ls -lha` and friends —

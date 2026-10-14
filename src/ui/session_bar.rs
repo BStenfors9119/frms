@@ -191,6 +191,7 @@ fn session_tab<'a>(
             colors.primary,
             colors.secondary,
             colors.tertiary,
+            colors.current,
             is_active,
         ))
         .into()

@@ -6,6 +6,7 @@ use crate::fonts::UI_FONT;
 pub mod browser;
 pub mod buttons;
 pub mod claude_missing;
+pub mod color_picker;
 pub mod confirm_dialog;
 pub mod db_panel;
 pub mod editor;
@@ -27,6 +28,7 @@ pub mod splash;
 pub mod telemetry_notice;
 pub mod terminal;
 pub mod usage_dialog;
+pub mod whats_new;
 
 /// Wrap a small icon button in a hover tooltip — the single-glyph buttons
 /// are tiny, so spell out what each one does.

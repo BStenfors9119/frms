@@ -234,6 +234,10 @@ pub struct ThemeColors {
     pub surface:    Color,
     pub border:     Color,
     pub text:       Color,
+    /// Bright companion to the palette's one hue — light yellow, or mint for
+    /// the Yellows palette — that marks the active project / agent tab (see
+    /// `buttons::glass_active`).
+    pub current:    Color,
 }
 
 impl ThemeColors {
@@ -284,6 +288,20 @@ impl ThemeColors {
             ),
         };
 
+        // The "you are here" band on the active project / agent tab. The
+        // palettes are monochrome, so another shade of the same hue wouldn't
+        // set the tab apart; instead the band is a light, luminous yellow — a
+        // lit edge the gradient brightens into at the tab's bottom. Pale enough
+        // to stay distinct from the saturated amber attention color. The
+        // Yellows palette is the exception: yellow would vanish into its ochre
+        // tabs, so it gets mint green instead.
+        let current = match (palette, mode) {
+            (Palette::Yellows, Mode::Light) => rgb(96,  222, 170),  // mint
+            (Palette::Yellows, Mode::Dark)  => rgb(146, 240, 198),  // bright mint
+            (_,                Mode::Light) => rgb(250, 226, 112),  // light yellow
+            (_,                Mode::Dark)  => rgb(255, 238, 150),  // pale yellow
+        };
+
         let (background, surface, border, text) = match (palette, mode) {
             // Light backgrounds tinted with the active palette so the whole
             // window reads as "a muted shade of Blue/Green/Gray".
@@ -321,7 +339,7 @@ impl ThemeColors {
             ),
         };
 
-        Self { primary, secondary, tertiary, background, surface, border, text }
+        Self { primary, secondary, tertiary, background, surface, border, text, current }
     }
 }
 
@@ -344,6 +362,60 @@ pub fn iced_theme_from(c: ThemeColors) -> IcedTheme {
     )
 }
 
+// ── HSL ───────────────────────────────────────────────────────────────────────
+
+/// RGB → HSL, hue in degrees.
+pub fn to_hsl(c: Color) -> (f32, f32, f32) {
+    let max = c.r.max(c.g).max(c.b);
+    let min = c.r.min(c.g).min(c.b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d <= f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs()).max(f32::EPSILON);
+    let h = if max == c.r {
+        60.0 * (((c.g - c.b) / d) % 6.0)
+    } else if max == c.g {
+        60.0 * ((c.b - c.r) / d + 2.0)
+    } else {
+        60.0 * ((c.r - c.g) / d + 4.0)
+    };
+    ((h + 360.0) % 360.0, s.clamp(0.0, 1.0), l)
+}
+
+/// HSL → RGB, hue in degrees.
+pub fn from_hsl(h: f32, s: f32, l: f32) -> Color {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match h {
+        h if h < 60.0  => (c, x, 0.0),
+        h if h < 120.0 => (x, c, 0.0),
+        h if h < 180.0 => (0.0, c, x),
+        h if h < 240.0 => (0.0, x, c),
+        h if h < 300.0 => (x, 0.0, c),
+        _              => (c, 0.0, x),
+    };
+    Color { r: r + m, g: g + m, b: b + m, a: 1.0 }
+}
+
+#[cfg(test)]
+mod hsl_tests {
+    use super::*;
+
+    #[test]
+    fn hsl_round_trips_the_band_colors() {
+        for c in [rgb(250, 226, 112), rgb(96, 222, 170), rgb(107, 140, 174)] {
+            let (h, s, l) = to_hsl(c);
+            let back = from_hsl(h, s, l);
+            for (a, b) in [(c.r, back.r), (c.g, back.g), (c.b, back.b)] {
+                assert!((a - b).abs() < 1e-3, "{c:?} → ({h}, {s}, {l}) → {back:?}");
+            }
+        }
+    }
+}
+
 // ── interpolation ─────────────────────────────────────────────────────────────
 
 impl ThemeColors {
@@ -356,6 +428,7 @@ impl ThemeColors {
             surface:    lerp_color(a.surface,    b.surface,    t),
             border:     lerp_color(a.border,     b.border,     t),
             text:       lerp_color(a.text,       b.text,       t),
+            current:    lerp_color(a.current,    b.current,    t),
         }
     }
 }

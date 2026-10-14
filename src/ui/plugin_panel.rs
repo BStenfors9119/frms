@@ -13,11 +13,12 @@ use crate::docs::DocsState;
 use crate::fonts::{ICON_FONT, UI_FONT};
 use crate::notes::{CategoryChoice, Note, NoteFormat, NoteViewMode, NotesState, UNCATEGORIZED_LABEL};
 use crate::plugin_panel::{DockSide, PluginPanel, PluginSlot, PluginTab};
-use crate::prefs::Prefs;
+use crate::prefs::{PickedColor, Prefs};
 use crate::receivers::ReceiversState;
 use crate::terminals::TerminalsState;
 use crate::theme::{FontScale, Mode, Palette, TerminalFontScale};
 use crate::ui::{buttons, with_tip};
+use crate::ui::color_picker;
 use crate::ui::docs_panel;
 use crate::ui::preview;
 use crate::ui::receivers_panel;
@@ -33,10 +34,12 @@ pub struct ReceiverCtx<'a> {
 }
 
 /// What the Profile tab needs from the app beyond `Prefs`: whether usage
-/// telemetry is on. Per-tool install status is probed live in the tools
-/// section ([`AiTool::on_path`]) since the tab only renders while open.
+/// telemetry is on, and any half-typed color picker hex. Per-tool install
+/// status is probed live in the tools section ([`AiTool::on_path`]) since the
+/// tab only renders while open.
 pub struct ProfileCtx {
-    pub telemetry_enabled: bool,
+    pub telemetry_enabled:  bool,
+    pub color_draft:        Option<(PickedColor, String)>,
 }
 
 /// Widget id for the Terminals-plugin Name field — used to focus it after
@@ -68,6 +71,7 @@ pub fn view<'a>(
     db_connected: bool,
     db_tables: &'a [TableRef],
     telemetry_enabled: bool,
+    color_draft: Option<&(PickedColor, String)>,
 ) -> Element<'a, Message> {
     let rctx = ReceiverCtx {
         state:        receivers,
@@ -75,7 +79,10 @@ pub fn view<'a>(
         db_tables,
         font_scale:   prefs.terminal_font_scale,
     };
-    let pctx = ProfileCtx { telemetry_enabled };
+    let pctx = ProfileCtx {
+        telemetry_enabled,
+        color_draft: color_draft.cloned(),
+    };
     let content: Element<'_, Message> = if panel.split {
         let top    = slot_view(panel, PluginSlot::Top,    prefs, notes, docs, project, terminals, &rctx, &pctx);
         let bottom = slot_view(panel, PluginSlot::Bottom, prefs, notes, docs, project, terminals, &rctx, &pctx);
@@ -162,8 +169,8 @@ fn slot_view<'a>(
     let tab = panel.tab(slot);
     let body: Element<'_, Message> = match tab {
         PluginTab::Profile   => profile_body(prefs, pctx),
-        PluginTab::Notes     => notes_body(notes, project, prefs.submodule_color),
-        PluginTab::Docs      => docs_panel::view(docs, prefs.submodule_color),
+        PluginTab::Notes     => notes_body(notes, project, prefs.accent_tint, prefs.bookstack_configured()),
+        PluginTab::Docs      => docs_panel::view(docs, prefs.accent_tint),
         PluginTab::Terminals => terminals_body(
             terminals, prefs.terminal_font_scale, prefs.immutable_system,
         ),
@@ -353,9 +360,19 @@ fn profile_body<'a>(prefs: &'a Prefs, pctx: &ProfileCtx) -> Element<'a, Message>
         .into(),
     );
 
-    let submodule_picker = labeled_row(
-        "Folder tint:",
-        submodule_color_picker(prefs.submodule_color),
+    let accent_picker = color_row(
+        "Accent tint:",
+        PickedColor::Accent,
+        "Submodule folders in the file browser, and note and doc categories.",
+        prefs,
+        pctx,
+    );
+    let active_picker = color_row(
+        "Active color:",
+        PickedColor::Active,
+        "Selected tab's underline, and the names of agent tabs whose tool is running.",
+        prefs,
+        pctx,
     );
 
     let content = column![
@@ -366,13 +383,18 @@ fn profile_body<'a>(prefs: &'a Prefs, pctx: &ProfileCtx) -> Element<'a, Message>
         mode_picker,
         font_picker,
         term_font_picker,
-        submodule_picker,
+        accent_picker,
+        active_picker,
         Space::new(Length::Shrink, Length::Fixed(8.0)),
         shell_section(prefs),
         Space::new(Length::Shrink, Length::Fixed(8.0)),
         tools_section(prefs.default_tool, prefs.filter_tools_to_installed, prefs.chat_access),
         Space::new(Length::Shrink, Length::Fixed(8.0)),
+        bookstack_section(prefs),
+        Space::new(Length::Shrink, Length::Fixed(8.0)),
         keyboard_shortcuts_section(),
+        Space::new(Length::Shrink, Length::Fixed(8.0)),
+        notifications_section(prefs),
         Space::new(Length::Shrink, Length::Fixed(8.0)),
         privacy_section(pctx),
     ]
@@ -416,62 +438,43 @@ fn about_section() -> Element<'static, Message> {
     column![name, stamp].spacing(2).into()
 }
 
-/// Curated highlight colors for submodules and note categories. The first is the
-/// built-in default; the rest span the hue wheel so there's a distinct,
-/// legible option whatever the user's theme.
-const SUBMODULE_SWATCHES: &[Color] = &[
-    buttons::SUBMODULE,                  // violet (default)
-    Color { r: 0.31, g: 0.62, b: 0.91, a: 1.0 }, // blue
-    Color { r: 0.18, g: 0.77, b: 0.72, a: 1.0 }, // teal
-    Color { r: 0.30, g: 0.72, b: 0.44, a: 1.0 }, // green
-    Color { r: 0.88, g: 0.58, b: 0.18, a: 1.0 }, // amber
-    Color { r: 0.90, g: 0.42, b: 0.44, a: 1.0 }, // rose
-    Color { r: 0.80, g: 0.48, b: 0.91, a: 1.0 }, // orchid
-    Color { r: 0.60, g: 0.63, b: 0.67, a: 1.0 }, // slate
-];
+/// A Profile color setting: a full [`color_picker`] showing the color in
+/// effect, a Reset back to its default once the user has picked their own,
+/// and a line on what the color marks.
+fn color_row<'a>(
+    label: &'a str,
+    which: PickedColor,
+    hint:  &'a str,
+    prefs: &Prefs,
+    pctx:  &ProfileCtx,
+) -> Element<'a, Message> {
+    let color = prefs.picked_color(which);
+    let hex = match &pctx.color_draft {
+        Some((w, draft)) if *w == which => draft.clone(),
+        _                               => crate::prefs::color_to_hex(color),
+    };
 
-/// Row of clickable color swatches for the folder/submodule highlight. The swatch
-/// matching the current choice gets a bright ring; picking another emits
-/// [`Message::PrefsSubmoduleColorChanged`].
-fn submodule_color_picker(current: Color) -> Element<'static, Message> {
-    let mut swatches = row![].spacing(6).align_y(Alignment::Center);
-    for &c in SUBMODULE_SWATCHES {
-        swatches = swatches.push(color_swatch(c, color_eq(c, current)));
-    }
-    swatches.into()
-}
+    let reset = button(text("Reset").font(UI_FONT).size(buttons::TEXT_SIZE))
+        .padding([4, 10])
+        .on_press_maybe(
+            prefs.picked_color_is_custom(which).then_some(Message::PrefsColorReset(which)),
+        )
+        .style(buttons::secondary);
+    let picker = color_picker::view(
+        color,
+        hex,
+        move |c| Message::PrefsColorChanged(which, c),
+        Message::PrefsColorCommitted,
+        move |s| Message::PrefsColorHexEdited(which, s),
+        reset.into(),
+    );
 
-/// One 22×22 swatch button filled with `color`; `selected` draws the ring.
-fn color_swatch(color: Color, selected: bool) -> Element<'static, Message> {
-    button(Space::new(Length::Fixed(16.0), Length::Fixed(16.0)))
-        .padding(0)
-        .on_press(Message::PrefsSubmoduleColorChanged(color))
-        .style(move |_theme, status| {
-            // Brighten slightly on hover so the swatch feels live.
-            let bg = match status {
-                button::Status::Hovered => Color {
-                    r: (color.r + 0.08).min(1.0),
-                    g: (color.g + 0.08).min(1.0),
-                    b: (color.b + 0.08).min(1.0),
-                    a: 1.0,
-                },
-                _ => color,
-            };
-            button::Style {
-                background: Some(Background::Color(bg)),
-                border: Border {
-                    color: if selected {
-                        Color::WHITE
-                    } else {
-                        Color { r: 1.0, g: 1.0, b: 1.0, a: 0.25 }
-                    },
-                    width: if selected { 2.0 } else { 1.0 },
-                    radius: 4.0.into(),
-                },
-                ..button::Style::default()
-            }
-        })
-        .into()
+    row![
+        text(label).size(13).width(Length::Fixed(110.0)),
+        column![picker, text(hint).size(11)].spacing(6),
+    ]
+    .spacing(8)
+    .into()
 }
 
 /// Linearly blend `a` toward `b` by `t` (0.0 = all `a`, 1.0 = all `b`), keeping
@@ -485,18 +488,12 @@ fn mix(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-/// Compare two colors at 8-bit precision, so a swatch matches a stored choice
-/// that round-tripped through the `#RRGGBB` prefs encoding.
-fn color_eq(a: Color, b: Color) -> bool {
-    let q = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-    q(a.r) == q(b.r) && q(a.g) == q(b.g) && q(a.b) == q(b.b)
-}
-
 /// Accent hues for the profile callouts. Warm coral for Claude Code, teal for
 /// Windsurf, cool blue for the keyboard reference — each gets a tinted box +
 /// accent bar via [`callout`].
 const CLAUDE_ACCENT:   Color = Color { r: 0.85, g: 0.47, b: 0.34, a: 1.0 };
 const WINDSURF_ACCENT: Color = Color { r: 0.18, g: 0.72, b: 0.66, a: 1.0 };
+const GEMINI_ACCENT:   Color = Color { r: 0.26, g: 0.52, b: 0.96, a: 1.0 };
 const KEYS_ACCENT:     Color = Color { r: 0.36, g: 0.55, b: 0.94, a: 1.0 };
 
 /// The callout accent for a given AI tool.
@@ -504,6 +501,7 @@ fn tool_accent(tool: AiTool) -> Color {
     match tool {
         AiTool::Claude   => CLAUDE_ACCENT,
         AiTool::Windsurf => WINDSURF_ACCENT,
+        AiTool::Gemini   => GEMINI_ACCENT,
     }
 }
 
@@ -664,6 +662,27 @@ fn shortcut_group_header(area: &str) -> Element<'static, Message> {
         .spacing(8)
         .align_y(Alignment::Center)
         .into()
+}
+
+/// Desktop-notification controls. On by default; this is the opt-out for the
+/// background toast frms raises when an agent needs attention while frms isn't
+/// the focused window.
+fn notifications_section(prefs: &Prefs) -> Element<'static, Message> {
+    let toggle = iced::widget::checkbox("Notify when an agent needs attention", prefs.notifications)
+        .on_toggle(Message::PrefsNotificationsToggled)
+        .text_size(13);
+
+    column![
+        text("Notifications").size(15),
+        toggle,
+        text("Raises a desktop notification when a Build session stops on a \
+              question, or a Research/Chat reply finishes, while frms is in the \
+              background. Uses your desktop's notification service (notify-send \
+              on Linux); nothing is shown while you're looking at that pane.")
+            .size(11),
+    ]
+    .spacing(6)
+    .into()
 }
 
 /// Privacy / telemetry controls. The optional tier is on by default and this is
@@ -851,6 +870,62 @@ fn install_button(tool: AiTool) -> Element<'static, Message> {
         .into()
 }
 
+/// Optional BookStack notes-sync config. Everything here is empty by default;
+/// until a URL and both token halves are filled in, the "Sync to BookStack"
+/// button in the Notes tab stays hidden, so a user without a BookStack instance
+/// can leave this untouched. The token is stored in plaintext in `prefs.json`,
+/// the same as the Cloud SQL credential path — stated here so that's no surprise.
+fn bookstack_section<'a>(prefs: &'a Prefs) -> Element<'a, Message> {
+    let status = if prefs.bookstack_configured() {
+        text("Configured — the Notes tab shows a “Sync with BookStack” button.")
+            .font(UI_FONT).size(11)
+    } else {
+        text("Fill in the URL and API token to enable syncing notes.")
+            .font(UI_FONT).size(11)
+    };
+
+    column![
+        text("BookStack sync").size(15),
+        text("Two-way sync between your notes and a BookStack wiki. Each project \
+              becomes a book, each category a chapter, and each note a page — all \
+              filed under a shelf. Syncing pushes local edits, pulls pages you \
+              wrote in BookStack, and flags notes that changed on both sides for \
+              you to resolve. Optional: leave blank if you don't use BookStack.")
+            .font(UI_FONT).size(11),
+        bookstack_field("URL:", "https://wiki.example.com", &prefs.bookstack_url,
+                        false, Message::PrefsBookStackUrlEdited),
+        bookstack_field("Token ID:", "API token id", &prefs.bookstack_token_id,
+                        false, Message::PrefsBookStackTokenIdEdited),
+        bookstack_field("Token secret:", "API token secret", &prefs.bookstack_token_secret,
+                        true, Message::PrefsBookStackTokenSecretEdited),
+        bookstack_field("Shelf:", crate::prefs::DEFAULT_BOOKSTACK_SHELF, &prefs.bookstack_shelf,
+                        false, Message::PrefsBookStackShelfEdited),
+        text("Create the token in BookStack under your profile → API Tokens. \
+              It's stored in plaintext in prefs.json.")
+            .font(UI_FONT).size(11),
+        status,
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// One labeled config field for [`bookstack_section`]. `secure` masks the input
+/// (used for the token secret).
+fn bookstack_field<'a>(
+    label:       &'a str,
+    placeholder: &'a str,
+    value:       &'a str,
+    secure:      bool,
+    on_input:    fn(String) -> Message,
+) -> Element<'a, Message> {
+    let input = text_input(placeholder, value)
+        .on_input(on_input)
+        .secure(secure)
+        .size(12)
+        .width(Length::Fill);
+    labeled_row(label, input.into())
+}
+
 fn labeled_row<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
     row![
         text(label).size(13).width(Length::Fixed(110.0)),
@@ -864,11 +939,12 @@ fn labeled_row<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a,
 // ── Notes plugin ──────────────────────────────────────────────────────────────
 
 fn notes_body<'a>(
-    notes:   &'a NotesState,
-    project: Option<&'a str>,
-    folder:  Color,
+    notes:           &'a NotesState,
+    project:         Option<&'a str>,
+    folder:          Color,
+    bookstack_ready: bool,
 ) -> Element<'a, Message> {
-    let list = notes_list(notes, project, folder);
+    let list = notes_list(notes, project, folder, bookstack_ready);
     let editor = notes_editor(notes, project, folder);
 
     row![
@@ -886,9 +962,10 @@ fn notes_body<'a>(
 }
 
 fn notes_list<'a>(
-    notes:   &'a NotesState,
-    project: Option<&'a str>,
-    folder:  Color,
+    notes:           &'a NotesState,
+    project:         Option<&'a str>,
+    folder:          Color,
+    bookstack_ready: bool,
 ) -> Element<'a, Message> {
     let new_btn = button(text("+ New").font(UI_FONT).size(buttons::TEXT_SIZE))
         .on_press(Message::NotesNew)
@@ -973,15 +1050,115 @@ fn notes_list<'a>(
         }
     }
 
-    column![
+    let mut col = column![
         new_btn,
         search_row,
         scrollable(list).height(Length::Fill),
     ]
     .spacing(6)
-    .height(Length::Fill)
-    .into()
+    .height(Length::Fill);
+
+    // The BookStack sync footer only appears once the feature is configured in
+    // Profile, so a user without a BookStack instance never sees it.
+    if bookstack_ready {
+        col = col.push(bookstack_footer(notes));
+    }
+
+    col.into()
 }
+
+/// Two-way "Sync" button, the last run's status line, and — when the last sync
+/// turned up notes that changed on both sides — a list of those conflicts, each
+/// a button that opens its diff in the editor pane. Shown at the bottom of the
+/// notes list when a BookStack instance is configured. The button is disabled
+/// (and relabelled) while a sync is in flight.
+fn bookstack_footer<'a>(notes: &'a NotesState) -> Element<'a, Message> {
+    let syncing = notes.bookstack_syncing;
+    let label = if syncing { "Syncing…" } else { "Sync with BookStack" };
+    let mut btn = button(text(label).font(UI_FONT).size(buttons::TEXT_SIZE))
+        .padding(buttons::PADDING)
+        .style(buttons::secondary)
+        .width(Length::Fill);
+    // No on_press while syncing → the button reads as disabled and can't queue
+    // a second concurrent run.
+    if !syncing {
+        btn = btn.on_press(Message::NotesSyncToBookStack);
+    }
+
+    let mut col = column![btn].spacing(4);
+    if let Some(s) = notes.bookstack_status.as_deref() {
+        col = col.push(text(s.to_string()).font(UI_FONT).size(10));
+    }
+
+    // Conflicts (both sides changed) are never auto-resolved — list each so the
+    // user can open its diff and pick a side.
+    if !notes.bookstack_conflicts.is_empty() {
+        col = col.push(
+            text(format!("\u{26A0} {} conflict(s) — review:", notes.bookstack_conflicts.len()))
+                .font(UI_FONT).size(10)
+                .color(CONFLICT_COLOR),
+        );
+        for c in &notes.bookstack_conflicts {
+            let title = if c.local_title.trim().is_empty() { "Untitled" } else { c.local_title.as_str() };
+            col = col.push(
+                button(text(title.to_string()).font(UI_FONT).size(buttons::TEXT_SIZE))
+                    .on_press(Message::NotesConflictShow(c.note_id))
+                    .padding(buttons::PADDING)
+                    .style(buttons::secondary)
+                    .width(Length::Fill),
+            );
+        }
+    }
+
+    // Pages authored in BookStack that no note points at — offered for import
+    // rather than dumped into the list. Each has an Import (✓) and Dismiss (✕).
+    if !notes.bookstack_pending_imports.is_empty() {
+        col = col.push(
+            text(format!("{} new page(s) in BookStack:", notes.bookstack_pending_imports.len()))
+                .font(UI_FONT).size(10),
+        );
+        for p in &notes.bookstack_pending_imports {
+            let title = if p.title.trim().is_empty() { "Untitled" } else { p.title.as_str() };
+            col = col.push(
+                row![
+                    text(title.to_string()).font(UI_FONT).size(11).width(Length::Fill),
+                    button(text("\u{2713}").font(ICON_FONT).size(11))
+                        .on_press(Message::NotesImportPage(p.page_id))
+                        .padding([2, 6])
+                        .style(buttons::primary),
+                    button(text("\u{2715}").font(ICON_FONT).size(11))
+                        .on_press(Message::NotesDismissImport(p.page_id))
+                        .padding([2, 6])
+                        .style(buttons::secondary),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            );
+        }
+        col = col.push(
+            row![
+                button(text("Import all").font(UI_FONT).size(buttons::TEXT_SIZE))
+                    .on_press(Message::NotesImportAll)
+                    .padding(buttons::PADDING)
+                    .style(buttons::secondary),
+                button(text("Dismiss all").font(UI_FONT).size(buttons::TEXT_SIZE))
+                    .on_press(Message::NotesDismissAllImports)
+                    .padding(buttons::PADDING)
+                    .style(buttons::secondary),
+            ]
+            .spacing(4),
+        );
+    }
+
+    col.into()
+}
+
+/// Accent for conflict affordances and removed diff lines.
+const CONFLICT_COLOR: Color = Color { r: 0.85, g: 0.42, b: 0.42, a: 1.0 };
+/// Green for added diff lines (BookStack's version).
+const ADDED_COLOR: Color = Color { r: 0.40, g: 0.72, b: 0.45, a: 1.0 };
+/// Muted grey for unchanged (context) diff lines.
+const CONTEXT_COLOR: Color = Color { r: 0.58, g: 0.58, b: 0.62, a: 1.0 };
 
 /// Height of the folder-colored rule drawn beside notes filed in a category.
 /// Fixed rather than `Fill` — a `Fill` child inside a shrink-height row would
@@ -1069,6 +1246,12 @@ fn notes_editor<'a>(
     project: Option<&'a str>,
     folder:  Color,
 ) -> Element<'a, Message> {
+    // A conflict under review takes over the pane: the diff and the choice
+    // matter more than whatever note happens to be selected behind it.
+    if let Some(conflict) = notes.open_conflict() {
+        return conflict_view(conflict);
+    }
+
     // A note left selected from another project isn't in the visible list —
     // treat it the same as no selection so it can't be edited blind.
     let selected = notes.selected
@@ -1109,8 +1292,8 @@ fn notes_editor<'a>(
                 .style(pin_style),
             pin_tip,
         ),
-        button(text("→ Claude").font(UI_FONT).size(buttons::TEXT_SIZE))
-            .on_press(Message::NotesSendToClaude)
+        button(text("→ Prompt").font(UI_FONT).size(buttons::TEXT_SIZE))
+            .on_press(Message::NotesPromptAgent)
             .padding(buttons::PADDING)
             .style(buttons::primary),
         button(text("Delete").font(UI_FONT).size(buttons::TEXT_SIZE))
@@ -1166,6 +1349,125 @@ fn notes_editor<'a>(
     .spacing(8)
     .height(Length::Fill)
     .into()
+}
+
+/// The conflict-resolution pane, shown in place of the editor while a conflict
+/// is open. A header, the two-way choice, and a unified line diff of the local
+/// note (`−`) against the BookStack page (`+`) so the user sees exactly what
+/// differs before picking a side.
+fn conflict_view<'a>(c: &'a crate::bookstack::Conflict) -> Element<'a, Message> {
+    let id = c.note_id;
+    let title = if c.local_title.trim().is_empty() { "Untitled" } else { c.local_title.as_str() };
+
+    let header = column![
+        row![
+            text(format!("\u{26A0} Conflict: {title}")).font(UI_FONT).size(15).color(CONFLICT_COLOR),
+            Space::new(Length::Fill, Length::Shrink),
+            button(text("Close").font(UI_FONT).size(buttons::TEXT_SIZE))
+                .on_press(Message::NotesConflictClose)
+                .padding(buttons::PADDING)
+                .style(buttons::secondary),
+        ]
+        .align_y(Alignment::Center),
+        text("This note changed both here and in BookStack since the last sync. \
+              Nothing has been overwritten — choose which version to keep.")
+            .font(UI_FONT).size(11),
+    ]
+    .spacing(6);
+
+    let choose = row![
+        button(text("Keep my version").font(UI_FONT).size(buttons::TEXT_SIZE))
+            .on_press(Message::NotesConflictKeepLocal(id))
+            .padding(buttons::PADDING)
+            .style(buttons::primary),
+        button(text("Use BookStack version").font(UI_FONT).size(buttons::TEXT_SIZE))
+            .on_press(Message::NotesConflictUseRemote(id))
+            .padding(buttons::PADDING)
+            .style(buttons::danger),
+        Space::new(Length::Fill, Length::Shrink),
+        text("\u{2212} yours").font(Font::MONOSPACE).size(10).color(CONFLICT_COLOR),
+        text("+ BookStack").font(Font::MONOSPACE).size(10).color(ADDED_COLOR),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+
+    let mut diff = Column::new().spacing(1).width(Length::Fill);
+    // The title diffs on its own line first (when it changed), then the body.
+    if c.local_title != c.remote_title {
+        diff = diff.push(text("Title").font(UI_FONT).size(11));
+        diff = diff.push(diff_line(DiffTag::Del, &c.local_title));
+        diff = diff.push(diff_line(DiffTag::Add, &c.remote_title));
+        diff = diff.push(text(" ").size(6));
+    }
+    for (tag, line) in line_diff(&c.local_body, &c.remote_body) {
+        diff = diff.push(diff_line(tag, &line));
+    }
+
+    column![
+        header,
+        choose,
+        container(scrollable(diff))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(6)
+            .style(container::bordered_box),
+    ]
+    .spacing(8)
+    .height(Length::Fill)
+    .into()
+}
+
+/// One line of a [`line_diff`], rendered with its marker and color.
+fn diff_line<'a>(tag: DiffTag, line: &str) -> Element<'a, Message> {
+    let (prefix, color) = match tag {
+        DiffTag::Del  => ("\u{2212} ", CONFLICT_COLOR),
+        DiffTag::Add  => ("+ ", ADDED_COLOR),
+        DiffTag::Same => ("  ", CONTEXT_COLOR),
+    };
+    text(format!("{prefix}{line}")).font(Font::MONOSPACE).size(12).color(color).into()
+}
+
+/// Which side a diff line belongs to.
+#[derive(Clone, Copy)]
+enum DiffTag { Same, Add, Del }
+
+/// A unified line diff of `old` → `new`, built from a longest-common-subsequence
+/// table. Sized for notes, not large files — the table is O(lines²).
+fn line_diff(old: &str, new: &str) -> Vec<(DiffTag, String)> {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let (n, m) = (a.len(), b.len());
+
+    // lcs[i][j] = length of the LCS of a[i..] and b[j..].
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            out.push((DiffTag::Same, a[i].to_string()));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push((DiffTag::Del, a[i].to_string()));
+            i += 1;
+        } else {
+            out.push((DiffTag::Add, b[j].to_string()));
+            j += 1;
+        }
+    }
+    while i < n { out.push((DiffTag::Del, a[i].to_string())); i += 1; }
+    while j < m { out.push((DiffTag::Add, b[j].to_string())); j += 1; }
+    out
 }
 
 /// Category picker for the selected note. Normally a dropdown of existing

@@ -16,6 +16,8 @@
 //! taking over a terminal. How far its tools reach is the user's choice (see
 //! [`crate::chat_api::ChatAccess`]).
 
+use std::sync::RwLock;
+
 use iced::widget::text_editor;
 
 use crate::terminal::{TerminalId, TerminalPane};
@@ -123,10 +125,15 @@ impl Default for ToolModel {
 /// path, and persistence (each entry's `token` is the stable persisted id).
 const CLAUDE_MODELS: &[ToolModel] = &[
     ToolModel { label: "Default",   token: "default",   cli_arg: None },
-    ToolModel { label: "Fable 5",   token: "fable-5",   cli_arg: Some("claude-fable-5") },
-    ToolModel { label: "Opus 4.8",  token: "opus-4-8",  cli_arg: Some("claude-opus-4-8") },
-    ToolModel { label: "Sonnet 5",  token: "sonnet-5",  cli_arg: Some("claude-sonnet-5") },
-    ToolModel { label: "Haiku 4.5", token: "haiku-4-5", cli_arg: Some("claude-haiku-4-5") },
+    ToolModel { label: "Fable 5.1",  token: "fable-5-1",  cli_arg: Some("claude-fable-5-1") },
+    ToolModel { label: "Fable 5",    token: "fable-5",    cli_arg: Some("claude-fable-5") },
+    ToolModel { label: "Opus 5",     token: "opus-5",     cli_arg: Some("claude-opus-5") },
+    ToolModel { label: "Opus 4.8",   token: "opus-4-8",   cli_arg: Some("claude-opus-4-8") },
+    ToolModel { label: "Opus 4.7",   token: "opus-4-7",   cli_arg: Some("claude-opus-4-7") },
+    ToolModel { label: "Opus 4.6",   token: "opus-4-6",   cli_arg: Some("claude-opus-4-6") },
+    ToolModel { label: "Sonnet 5",   token: "sonnet-5",   cli_arg: Some("claude-sonnet-5") },
+    ToolModel { label: "Sonnet 4.6", token: "sonnet-4-6", cli_arg: Some("claude-sonnet-4-6") },
+    ToolModel { label: "Haiku 4.5",  token: "haiku-4-5",  cli_arg: Some("claude-haiku-4-5") },
 ];
 
 /// Windsurf ("Devin for Terminal") model list. `devin --model <id>` selects the
@@ -140,6 +147,99 @@ const WINDSURF_MODELS: &[ToolModel] = &[
     ToolModel { label: "GPT-5.5", token: "gpt-5-5", cli_arg: Some("gpt-5.5") },
     ToolModel { label: "SWE-1.6", token: "swe-1-6", cli_arg: Some("swe-1.6") },
 ];
+
+/// Google's Gemini CLI (`gemini`) model list. `gemini -m <id>` selects the model
+/// at launch; `Default` omits the flag and leaves the CLI on its own "Auto" pick.
+/// Unlike Claude, Gemini has no requery endpoint reachable the way `/v1/models`
+/// is, so — like Windsurf — this seed is the whole list.
+const GEMINI_MODELS: &[ToolModel] = &[
+    ToolModel { label: "Default (Auto)",   token: "default",          cli_arg: None },
+    ToolModel { label: "Gemini 3 Pro",     token: "gemini-3-pro",     cli_arg: Some("gemini-3-pro-preview") },
+    ToolModel { label: "Gemini 2.5 Pro",   token: "gemini-2-5-pro",   cli_arg: Some("gemini-2.5-pro") },
+    ToolModel { label: "Gemini 2.5 Flash", token: "gemini-2-5-flash", cli_arg: Some("gemini-2.5-flash") },
+];
+
+// ── live model registry ───────────────────────────────────────────────────────
+//
+// The `*_MODELS` consts above are only the *seed*: the list each tool starts on.
+// Claude's real catalogue moves — a new model can ship mid-week — so the live
+// list is held behind a swappable pointer that [`AiTool::models`] reads and a
+// `/v1/models` requery replaces (see [`crate::models`]), with no rebuild and no
+// restart. Windsurf has no such endpoint yet, so it just keeps its seed.
+//
+// The swapped-in slice is `Box::leak`ed to stay `&'static`, which is what keeps
+// `ToolModel` `Copy` and every existing `&'static` return in this module
+// unchanged — the refresh is invisible to callers. Requeries are user-driven and
+// rare, and [`intern`] de-dupes the strings, so the leak is bounded to the set of
+// distinct model ids/labels ever seen this run.
+static CLAUDE_MODELS_LIVE:   RwLock<&'static [ToolModel]> = RwLock::new(CLAUDE_MODELS);
+static WINDSURF_MODELS_LIVE: RwLock<&'static [ToolModel]> = RwLock::new(WINDSURF_MODELS);
+
+/// Leak `s` as a `&'static str`, reusing an earlier leak of the same text so a
+/// repeated requery doesn't leak a fresh copy of an unchanged model name.
+fn intern(s: &str) -> &'static str {
+    static POOL: RwLock<Option<std::collections::HashSet<&'static str>>> = RwLock::new(None);
+    if let Some(found) = POOL.read().unwrap().as_ref().and_then(|p| p.get(s).copied()) {
+        return found;
+    }
+    let mut guard = POOL.write().unwrap();
+    let pool = guard.get_or_insert_with(std::collections::HashSet::new);
+    // Re-check under the write lock: another thread may have interned it since.
+    if let Some(found) = pool.get(s).copied() {
+        return found;
+    }
+    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+    pool.insert(leaked);
+    leaked
+}
+
+/// The stable persisted token for an API model id: `claude-` stripped off the
+/// front and a trailing `-YYYYMMDD` date snapshot stripped off the end. That way
+/// `Opus 4.8` keeps the token `opus-4-8` whether the API names it
+/// `claude-opus-4-8` or `claude-opus-4-8-20260528`, so a pane's saved model still
+/// resolves after a requery. `None` for an id without the `claude-` prefix.
+fn model_token(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("claude-")?;
+    let trimmed = rest
+        .rsplit_once('-')
+        .filter(|(_, tail)| tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(head, _)| head)
+        .unwrap_or(rest);
+    Some(trimmed)
+}
+
+/// Replace Claude's live model list from a `/v1/models` response, given
+/// `(id, display_name)` pairs newest-first (the order the API returns). Rebuilds
+/// the [`ToolModel`] table — `Default` first, then one entry per model — and
+/// swaps it in for `AiTool::Claude.models()`. Returns how many models the list
+/// now offers, not counting `Default`. Ids without the `claude-` prefix are
+/// skipped as unexpected.
+pub fn set_claude_models(entries: &[(String, String)]) -> usize {
+    let models = build_claude_models(entries);
+    let count = models.len() - 1;
+    let leaked: &'static [ToolModel] = Box::leak(models.into_boxed_slice());
+    *CLAUDE_MODELS_LIVE.write().unwrap() = leaked;
+    count
+}
+
+/// Build the [`ToolModel`] table for [`set_claude_models`] without swapping it
+/// in — `Default` first, then one entry per usable `(id, display_name)`. Split
+/// out so the id filtering, token derivation, and labelling can be tested
+/// without mutating the shared live registry.
+fn build_claude_models(entries: &[(String, String)]) -> Vec<ToolModel> {
+    let mut models = vec![ToolModel::default()];
+    for (id, display_name) in entries {
+        let Some(token) = model_token(id) else { continue };
+        let label = display_name.strip_prefix("Claude ").unwrap_or(display_name).trim();
+        let label = if label.is_empty() { id.as_str() } else { label };
+        models.push(ToolModel {
+            label:   intern(label),
+            token:   intern(token),
+            cli_arg: Some(intern(id)),
+        });
+    }
+    models
+}
 
 /// Which AI CLI drives a `Build` (PTY) agent pane. Every tool is launched as its
 /// own binary in a [`TerminalPane`], exactly like Claude Code — the only
@@ -159,16 +259,21 @@ pub enum AiTool {
     /// model as Claude Code: `devin auth login` signs in with the user's
     /// existing Windsurf subscription, so frms never handles credentials.
     Windsurf,
+    /// Google's Gemini CLI (`gemini`). Same subscription-login model as the
+    /// others: running `gemini` once signs in with the user's Google account,
+    /// so frms never handles a key.
+    Gemini,
 }
 
 impl AiTool {
-    pub const ALL: &'static [AiTool] = &[AiTool::Claude, AiTool::Windsurf];
+    pub const ALL: &'static [AiTool] = &[AiTool::Claude, AiTool::Windsurf, AiTool::Gemini];
 
     /// Human-readable name for the picker and Profile tab.
     pub fn label(self) -> &'static str {
         match self {
             AiTool::Claude   => "Claude Code",
             AiTool::Windsurf => "Windsurf",
+            AiTool::Gemini   => "Gemini CLI",
         }
     }
 
@@ -177,6 +282,7 @@ impl AiTool {
         match self {
             AiTool::Claude   => "claude",
             AiTool::Windsurf => "devin",
+            AiTool::Gemini   => "gemini",
         }
     }
 
@@ -185,6 +291,7 @@ impl AiTool {
         match self {
             AiTool::Claude   => "claude",
             AiTool::Windsurf => "windsurf",
+            AiTool::Gemini   => "gemini",
         }
     }
 
@@ -192,15 +299,22 @@ impl AiTool {
         match s {
             "claude"   => Some(AiTool::Claude),
             "windsurf" => Some(AiTool::Windsurf),
+            "gemini"   => Some(AiTool::Gemini),
             _          => None,
         }
     }
 
-    /// The tool's selectable models, most-default first.
+    /// The tool's selectable models, most-default first. Reads the live registry
+    /// so a `/v1/models` requery ([`crate::models`], [`set_claude_models`]) shows
+    /// up here immediately — the returned slice is `&'static`, so callers are
+    /// unaffected by the swap. Seeded from the `*_MODELS` consts until a requery
+    /// replaces it.
     pub fn models(self) -> &'static [ToolModel] {
         match self {
-            AiTool::Claude   => CLAUDE_MODELS,
-            AiTool::Windsurf => WINDSURF_MODELS,
+            AiTool::Claude   => *CLAUDE_MODELS_LIVE.read().unwrap(),
+            AiTool::Windsurf => *WINDSURF_MODELS_LIVE.read().unwrap(),
+            // No requery endpoint, so the seed is the whole list (no `*_LIVE`).
+            AiTool::Gemini   => GEMINI_MODELS,
         }
     }
 
@@ -226,6 +340,9 @@ impl AiTool {
         match self {
             AiTool::Claude   => Some(format!("/model {}", model.cli_arg.unwrap_or("default"))),
             AiTool::Windsurf => None,
+            // Gemini's `/model` opens an interactive picker rather than taking a
+            // model id as an argument, so there is no line to type — respawn.
+            AiTool::Gemini   => None,
         }
     }
 
@@ -246,6 +363,7 @@ impl AiTool {
         match self {
             AiTool::Claude   => "npm install -g @anthropic-ai/claude-code",
             AiTool::Windsurf => "curl -fsSL https://cli.devin.ai/install.sh | bash",
+            AiTool::Gemini   => "npm install -g @google/gemini-cli",
         }
     }
 
@@ -257,6 +375,8 @@ impl AiTool {
                 "run 'claude' once to sign in (a Claude Pro/Max subscription, no API key).",
             AiTool::Windsurf =>
                 "run 'devin auth login' once to sign in with your existing Windsurf subscription.",
+            AiTool::Gemini =>
+                "run 'gemini' once to sign in with your Google account (no API key).",
         }
     }
 }
@@ -460,6 +580,16 @@ pub struct PendingPane {
     pub tool:  AiTool,
     pub model: ToolModel,
     pub name:  Option<String>,
+    /// True when the user stopped this pane from the Agents dialog, as opposed
+    /// to a tab whose CLI has simply never been started.
+    ///
+    /// Both states are "a tab with no process", which is the whole point — the
+    /// tab, its name, its tool and its model all survive. They differ only in
+    /// what happens next: an unstarted pane launches as soon as it is looked
+    /// at, while a stopped one stays stopped until the user asks for it back.
+    /// Without that distinction, stopping the pane you are looking at would be
+    /// undone by [`crate::app::Frms::spawn_visible_panes`] on the same frame.
+    pub stopped: bool,
 }
 
 /// One agent tab: a `Build` PTY pane, a `Build` pane not yet spawned, or a
@@ -489,6 +619,19 @@ impl AgentPane {
     /// True while this is a `Build` pane whose CLI has yet to be launched.
     pub fn is_pending(&self) -> bool {
         matches!(self, AgentPane::Pending(_))
+    }
+
+    /// True for a pane the user stopped — a tab that is deliberately holding no
+    /// process, and must not be auto-started the way an unopened tab is.
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, AgentPane::Pending(p) if p.stopped)
+    }
+
+    /// Whether there is a running CLI here to stop. Only Build panes hold one:
+    /// a chat pane runs `claude -p` per turn and owns no process between them,
+    /// and converting one to a stopped pane would throw away its transcript.
+    pub fn can_stop(&self) -> bool {
+        matches!(self, AgentPane::Terminal(_))
     }
 
     /// Which AI CLI a `Build` pane runs. Chat panes are Claude-only, so they
@@ -566,6 +709,19 @@ impl AgentPane {
             AgentPane::Terminal(t) => t.waiting_on_user,
             AgentPane::Pending(_)  => false,
             AgentPane::Chat(c)     => c.unread,
+        }
+    }
+
+    /// True when this pane's AI tool is up: a Build pane whose CLI has been
+    /// launched (not the install-guidance fallback shell), or any chat pane —
+    /// those run `claude -p` per turn, so there is nothing to launch or stop
+    /// and they are always ready. A Build pane not yet opened, or one the user
+    /// stopped, is not. Drives the colored label on agent tabs.
+    pub fn is_live(&self) -> bool {
+        match self {
+            AgentPane::Terminal(t) => t.agent_cli_ready,
+            AgentPane::Pending(_)  => false,
+            AgentPane::Chat(_)     => true,
         }
     }
 
@@ -692,6 +848,13 @@ mod tests {
         // Windsurf has no in-session command, so its panes have to respawn.
         assert!(AiTool::Windsurf.model_command(ToolModel::default()).is_none());
         assert!(!AiTool::Windsurf.switches_model_in_place());
+
+        // Gemini's `/model` is an interactive picker, not a parameterized
+        // command, so its panes respawn too.
+        let flash = *AiTool::Gemini.model_by_token("gemini-2-5-flash").unwrap();
+        assert!(AiTool::Gemini.model_command(flash).is_none());
+        assert!(!AiTool::Gemini.switches_model_in_place());
+        assert_eq!(flash.cli_arg, Some("gemini-2.5-flash"));
     }
 
     #[test]
@@ -714,12 +877,84 @@ mod tests {
     fn pending_pane_has_no_terminal_and_raises_no_alert() {
         let pane = AgentPane::Pending(PendingPane {
             id: 4, tool: AiTool::Claude, model: ToolModel::default(), name: None,
+            stopped: false,
         });
         assert!(pane.is_pending());
         assert!(pane.as_terminal().is_none());
         assert!(pane.as_chat().is_none());
         assert!(!pane.needs_attention(), "a CLI that never ran can't be waiting");
         assert_eq!(pane.kind(), AgentKind::Build);
+    }
+
+    /// The distinction the on-screen spawner keys off. Both are tabs with no
+    /// process; only the never-opened one may start itself, or Stop would be
+    /// undone on the frame it happened.
+    #[test]
+    fn a_stopped_pane_is_pending_but_must_not_self_start() {
+        let pending = |stopped| PendingPane {
+            id: 5, tool: AiTool::Claude, model: ToolModel::default(),
+            name: Some("planning".into()), stopped,
+        };
+        let stopped = AgentPane::Pending(pending(true));
+        assert!(stopped.is_pending());
+        assert!(stopped.is_stopped(), "the spawner filters on this");
+        assert!(!stopped.can_stop(), "nothing left to stop");
+        // The tab keeps everything that identifies it.
+        assert_eq!(stopped.name(), Some("planning"));
+        assert_eq!(stopped.tool(), AiTool::Claude);
+
+        // A tab that was simply never opened is pending but not stopped, so it
+        // still starts the moment it comes on screen.
+        assert!(!AgentPane::Pending(pending(false)).is_stopped());
+    }
+
+    #[test]
+    fn model_token_strips_prefix_and_date_snapshot() {
+        // Plain alias id keeps the historical token…
+        assert_eq!(model_token("claude-opus-4-8"), Some("opus-4-8"));
+        // …and a dated id lands on the same token, so a saved pane still resolves.
+        assert_eq!(model_token("claude-haiku-4-5-20251001"), Some("haiku-4-5"));
+        assert_eq!(model_token("claude-opus-5-5"), Some("opus-5-5"));
+        // A trailing group that isn't an 8-digit date is left alone.
+        assert_eq!(model_token("claude-sonnet-4-6"), Some("sonnet-4-6"));
+        // Non-Claude ids are rejected.
+        assert_eq!(model_token("gpt-5.5"), None);
+    }
+
+    /// The fetched list is built `Default`-first (so `default_model()` stays
+    /// correct), derives clean tokens/labels, and drops non-Claude ids rather
+    /// than showing them raw — including a brand-new model absent from the seed.
+    /// Tests the pure builder so it doesn't disturb the shared live registry
+    /// other tests read.
+    #[test]
+    fn build_claude_models_shapes_the_fetched_list() {
+        let models = build_claude_models(&[
+            ("claude-opus-5-5".to_string(), "Claude Opus 5.5".to_string()),
+            ("claude-opus-4-8".to_string(), "Claude Opus 4.8".to_string()),
+            ("gpt-5.5".to_string(),         "GPT 5.5".to_string()), // dropped
+        ]);
+        assert_eq!(models[0], ToolModel::default(), "Default stays first");
+        assert_eq!(models.len(), 3, "two Claude models + Default; GPT dropped");
+
+        let opus55 = models.iter().find(|m| m.token == "opus-5-5").expect("new model present");
+        assert_eq!(opus55.label, "Opus 5.5");
+        assert_eq!(opus55.cli_arg, Some("claude-opus-5-5"));
+    }
+
+    /// The swap makes the fetched list what `AiTool::Claude.models()` returns,
+    /// and each entry resolves by token. The swapped-in list keeps the seed's
+    /// models so it never races other tests that resolve `opus-4-8`.
+    #[test]
+    fn set_claude_models_swaps_the_live_list() {
+        let count = set_claude_models(&[
+            ("claude-opus-5-5".to_string(), "Claude Opus 5.5".to_string()),
+            ("claude-opus-4-8".to_string(), "Claude Opus 4.8".to_string()),
+            ("claude-sonnet-4-6".to_string(), "Claude Sonnet 4.6".to_string()),
+        ]);
+        assert_eq!(count, 3);
+        let opus55 = AiTool::Claude.model_by_token("opus-5-5").expect("swapped in");
+        assert_eq!(opus55.cli_arg, Some("claude-opus-5-5"));
+        assert_eq!(AiTool::Claude.default_model().token, "default");
     }
 
     /// Persistence reads panes through these accessors, so a session left
@@ -729,7 +964,7 @@ mod tests {
     fn pending_pane_reports_its_tool_model_and_name() {
         let opus = *AiTool::Claude.model_by_token("opus-4-8").unwrap();
         let mut pane = AgentPane::Pending(PendingPane {
-            id: 9, tool: AiTool::Windsurf, model: opus, name: None,
+            id: 9, tool: AiTool::Windsurf, model: opus, name: None, stopped: false,
         });
         pane.set_name(Some("planning".to_string()));
 

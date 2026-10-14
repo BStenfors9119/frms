@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod bookstack;
 mod cdp;
 mod chat_api;
 mod clipboard;
@@ -16,6 +17,7 @@ mod file_browser;
 mod fonts;
 mod icon;
 mod layout;
+mod models;
 mod notes;
 mod pane;
 mod persisted;

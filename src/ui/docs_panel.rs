@@ -9,7 +9,7 @@ use iced::widget::{button, column, container, pick_list, row, scrollable, text, 
 
 use crate::app::Message;
 use crate::docs::{self, DateFilter, Doc, DocsState, SortBy};
-use crate::fonts::{ICON_FONT, UI_FONT};
+use crate::fonts::{ICON_FONT, RESET_FONT, UI_FONT};
 use crate::ui::{buttons, with_tip};
 
 /// Widget id for the Docs search field, so the Ctrl+Shift+S chord can drop the
@@ -36,7 +36,7 @@ pub fn view<'a>(docs: &'a DocsState, folder: Color) -> Element<'a, Message> {
         .padding(buttons::PADDING);
 
     let refresh = with_tip(
-        button(text("\u{21BB}").font(ICON_FONT).size(13)) // ↻
+        button(text("\u{21BB}").font(RESET_FONT).size(13)) // ↻ — RESET_FONT, not ICON_FONT (no Arrows)
             .on_press(Message::DocsRefresh)
             .padding(buttons::PADDING)
             .style(buttons::secondary),

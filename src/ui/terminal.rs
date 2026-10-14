@@ -10,7 +10,7 @@ use portable_pty::MasterPty;
 use crate::app::Message;
 use crate::fonts::{MONO_ADVANCE_RATIO, MONO_FONT};
 use crate::terminal::{FindHighlights, Grid, Selection, TerminalId, COLS, ROWS};
-use crate::theme::TerminalFontScale;
+use crate::theme::{from_hsl, to_hsl, TerminalFontScale};
 
 /// Line-box height at `TerminalFontScale::Medium`. The font scale multiplies
 /// this; the number of whole cells that fit the pane then *is* the terminal
@@ -62,42 +62,6 @@ fn lighten(c: Color, t: f32) -> Color {
         b: c.b + (1.0 - c.b) * t,
         a: 1.0,
     }
-}
-
-/// RGB → HSL, hue in degrees.
-fn to_hsl(c: Color) -> (f32, f32, f32) {
-    let max = c.r.max(c.g).max(c.b);
-    let min = c.r.min(c.g).min(c.b);
-    let l = (max + min) / 2.0;
-    let d = max - min;
-    if d <= f32::EPSILON {
-        return (0.0, 0.0, l);
-    }
-    let s = d / (1.0 - (2.0 * l - 1.0).abs()).max(f32::EPSILON);
-    let h = if max == c.r {
-        60.0 * (((c.g - c.b) / d) % 6.0)
-    } else if max == c.g {
-        60.0 * ((c.b - c.r) / d + 2.0)
-    } else {
-        60.0 * ((c.r - c.g) / d + 4.0)
-    };
-    ((h + 360.0) % 360.0, s.clamp(0.0, 1.0), l)
-}
-
-/// HSL → RGB, hue in degrees.
-fn from_hsl(h: f32, s: f32, l: f32) -> Color {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-    let m = l - c / 2.0;
-    let (r, g, b) = match h {
-        h if h < 60.0  => (c, x, 0.0),
-        h if h < 120.0 => (x, c, 0.0),
-        h if h < 180.0 => (0.0, c, x),
-        h if h < 240.0 => (0.0, x, c),
-        h if h < 300.0 => (x, 0.0, c),
-        _              => (c, 0.0, x),
-    };
-    Color { r: r + m, g: g + m, b: b + m, a: 1.0 }
 }
 
 /// Opacity of the full-width speaker wash. Deliberately faint: it has to sit
@@ -196,6 +160,10 @@ impl TerminalCanvas {
         // screen, so no vertical offset is needed. Skip degenerate bounds
         // (collapsed/initial layout) so we never flap the pty down to 1×1.
         if bounds.width >= cell_w && bounds.height >= cell_h {
+            // Remember this as the size the *next* freshly spawned pane's pty
+            // should open at, so its child reads the real dimensions at startup
+            // rather than the 80×24 default. See `terminal::spawn_size`.
+            crate::terminal::remember_spawn_size(cols, rows);
             self.ensure_size(cols, rows);
         }
         Layout { cell_w, cell_h, x_offset: 0.0, y_offset: 0.0, rows }
